@@ -1,13 +1,14 @@
 use core::fmt;
-use std::{any::Any, sync::Arc, vec};
+use std::{any::Any, collections::HashMap, sync::Arc, vec};
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
+    common::Column,
     config::ConfigOptions,
     error::Result,
     execution::{context::SessionState, TaskContext},
-    logical_expr::{BinaryExpr, Expr, Extension, LogicalPlan, Subquery, SubqueryAlias},
+    logical_expr::{expr::Alias, BinaryExpr, Expr, Extension, LogicalPlan, Subquery},
     optimizer::analyzer::{Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -77,7 +78,8 @@ impl SQLFederationAnalyzerRule {
 impl AnalyzerRule for SQLFederationAnalyzerRule {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
-        let plan = rewrite_table_scans(&plan)?;
+        let mut known_rewrites = HashMap::new();
+        let plan = rewrite_table_scans(&plan, &mut known_rewrites)?;
 
         let fed_plan = FederatedPlanNode::new(plan.clone(), Arc::clone(&self.planner));
         let ext_node = Extension {
@@ -93,7 +95,10 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
 }
 
 /// Rewrite table scans to use the original federated table name.
-fn rewrite_table_scans(plan: &LogicalPlan) -> Result<LogicalPlan> {
+fn rewrite_table_scans(
+    plan: &LogicalPlan,
+    known_rewrites: &mut HashMap<TableReference, TableReference>,
+) -> Result<LogicalPlan> {
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
             let original_table_name = table_scan.table_name.clone();
@@ -106,7 +111,15 @@ fn rewrite_table_scans(plan: &LogicalPlan) -> Result<LogicalPlan> {
 
             match federated_source.as_any().downcast_ref::<SQLTableSource>() {
                 Some(sql_table_source) => {
-                    new_table_scan.table_name = TableReference::from(sql_table_source.table_name());
+                    let remote_table_name = TableReference::from(sql_table_source.table_name());
+                    known_rewrites.insert(original_table_name, remote_table_name.clone());
+
+                    // Rewrite the schema of this node to have the remote table as the qualifier.
+                    let new_schema = (*new_table_scan.projected_schema)
+                        .clone()
+                        .replace_qualifier(remote_table_name.clone());
+                    new_table_scan.projected_schema = Arc::new(new_schema);
+                    new_table_scan.table_name = remote_table_name;
                 }
                 None => {
                     // Not a SQLTableSource (is this possible?)
@@ -114,51 +127,72 @@ fn rewrite_table_scans(plan: &LogicalPlan) -> Result<LogicalPlan> {
                 }
             }
 
-            // Wrap the table scan in a SubqueryAlias back to the original table name, so references continue to work.
-            let subquery_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                Arc::new(LogicalPlan::TableScan(new_table_scan)),
-                original_table_name,
-            )?);
-
-            return Ok(subquery_alias);
+            return Ok(LogicalPlan::TableScan(new_table_scan));
         } else {
             return Ok(plan.clone());
         }
     }
 
-    let mut new_expressions = vec![];
-    for expression in plan.expressions() {
-        new_expressions.push(rewrite_table_scans_in_subqueries(expression)?);
-    }
-
     let rewritten_inputs = plan
         .inputs()
         .into_iter()
-        .map(rewrite_table_scans)
+        .map(|i| rewrite_table_scans(i, known_rewrites))
         .collect::<Result<Vec<_>>>()?;
+
+    let mut new_expressions = vec![];
+    for expression in plan.expressions() {
+        let new_expr = rewrite_table_scans_in_subqueries(expression.clone(), known_rewrites)?;
+        new_expressions.push(new_expr);
+    }
 
     let new_plan = plan.with_new_exprs(new_expressions, rewritten_inputs)?;
 
     Ok(new_plan)
 }
 
-fn rewrite_table_scans_in_subqueries(expr: Expr) -> Result<Expr> {
+fn rewrite_table_scans_in_subqueries(
+    expr: Expr,
+    known_rewrites: &mut HashMap<TableReference, TableReference>,
+) -> Result<Expr> {
     match expr {
         Expr::ScalarSubquery(subquery) => {
-            let new_subquery = rewrite_table_scans(&subquery.subquery)?;
+            let new_subquery = rewrite_table_scans(&subquery.subquery, known_rewrites)?;
             Ok(Expr::ScalarSubquery(Subquery {
                 subquery: Arc::new(new_subquery),
                 outer_ref_columns: subquery.outer_ref_columns,
             }))
         }
         Expr::BinaryExpr(binary_expr) => {
-            let left = rewrite_table_scans_in_subqueries(*binary_expr.left)?;
-            let right = rewrite_table_scans_in_subqueries(*binary_expr.right)?;
+            let left = rewrite_table_scans_in_subqueries(*binary_expr.left, known_rewrites)?;
+            let right = rewrite_table_scans_in_subqueries(*binary_expr.right, known_rewrites)?;
             Ok(Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(left),
                 binary_expr.op,
                 Box::new(right),
             )))
+        }
+        Expr::Column(col) => {
+            let Some(col_relation) = &col.relation else {
+                return Ok(Expr::Column(col));
+            };
+            if let Some(rewrite) = known_rewrites.get(col_relation) {
+                Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
+            } else {
+                Ok(Expr::Column(col))
+            }
+        }
+        Expr::Alias(alias) => {
+            let expr = rewrite_table_scans_in_subqueries(*alias.expr, known_rewrites)?;
+            if let Some(relation) = &alias.relation {
+                if let Some(rewrite) = known_rewrites.get(relation) {
+                    return Ok(Expr::Alias(Alias::new(
+                        expr,
+                        Some(rewrite.clone()),
+                        alias.name,
+                    )));
+                }
+            }
+            Ok(Expr::Alias(Alias::new(expr, alias.relation, alias.name)))
         }
         _ => {
             tracing::debug!("rewrite_table_scans_in_subqueries: no match for expr={expr:?}",);
@@ -266,5 +300,96 @@ impl ExecutionPlan for VirtualExecutionPlan {
 
     fn properties(&self) -> &PlanProperties {
         &self.props
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::{
+        arrow::datatypes::{DataType, Field},
+        common::Column,
+        datasource::DefaultTableSource,
+        error::DataFusionError,
+        logical_expr::LogicalPlanBuilder,
+        sql::sqlparser::dialect::{Dialect, GenericDialect},
+    };
+    use datafusion_federation::FederatedTableProviderAdaptor;
+
+    use super::*;
+
+    struct TestSQLExecutor {}
+
+    #[async_trait]
+    impl SQLExecutor for TestSQLExecutor {
+        fn name(&self) -> &str {
+            "test_sql_table_source"
+        }
+
+        fn compute_context(&self) -> Option<String> {
+            None
+        }
+
+        fn dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(GenericDialect {})
+        }
+
+        fn execute(&self, _query: &str, _schema: SchemaRef) -> Result<SendableRecordBatchStream> {
+            Err(DataFusionError::NotImplemented(
+                "execute not implemented".to_string(),
+            ))
+        }
+
+        async fn table_names(&self) -> Result<Vec<String>> {
+            Err(DataFusionError::NotImplemented(
+                "table inference not implemented".to_string(),
+            ))
+        }
+
+        async fn get_table_schema(&self, _table_name: &str) -> Result<SchemaRef> {
+            Err(DataFusionError::NotImplemented(
+                "table inference not implemented".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_rewrite_table_scans() -> Result<()> {
+        let sql_federation_provider =
+            Arc::new(SQLFederationProvider::new(Arc::new(TestSQLExecutor {})));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Date32, false),
+        ]));
+        let table_source = Arc::new(SQLTableSource::new_with_schema(
+            sql_federation_provider,
+            "remote_table".to_string(),
+            schema,
+        )?);
+        let table_provider_adaptor = Arc::new(FederatedTableProviderAdaptor::new(table_source));
+        let default_table_source = Arc::new(DefaultTableSource::new(table_provider_adaptor));
+        let plan =
+            LogicalPlanBuilder::scan("foo.df_table", default_table_source, None)?.project(vec![
+                Expr::Column(Column::from_qualified_name("foo.df_table.a")),
+                Expr::Column(Column::from_qualified_name("foo.df_table.b")),
+                Expr::Column(Column::from_qualified_name("foo.df_table.c")),
+            ])?;
+
+        let mut known_rewrites = HashMap::new();
+        let rewritten_plan = rewrite_table_scans(&plan.build()?, &mut known_rewrites)?;
+
+        println!("rewritten_plan: \n{:#?}", rewritten_plan);
+
+        let unparsed_sql = plan_to_sql(&rewritten_plan)?;
+
+        println!("unparsed_sql: \n{unparsed_sql}");
+
+        assert_eq!(
+            format!("{unparsed_sql}"),
+            r#"SELECT "remote_table"."a", "remote_table"."b", "remote_table"."c" FROM "remote_table""#
+        );
+
+        Ok(())
     }
 }
