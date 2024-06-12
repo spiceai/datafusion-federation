@@ -31,6 +31,8 @@ use datafusion_federation::{
     get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
 };
 
+use regex::Regex;
+
 mod schema;
 pub use schema::*;
 
@@ -194,8 +196,15 @@ fn rewrite_table_scans_in_expr(
                 // This will handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
                 let rewritten_name = known_rewrites.iter().find_map(|(table_ref, rewrite)| {
                     let table_ref_str = table_ref.to_string();
-                    if col.name.contains(&table_ref_str) {
-                        Some(col.name.replace(&table_ref_str, &rewrite.to_string()))
+                    // name to rewrite should NOT be a substring of another name
+                    let pattern =
+                        format!(r"[^a-zA-Z_.]{0}[^a-zA-Z_]", regex::escape(&table_ref_str));
+                    let Ok(re) = Regex::new(&pattern) else {
+                        return None;
+                    };
+
+                    if re.is_match(&col.name) {
+                        return Some(col.name.replace(&table_ref_str, &rewrite.to_string()));
                     } else {
                         None
                     }
@@ -696,6 +705,14 @@ mod tests {
         foo_schema
             .register_table("df_table".to_string(), get_test_table_provider())
             .expect("to register table");
+
+        let public_schema = catalog
+            .schema("public")
+            .expect("public schema should exist");
+        public_schema
+            .register_table("app_table".to_string(), get_test_table_provider())
+            .expect("to register table");
+
         ctx
     }
 
@@ -720,7 +737,7 @@ mod tests {
 
         assert_eq!(
             format!("{unparsed_sql}"),
-            r#"SELECT "remote_table"."a", "remote_table"."b", "remote_table"."c" FROM "remote_table""#
+            r#"SELECT remote_table.a, remote_table.b, remote_table.c FROM remote_table"#
         );
 
         Ok(())
@@ -742,52 +759,88 @@ mod tests {
         let agg_tests = vec![
             (
                 "SELECT MAX(a) FROM foo.df_table",
-                r#"SELECT MAX("remote_table"."a") FROM "remote_table""#,
+                r#"SELECT MAX(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",
-                r#"SELECT MIN("remote_table"."a") FROM "remote_table""#,
+                r#"SELECT MIN(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT AVG(a) FROM foo.df_table",
-                r#"SELECT AVG("remote_table"."a") FROM "remote_table""#,
+                r#"SELECT AVG(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT SUM(a) FROM foo.df_table",
-                r#"SELECT SUM("remote_table"."a") FROM "remote_table""#,
+                r#"SELECT SUM(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT COUNT(a) FROM foo.df_table",
-                r#"SELECT COUNT("remote_table"."a") FROM "remote_table""#,
+                r#"SELECT COUNT(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT COUNT(a) as cnt FROM foo.df_table",
-                r#"SELECT COUNT("remote_table"."a") AS "cnt" FROM "remote_table""#,
+                r#"SELECT COUNT(remote_table.a) AS cnt FROM remote_table"#,
             ),
         ];
 
         for test in agg_tests {
-            let data_frame = ctx.sql(test.0).await?;
-
-            println!("before optimization: \n{:#?}", data_frame.logical_plan());
-
-            let mut known_rewrites = HashMap::new();
-            let rewritten_plan =
-                rewrite_table_scans(data_frame.logical_plan(), &mut known_rewrites)?;
-
-            println!("rewritten_plan: \n{:#?}", rewritten_plan);
-
-            let unparsed_sql = plan_to_sql(&rewritten_plan)?;
-
-            println!("unparsed_sql: \n{unparsed_sql}");
-
-            assert_eq!(
-                format!("{unparsed_sql}"),
-                test.1,
-                "SQL under test: {}",
-                test.0
-            );
+            test_sql(&ctx, test.0, test.1).await?;
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_table_scans_alias() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let tests = vec![
+            (
+                "SELECT COUNT(app_table_a) FROM (SELECT a as app_table_a FROM app_table)",
+                r#"SELECT COUNT(app_table_a) FROM (SELECT remote_table.a AS app_table_a FROM remote_table)"#,
+            ),
+            (
+                "SELECT app_table_a FROM (SELECT a as app_table_a FROM app_table)",
+                r#"SELECT app_table_a FROM (SELECT remote_table.a AS app_table_a FROM remote_table)"#,
+            ),
+            (
+                "SELECT aapp_table FROM (SELECT a as aapp_table FROM app_table)",
+                r#"SELECT aapp_table FROM (SELECT remote_table.a AS aapp_table FROM remote_table)"#,
+            ),
+        ];
+
+        for test in tests {
+            test_sql(&ctx, test.0, test.1).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn test_sql(
+        ctx: &SessionContext,
+        sql_query: &str,
+        expected_sql: &str,
+    ) -> Result<(), datafusion::error::DataFusionError> {
+        let data_frame = ctx.sql(sql_query).await?;
+
+        println!("before optimization: \n{:#?}", data_frame.logical_plan());
+
+        let mut known_rewrites = HashMap::new();
+        let rewritten_plan = rewrite_table_scans(data_frame.logical_plan(), &mut known_rewrites)?;
+
+        println!("rewritten_plan: \n{:#?}", rewritten_plan);
+
+        let unparsed_sql = plan_to_sql(&rewritten_plan)?;
+
+        println!("unparsed_sql: \n{unparsed_sql}");
+
+        assert_eq!(
+            format!("{unparsed_sql}"),
+            expected_sql,
+            "SQL under test: {}",
+            sql_query
+        );
 
         Ok(())
     }
