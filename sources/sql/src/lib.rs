@@ -173,13 +173,17 @@ fn rewrite_column_name_in_expr(
         return None;
     }
 
+    // Find the first occurrence of table_ref_str starting from start_pos
     let Some(idx) = col_name[start_pos..].find(table_ref_str) else {
         return None;
     };
 
+    // Calculate the absolute index of the occurrence in string as the index above is relative to start_pos
     let idx = start_pos + idx;
 
     if idx > 0 {
+        // Check if the previous character is alphabetic, underscore or period, in which case we
+        // should not rewrite as it is a part of another name.
         if let Some(prev_char) = col_name.chars().nth(idx - 1) {
             if prev_char.is_alphabetic() || prev_char == '_' || prev_char == '.' {
                 return rewrite_column_name_in_expr(
@@ -192,6 +196,8 @@ fn rewrite_column_name_in_expr(
         }
     }
 
+    // Check if the next character is alphabetic or underscore, in which case we
+    // should not rewrite as it is a part of another name.
     if let Some(next_char) = col_name.chars().nth(idx + table_ref_str.len()) {
         if next_char.is_alphabetic() || next_char == '_' {
             return rewrite_column_name_in_expr(
@@ -203,6 +209,7 @@ fn rewrite_column_name_in_expr(
         }
     }
 
+    // Found full match, replace table_ref_str occurrence with rewrite
     let rewritten_name = format!(
         "{}{}{}",
         &col_name[..idx],
@@ -210,10 +217,12 @@ fn rewrite_column_name_in_expr(
         &col_name[idx + table_ref_str.len()..]
     );
 
+    // Check if the rewritten name contains more occurrence of table_ref_str, and rewrite them as wel
+    // This is done by providing the updated start_pos for search
     match rewrite_column_name_in_expr(&rewritten_name, table_ref_str, rewrite, idx + rewrite.len())
     {
-        Some(new_name) => Some(new_name),
-        None => Some(rewritten_name),
+        Some(new_name) => Some(new_name), // more occurernces found
+        None => Some(rewritten_name),     // no more occurrences/changes
     }
 }
 
