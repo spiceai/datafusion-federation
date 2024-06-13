@@ -249,15 +249,21 @@ fn rewrite_table_scans_in_expr(
             } else {
                 // Check if any of the rewrites match any substring in col.name, and replace that part of the string if so.
                 // This will handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
-                let rewritten_name = known_rewrites.iter().find_map(|(table_ref, rewrite)| {
-                    return rewrite_column_name_in_expr(
-                        &col.name,
-                        &table_ref.to_string(),
-                        &rewrite.to_string(),
-                        0,
-                    );
-                });
-                if let Some(new_name) = rewritten_name {
+                let (new_name, was_rewritten) = known_rewrites.iter().fold(
+                    (col.name.to_string(), false),
+                    |(col_name, was_rewritten), (table_ref, rewrite)| {
+                        match rewrite_column_name_in_expr(
+                            &col_name,
+                            &table_ref.to_string(),
+                            &rewrite.to_string(),
+                            0,
+                        ) {
+                            Some(new_name) => (new_name, true),
+                            None => (col_name, was_rewritten),
+                        }
+                    },
+                );
+                if was_rewritten {
                     Ok(Expr::Column(Column::new(col.relation.take(), new_name)))
                 } else {
                     Ok(Expr::Column(col))
@@ -829,10 +835,15 @@ mod tests {
                 "SELECT COUNT(a) as cnt FROM foo.df_table",
                 r#"SELECT COUNT(remote_table.a) AS cnt FROM remote_table"#,
             ),
-            // multiple occurrences in single aggregation expression
+            // multiple occurrences of the same table in single aggregation expression
             (
                 "SELECT COUNT(CASE WHEN a > 0 THEN a ELSE 0 END) FROM app_table",
                 r#"SELECT COUNT(CASE WHEN (remote_table.a > 0) THEN remote_table.a ELSE 0 END) FROM remote_table"#,
+            ),
+            // different tables in single aggregation expression
+            (
+                "SELECT COUNT(CASE WHEN app_table.a > 0 THEN app_table.a ELSE foo.df_table.a END) FROM app_table, foo.df_table",
+                r#"SELECT COUNT(CASE WHEN (remote_table.a > 0) THEN remote_table.a ELSE remote_table.a END) FROM remote_table JOIN remote_table ON true"#,
             ),
         ];
 
