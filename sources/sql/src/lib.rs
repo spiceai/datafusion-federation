@@ -160,36 +160,61 @@ fn rewrite_table_scans(
     Ok(new_plan)
 }
 
+// The function replaces occurrences of table_ref_str in col_name with the new name defined by rewrite.
+// The name to rewrite should NOT be a substring of another name.
+// Supports multiple occurrences of table_ref_str in col_name.
 fn rewrite_column_name_in_expr(
     col_name: &str,
     table_ref_str: &str,
     rewrite: &str,
+    start_pos: usize,
 ) -> Option<String> {
-    let Some(idx) = col_name.find(table_ref_str) else {
+    if start_pos >= col_name.len() {
+        return None;
+    }
+
+    let Some(idx) = col_name[start_pos..].find(table_ref_str) else {
         return None;
     };
 
-    // name to rewrite should NOT be a substring of another name
+    let idx = start_pos + idx;
+
     if idx > 0 {
         if let Some(prev_char) = col_name.chars().nth(idx - 1) {
             if prev_char.is_alphabetic() || prev_char == '_' || prev_char == '.' {
-                return None;
+                return rewrite_column_name_in_expr(
+                    col_name,
+                    table_ref_str,
+                    rewrite,
+                    idx + table_ref_str.len(),
+                );
             }
         }
     }
 
     if let Some(next_char) = col_name.chars().nth(idx + table_ref_str.len()) {
         if next_char.is_alphabetic() || next_char == '_' {
-            return None;
+            return rewrite_column_name_in_expr(
+                col_name,
+                table_ref_str,
+                rewrite,
+                idx + table_ref_str.len(),
+            );
         }
     }
 
-    Some(format!(
+    let rewritten_name = format!(
         "{}{}{}",
         &col_name[..idx],
         rewrite,
         &col_name[idx + table_ref_str.len()..]
-    ))
+    );
+
+    match rewrite_column_name_in_expr(&rewritten_name, table_ref_str, rewrite, idx + rewrite.len())
+    {
+        Some(new_name) => Some(new_name),
+        None => Some(rewritten_name),
+    }
 }
 
 fn rewrite_table_scans_in_expr(
@@ -229,6 +254,7 @@ fn rewrite_table_scans_in_expr(
                         &col.name,
                         &table_ref.to_string(),
                         &rewrite.to_string(),
+                        0,
                     );
                 });
                 if let Some(new_name) = rewritten_name {
@@ -802,6 +828,11 @@ mod tests {
             (
                 "SELECT COUNT(a) as cnt FROM foo.df_table",
                 r#"SELECT COUNT(remote_table.a) AS cnt FROM remote_table"#,
+            ),
+            // multiple occurrences in single aggregation expression
+            (
+                "SELECT COUNT(CASE WHEN a > 0 THEN a ELSE 0 END) FROM app_table",
+                r#"SELECT COUNT(CASE WHEN (remote_table.a > 0) THEN remote_table.a ELSE 0 END) FROM remote_table"#,
             ),
         ];
 
