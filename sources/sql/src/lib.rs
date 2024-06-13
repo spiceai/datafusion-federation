@@ -31,8 +31,6 @@ use datafusion_federation::{
     get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
 };
 
-use regex::Regex;
-
 mod schema;
 pub use schema::*;
 
@@ -162,6 +160,38 @@ fn rewrite_table_scans(
     Ok(new_plan)
 }
 
+fn rewrite_column_name_in_expr(
+    col_name: &str,
+    table_ref_str: &str,
+    rewrite: &str,
+) -> Option<String> {
+    let Some(idx) = col_name.find(table_ref_str) else {
+        return None;
+    };
+
+    // name to rewrite should NOT be a substring of another name
+    if idx > 0 {
+        if let Some(prev_char) = col_name.chars().nth(idx - 1) {
+            if prev_char.is_alphabetic() || prev_char == '_' || prev_char == '.' {
+                return None;
+            }
+        }
+    }
+
+    if let Some(next_char) = col_name.chars().nth(idx + table_ref_str.len()) {
+        if next_char.is_alphabetic() || next_char == '_' {
+            return None;
+        }
+    }
+
+    Some(format!(
+        "{}{}{}",
+        &col_name[..idx],
+        rewrite,
+        &col_name[idx + table_ref_str.len()..]
+    ))
+}
+
 fn rewrite_table_scans_in_expr(
     expr: Expr,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
@@ -195,19 +225,11 @@ fn rewrite_table_scans_in_expr(
                 // Check if any of the rewrites match any substring in col.name, and replace that part of the string if so.
                 // This will handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
                 let rewritten_name = known_rewrites.iter().find_map(|(table_ref, rewrite)| {
-                    let table_ref_str = table_ref.to_string();
-                    // name to rewrite should NOT be a substring of another name
-                    let pattern =
-                        format!(r"[^a-zA-Z_.]{0}[^a-zA-Z_]", regex::escape(&table_ref_str));
-                    let Ok(re) = Regex::new(&pattern) else {
-                        return None;
-                    };
-
-                    if re.is_match(&col.name) {
-                        return Some(col.name.replace(&table_ref_str, &rewrite.to_string()));
-                    } else {
-                        None
-                    }
+                    return rewrite_column_name_in_expr(
+                        &col.name,
+                        &table_ref.to_string(),
+                        &rewrite.to_string(),
+                    );
                 });
                 if let Some(new_name) = rewritten_name {
                     Ok(Expr::Column(Column::new(col.relation.take(), new_name)))
