@@ -221,11 +221,11 @@ fn rewrite_column_name_in_expr(
         &col_name[idx + table_ref_str.len()..]
     );
 
-    // Check if the rewritten name contains more occurrence of table_ref_str, and rewrite them as wel
+    // Check if the rewritten name contains more occurrence of table_ref_str, and rewrite them as well
     // This is done by providing the updated start_pos for search
     match rewrite_column_name_in_expr(&rewritten_name, table_ref_str, rewrite, idx + rewrite.len())
     {
-        Some(new_name) => Some(new_name), // more occurernces found
+        Some(new_name) => Some(new_name), // more occurrences found
         None => Some(rewritten_name),     // no more occurrences/changes
     }
 }
