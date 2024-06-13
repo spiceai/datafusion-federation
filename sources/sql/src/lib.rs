@@ -182,10 +182,14 @@ fn rewrite_column_name_in_expr(
     let idx = start_pos + idx;
 
     if idx > 0 {
-        // Check if the previous character is alphabetic, underscore or period, in which case we
+        // Check if the previous character is alphabetic, numeric, underscore or period, in which case we
         // should not rewrite as it is a part of another name.
         if let Some(prev_char) = col_name.chars().nth(idx - 1) {
-            if prev_char.is_alphabetic() || prev_char == '_' || prev_char == '.' {
+            if prev_char.is_alphabetic()
+                || prev_char.is_numeric()
+                || prev_char == '_'
+                || prev_char == '.'
+            {
                 return rewrite_column_name_in_expr(
                     col_name,
                     table_ref_str,
@@ -196,10 +200,10 @@ fn rewrite_column_name_in_expr(
         }
     }
 
-    // Check if the next character is alphabetic or underscore, in which case we
+    // Check if the next character is alphabetic, numeric or underscore, in which case we
     // should not rewrite as it is a part of another name.
     if let Some(next_char) = col_name.chars().nth(idx + table_ref_str.len()) {
-        if next_char.is_alphabetic() || next_char == '_' {
+        if next_char.is_alphabetic() || next_char.is_numeric() || next_char == '_' {
             return rewrite_column_name_in_expr(
                 col_name,
                 table_ref_str,
