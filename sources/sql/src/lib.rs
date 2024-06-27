@@ -628,7 +628,7 @@ impl VirtualExecutionPlan {
         Arc::new(Schema::from(df_schema))
     }
 
-    fn rewritten_query(&self) -> Result<String> {
+    fn sql(&self) -> Result<String> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
         let ast = Unparser::new(self.executor.dialect().as_ref())
@@ -648,7 +648,7 @@ impl DisplayAs for VirtualExecutionPlan {
             write!(f, " compute_context={ctx}")?;
         }
         write!(f, " sql={ast}")?;
-        if let Ok(query) = self.rewritten_query() {
+        if let Ok(query) = self.sql() {
             write!(f, " rewritten_sql={query}")?;
         };
 
@@ -681,8 +681,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        self.executor
-            .execute(self.rewritten_query()?.as_str(), self.schema())
+        self.executor.execute(self.sql()?.as_str(), self.schema())
     }
 
     fn properties(&self) -> &PlanProperties {
