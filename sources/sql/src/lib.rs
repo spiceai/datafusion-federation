@@ -630,13 +630,10 @@ impl VirtualExecutionPlan {
 
     fn rewritten_query(&self) -> Result<String> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
-        let dialect = self.executor.dialect();
-        let unparser = Unparser::new(dialect.as_ref());
         let mut known_rewrites = HashMap::new();
-        let plan = rewrite_table_scans(&self.plan, &mut known_rewrites)?;
-        let ast = unparser.plan_to_sql(&plan)?;
-        let query = format!("{ast}");
-        Ok(query)
+        let ast = Unparser::new(self.executor.dialect().as_ref())
+            .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
+        Ok(format!("{ast}"))
     }
 }
 
