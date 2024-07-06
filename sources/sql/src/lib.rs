@@ -632,7 +632,6 @@ impl VirtualExecutionPlan {
         let mut known_rewrites = HashMap::new();
         let ast = Unparser::new(self.executor.dialect().as_ref())
             .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
-        let sql = format!("{ast}"); 
         Ok(format!("{ast}"))
     }
 }
@@ -961,11 +960,11 @@ mod tests {
         init_tracing();
         let ctx = get_test_tpchl_context();
         let before_optimization = r#"SELECT c_orders.c_count,
-       Count(1) AS custdist
+       COUNT(1) AS custdist
 FROM   (SELECT customer.c_custkey         AS c_custkey,
                "COUNT(orders.o_orderkey)" AS c_count
         FROM   (SELECT customer.c_custkey,
-                       Count(orders.o_orderkey)
+                       COUNT(orders.o_orderkey)
                 FROM   customer
                        LEFT JOIN orders
                               ON ( ( customer.c_custkey = orders.o_custkey )
@@ -973,10 +972,10 @@ FROM   (SELECT customer.c_custkey         AS c_custkey,
                                        '%special%requests%' )
                 GROUP  BY customer.c_custkey)) AS c_orders
 GROUP  BY c_orders.c_count
-ORDER  BY custdist DESC nulls first,
-          c_orders.c_count DESC nulls first"#;
+ORDER  BY custdist DESC NULLS FIRST,
+          c_orders.c_count DESC NULLS FIRST"#;
         // Unfortunately plan-to-sql doesn't support formatting in Datafusion, so we need to join the string manually to create a one-line query
-        let after_optimization = r#"SELECT c_orders.c_count, Count(1) AS custdist FROM (SELECT c_custkey AS c_custkey, "count(tpch.orders.o_orderkey)" AS c_count FROM   (SELECT tpch.customer.c_custkey, Count(tpch.orders.o_orderkey) AS "count(tpch.orders.o_orderkey)" FROM tpch.customer LEFT JOIN tpch.orders ON ( ( tpch.customer.c_custkey =tpch.orders.o_custkey ) AND tpch.orders.o_comment NOT LIKE '%special%requests%' ) GROUP  BY tpch.customer.c_custkey)) AS c_orders GROUP  BY c_orders.c_count ORDER  BY custdist DESC nulls first, c_orders.c_count DESC nulls first"#;
+        let after_optimization = r#"SELECT c_orders.c_count, COUNT(1) AS custdist FROM (SELECT c_custkey AS c_custkey, "COUNT(tpch.orders.o_orderkey)" AS c_count FROM (SELECT tpch.customer.c_custkey, COUNT(tpch.orders.o_orderkey) AS "COUNT(tpch.orders.o_orderkey)" FROM tpch.customer LEFT JOIN tpch.orders ON ((tpch.customer.c_custkey = tpch.orders.o_custkey) AND tpch.orders.o_comment NOT LIKE '%special%requests%') GROUP BY tpch.customer.c_custkey)) AS c_orders GROUP BY c_orders.c_count ORDER BY custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST"#;
         test_sql(&ctx, &before_optimization, &after_optimization).await?;    
         Ok(())   
     }
