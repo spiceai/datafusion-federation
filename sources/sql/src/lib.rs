@@ -118,7 +118,6 @@ fn rewrite_table_scans(
             match federated_source.as_any().downcast_ref::<SQLTableSource>() {
                 Some(sql_table_source) => {
                     let remote_table_name = TableReference::from(sql_table_source.table_name());
-                    println!("Rewriting table scan {:#?} to {:#?}",  original_table_name.clone(), remote_table_name.clone());
                     known_rewrites.insert(original_table_name, remote_table_name.clone());
                     
                     // Rewrite the schema of this node to have the remote table as the qualifier.
@@ -145,13 +144,11 @@ fn rewrite_table_scans(
         .into_iter()
         .map(|i| rewrite_table_scans(i, known_rewrites))
         .collect::<Result<Vec<_>>>()?;
-    println!("Rewriten inputs {:#?}",rewritten_inputs);
     let mut new_expressions = vec![];
     for expression in plan.expressions() {
         let new_expr = rewrite_table_scans_in_expr(expression.clone(), known_rewrites)?;
         new_expressions.push(new_expr);
     }
-    println!("Rewriten expr {:#?}",new_expressions.clone());
 
     let new_plan = plan.with_new_exprs(new_expressions, rewritten_inputs)?;
 
@@ -232,7 +229,6 @@ fn rewrite_table_scans_in_expr(
     expr: Expr,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
 ) -> Result<Expr> {
-//    println!("Expr {:#?} rewrites {:#?}",expr);
     match expr {
         Expr::ScalarSubquery(subquery) => {
             let new_subquery = rewrite_table_scans(&subquery.subquery, known_rewrites)?;
@@ -634,14 +630,9 @@ impl VirtualExecutionPlan {
     fn sql(&self) -> Result<String> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
-        let before =Unparser::new(self.executor.dialect().as_ref())
-        .plan_to_sql(&self.plan)?;
-        let sql = format!("{before}"); 
-        println!("Before Sql: {sql}"); 
         let ast = Unparser::new(self.executor.dialect().as_ref())
             .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
         let sql = format!("{ast}"); 
-        println!("After rewrite Sql: {sql}");
         Ok(format!("{ast}"))
     }
 }
