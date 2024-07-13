@@ -105,6 +105,7 @@ fn rewrite_table_scans(
     plan: &LogicalPlan,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
 ) -> Result<LogicalPlan> {
+    let plan_desc = format!("{:?}", plan);
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
             let original_table_name = table_scan.table_name.clone();
@@ -119,7 +120,7 @@ fn rewrite_table_scans(
                 Some(sql_table_source) => {
                     let remote_table_name = TableReference::from(sql_table_source.table_name());
                     known_rewrites.insert(original_table_name, remote_table_name.clone());
-                    
+
                     // Rewrite the schema of this node to have the remote table as the qualifier.
                     let new_schema = (*new_table_scan.projected_schema)
                         .clone()
@@ -138,7 +139,12 @@ fn rewrite_table_scans(
             return Ok(plan.clone());
         }
     }
-
+    let mut alias_columns = false;
+    if plan.inputs().len() == 1 {
+        if let LogicalPlan::Projection(_) = plan {
+            alias_columns = true;
+        }
+    }
     let rewritten_inputs = plan
         .inputs()
         .into_iter()
@@ -146,7 +152,8 @@ fn rewrite_table_scans(
         .collect::<Result<Vec<_>>>()?;
     let mut new_expressions = vec![];
     for expression in plan.expressions() {
-        let new_expr = rewrite_table_scans_in_expr(expression.clone(), known_rewrites)?;
+        let new_expr =
+            rewrite_table_scans_in_expr(expression.clone(), known_rewrites, alias_columns)?;
         new_expressions.push(new_expr);
     }
 
@@ -228,6 +235,7 @@ fn rewrite_column_name_in_expr(
 fn rewrite_table_scans_in_expr(
     expr: Expr,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
+    alias_columns: bool,
 ) -> Result<Expr> {
     match expr {
         Expr::ScalarSubquery(subquery) => {
@@ -235,7 +243,7 @@ fn rewrite_table_scans_in_expr(
             let outer_ref_columns = subquery
                 .outer_ref_columns
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             Ok(Expr::ScalarSubquery(Subquery {
                 subquery: Arc::new(new_subquery),
@@ -243,8 +251,8 @@ fn rewrite_table_scans_in_expr(
             }))
         }
         Expr::BinaryExpr(binary_expr) => {
-            let left = rewrite_table_scans_in_expr(*binary_expr.left, known_rewrites)?;
-            let right = rewrite_table_scans_in_expr(*binary_expr.right, known_rewrites)?;
+            let left = rewrite_table_scans_in_expr(*binary_expr.left, known_rewrites, false)?;
+            let right = rewrite_table_scans_in_expr(*binary_expr.right, known_rewrites, false)?;
             Ok(Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(left),
                 binary_expr.op,
@@ -252,34 +260,46 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::Column(mut col) => {
-            if let Some(rewrite) = col.relation.as_ref().and_then(|r| known_rewrites.get(r)) {
-                Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
-            } else {
-                // Check if any of the rewrites match any substring in col.name, and replace that part of the string if so.
-                // This will handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
-                let (new_name, was_rewritten) = known_rewrites.iter().fold(
-                    (col.name.to_string(), false),
-                    |(col_name, was_rewritten), (table_ref, rewrite)| {
-                        match rewrite_column_name_in_expr(
-                            &col_name,
-                            &table_ref.to_string(),
-                            &rewrite.to_string(),
-                            0,
-                        ) {
-                            Some(new_name) => (new_name, true),
-                            None => (col_name, was_rewritten),
-                        }
-                    },
-                );
-                if was_rewritten {
-                    Ok(Expr::Column(Column::new(col.relation.take(), new_name)))
-                } else {
-                    Ok(Expr::Column(col))
+            match (
+                alias_columns,
+                col.relation.as_ref().and_then(|r| known_rewrites.get(r)),
+            ) {
+                (false, Some(rewrite)) => {
+                    Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
+                }
+                _ => {
+                    // Check if any of the rewrites match any substring in col.name, and replace that part of the string if so.
+                    // This will handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
+                    let (new_name, was_rewritten) = known_rewrites.iter().fold(
+                        (col.name.to_string(), false),
+                        |(col_name, was_rewritten), (table_ref, rewrite)| {
+                            match rewrite_column_name_in_expr(
+                                &col_name,
+                                &table_ref.to_string(),
+                                &rewrite.to_string(),
+                                0,
+                            ) {
+                                Some(new_name) => (new_name, true),
+                                None => (col_name, was_rewritten),
+                            }
+                        },
+                    );
+                    let relation = col.relation.take();
+                    let base_col = if was_rewritten {
+                        Expr::Column(Column::new(relation.clone(), new_name.clone()))
+                    } else {
+                        Expr::Column(col)
+                    };
+                    if alias_columns {
+                        Ok(Expr::Alias(Alias::new(base_col, relation, new_name)))
+                    } else {
+                        Ok(base_col)
+                    }
                 }
             }
         }
         Expr::Alias(alias) => {
-            let expr = rewrite_table_scans_in_expr(*alias.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*alias.expr, known_rewrites, false)?;
             if let Some(relation) = &alias.relation {
                 if let Some(rewrite) = known_rewrites.get(relation) {
                     return Ok(Expr::Alias(Alias::new(
@@ -292,8 +312,8 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::Alias(Alias::new(expr, alias.relation, alias.name)))
         }
         Expr::Like(like) => {
-            let expr = rewrite_table_scans_in_expr(*like.expr, known_rewrites)?;
-            let pattern = rewrite_table_scans_in_expr(*like.pattern, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*like.expr, known_rewrites, false)?;
+            let pattern = rewrite_table_scans_in_expr(*like.pattern, known_rewrites, false)?;
             Ok(Expr::Like(Like::new(
                 like.negated,
                 Box::new(expr),
@@ -303,8 +323,8 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::SimilarTo(similar_to) => {
-            let expr = rewrite_table_scans_in_expr(*similar_to.expr, known_rewrites)?;
-            let pattern = rewrite_table_scans_in_expr(*similar_to.pattern, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*similar_to.expr, known_rewrites, false)?;
+            let pattern = rewrite_table_scans_in_expr(*similar_to.pattern, known_rewrites, false)?;
             Ok(Expr::SimilarTo(Like::new(
                 similar_to.negated,
                 Box::new(expr),
@@ -314,49 +334,49 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::Not(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::Not(Box::new(expr)))
         }
         Expr::IsNotNull(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsNotNull(Box::new(expr)))
         }
         Expr::IsNull(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsNull(Box::new(expr)))
         }
         Expr::IsTrue(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsTrue(Box::new(expr)))
         }
         Expr::IsFalse(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsFalse(Box::new(expr)))
         }
         Expr::IsUnknown(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsUnknown(Box::new(expr)))
         }
         Expr::IsNotTrue(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsNotTrue(Box::new(expr)))
         }
         Expr::IsNotFalse(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsNotFalse(Box::new(expr)))
         }
         Expr::IsNotUnknown(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::IsNotUnknown(Box::new(expr)))
         }
         Expr::Negative(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*e, known_rewrites, false)?;
             Ok(Expr::Negative(Box::new(expr)))
         }
         Expr::Between(between) => {
-            let expr = rewrite_table_scans_in_expr(*between.expr, known_rewrites)?;
-            let low = rewrite_table_scans_in_expr(*between.low, known_rewrites)?;
-            let high = rewrite_table_scans_in_expr(*between.high, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*between.expr, known_rewrites, false)?;
+            let low = rewrite_table_scans_in_expr(*between.low, known_rewrites, false)?;
+            let high = rewrite_table_scans_in_expr(*between.high, known_rewrites, false)?;
             Ok(Expr::Between(Between::new(
                 Box::new(expr),
                 between.negated,
@@ -367,20 +387,20 @@ fn rewrite_table_scans_in_expr(
         Expr::Case(case) => {
             let expr = case
                 .expr
-                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites, false))
                 .transpose()?
                 .map(Box::new);
             let else_expr = case
                 .else_expr
-                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites, false))
                 .transpose()?
                 .map(Box::new);
             let when_expr = case
                 .when_then_expr
                 .into_iter()
                 .map(|(when, then)| {
-                    let when = rewrite_table_scans_in_expr(*when, known_rewrites);
-                    let then = rewrite_table_scans_in_expr(*then, known_rewrites);
+                    let when = rewrite_table_scans_in_expr(*when, known_rewrites, false);
+                    let then = rewrite_table_scans_in_expr(*then, known_rewrites, false);
 
                     match (when, then) {
                         (Ok(when), Ok(then)) => Ok((Box::new(when), Box::new(then))),
@@ -391,18 +411,18 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::Case(Case::new(expr, when_expr, else_expr)))
         }
         Expr::Cast(cast) => {
-            let expr = rewrite_table_scans_in_expr(*cast.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*cast.expr, known_rewrites, false)?;
             Ok(Expr::Cast(Cast::new(Box::new(expr), cast.data_type)))
         }
         Expr::TryCast(try_cast) => {
-            let expr = rewrite_table_scans_in_expr(*try_cast.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*try_cast.expr, known_rewrites, false)?;
             Ok(Expr::TryCast(TryCast::new(
                 Box::new(expr),
                 try_cast.data_type,
             )))
         }
         Expr::Sort(sort) => {
-            let expr = rewrite_table_scans_in_expr(*sort.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*sort.expr, known_rewrites, false)?;
             Ok(Expr::Sort(Sort::new(
                 Box::new(expr),
                 sort.asc,
@@ -413,7 +433,7 @@ fn rewrite_table_scans_in_expr(
             let args = sf
                 .args
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             Ok(Expr::ScalarFunction(ScalarFunction {
                 func: sf.func,
@@ -424,18 +444,18 @@ fn rewrite_table_scans_in_expr(
             let args = af
                 .args
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             let filter = af
                 .filter
-                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites, false))
                 .transpose()?
                 .map(Box::new);
             let order_by = af
                 .order_by
                 .map(|e| {
                     e.into_iter()
-                    .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                        .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                         .collect::<Result<Vec<Expr>>>()
                 })
                 .transpose()?;
@@ -452,17 +472,17 @@ fn rewrite_table_scans_in_expr(
             let args = wf
                 .args
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             let partition_by = wf
                 .partition_by
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             let order_by = wf
                 .order_by
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             Ok(Expr::WindowFunction(WindowFunction::new(
                 wf.fun,
@@ -474,11 +494,11 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::InList(il) => {
-            let expr = rewrite_table_scans_in_expr(*il.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*il.expr, known_rewrites, false)?;
             let list = il
                 .list
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             Ok(Expr::InList(InList::new(Box::new(expr), list, il.negated)))
         }
@@ -488,7 +508,7 @@ fn rewrite_table_scans_in_expr(
                 .subquery
                 .outer_ref_columns
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
@@ -497,13 +517,13 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::Exists(Exists::new(subquery, exists.negated)))
         }
         Expr::InSubquery(is) => {
-            let expr = rewrite_table_scans_in_expr(*is.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*is.expr, known_rewrites, false)?;
             let subquery_plan = rewrite_table_scans(&is.subquery.subquery, known_rewrites)?;
             let outer_ref_columns = is
                 .subquery
                 .outer_ref_columns
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                 .collect::<Result<Vec<Expr>>>()?;
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
@@ -531,14 +551,14 @@ fn rewrite_table_scans_in_expr(
             GroupingSet::Rollup(exprs) => {
                 let exprs = exprs
                     .into_iter()
-                    .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                    .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                     .collect::<Result<Vec<Expr>>>()?;
                 Ok(Expr::GroupingSet(GroupingSet::Rollup(exprs)))
             }
             GroupingSet::Cube(exprs) => {
                 let exprs = exprs
                     .into_iter()
-                    .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                    .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                     .collect::<Result<Vec<Expr>>>()?;
                 Ok(Expr::GroupingSet(GroupingSet::Cube(exprs)))
             }
@@ -548,7 +568,7 @@ fn rewrite_table_scans_in_expr(
                     .map(|exprs| {
                         exprs
                             .into_iter()
-                            .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                            .map(|e| rewrite_table_scans_in_expr(e, known_rewrites, false))
                             .collect::<Result<Vec<Expr>>>()
                     })
                     .collect::<Result<Vec<Vec<Expr>>>>()?;
@@ -566,7 +586,7 @@ fn rewrite_table_scans_in_expr(
             }
         }
         Expr::Unnest(unnest) => {
-            let expr = rewrite_table_scans_in_expr(*unnest.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(*unnest.expr, known_rewrites, false)?;
             Ok(Expr::Unnest(Unnest::new(expr)))
         }
         Expr::ScalarVariable(_, _) | Expr::Literal(_) | Expr::Placeholder(_) => Ok(expr),
@@ -698,7 +718,8 @@ mod tests {
         error::DataFusionError,
         execution::context::SessionContext,
         logical_expr::LogicalPlanBuilder,
-        sql::{unparser::dialect::DefaultDialect, unparser::dialect::Dialect},
+        parquet::data_type,
+        sql::unparser::dialect::{DefaultDialect, Dialect},
     };
     use datafusion_federation::FederatedTableProviderAdaptor;
 
@@ -897,22 +918,21 @@ mod tests {
 
         Ok(())
     }
-    
-    fn get_test_table_provider_from_schema(schema: Arc<Schema>, table_name: String) -> Arc<dyn TableProvider> {
+
+    fn get_test_table_provider_from_schema(
+        schema: Arc<Schema>,
+        table_name: String,
+    ) -> Arc<dyn TableProvider> {
         let sql_federation_provider =
             Arc::new(SQLFederationProvider::new(Arc::new(TestSQLExecutor {})));
 
         let table_source = Arc::new(
-            SQLTableSource::new_with_schema(
-                sql_federation_provider,
-                table_name,
-                schema,
-            )
-            .expect("to have a valid SQLTableSource"),
+            SQLTableSource::new_with_schema(sql_federation_provider, table_name, schema)
+                .expect("to have a valid SQLTableSource"),
         );
         Arc::new(FederatedTableProviderAdaptor::new(table_source))
     }
-    fn get_tpch_customers_table_provider() ->  Arc<dyn TableProvider> {
+    fn get_tpch_customers_table_provider() -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("c_custkey", DataType::Utf8, false),
             Field::new("custdist", DataType::Utf8, true),
@@ -920,8 +940,7 @@ mod tests {
         get_test_table_provider_from_schema(schema, "tpch.customers".to_string())
     }
 
-
-    fn get_tpch_orders_table_provider() -> Arc<dyn TableProvider>{
+    fn get_tpch_orders_table_provider() -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("o_orderkey", DataType::Utf8, false),
             Field::new("o_custkey", DataType::Utf8, false),
@@ -934,15 +953,15 @@ mod tests {
         let catalog = ctx
             .catalog("datafusion")
             .expect("default catalog is datafusion");
-        let tpch_schema= Arc::new(MemorySchemaProvider::new()) as Arc<dyn SchemaProvider>;
+        let tpch_schema = Arc::new(MemorySchemaProvider::new()) as Arc<dyn SchemaProvider>;
         catalog
             .register_schema("tpch", Arc::clone(&tpch_schema))
             .expect("to register schema");
         tpch_schema
             .register_table("orders".to_string(), get_tpch_orders_table_provider())
             .expect("to register table");
-        tpch_schema.
-            register_table("customers".to_string(),get_tpch_customers_table_provider())
+        tpch_schema
+            .register_table("customers".to_string(), get_tpch_customers_table_provider())
             .expect("to register table");
         let public_schema = catalog
             .schema("public")
@@ -956,7 +975,7 @@ mod tests {
         ctx
     }
     #[tokio::test]
-    async fn test_subquery_rewriet() -> Result<()> {
+    async fn test_subquery_rewrite() -> Result<()> {
         init_tracing();
         let ctx = get_test_tpchl_context();
         let before_optimization = r#"SELECT c_orders.c_count,
@@ -976,8 +995,8 @@ ORDER  BY custdist DESC NULLS FIRST,
           c_orders.c_count DESC NULLS FIRST"#;
         // Unfortunately plan-to-sql doesn't support formatting in Datafusion, so we need to join the string manually to create a one-line query
         let after_optimization = r#"SELECT c_orders.c_count, COUNT(1) AS custdist FROM (SELECT c_custkey AS c_custkey, "COUNT(tpch.orders.o_orderkey)" AS c_count FROM (SELECT tpch.customer.c_custkey, COUNT(tpch.orders.o_orderkey) AS "COUNT(tpch.orders.o_orderkey)" FROM tpch.customer LEFT JOIN tpch.orders ON ((tpch.customer.c_custkey = tpch.orders.o_custkey) AND tpch.orders.o_comment NOT LIKE '%special%requests%') GROUP BY tpch.customer.c_custkey)) AS c_orders GROUP BY c_orders.c_count ORDER BY custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST"#;
-        test_sql(&ctx, &before_optimization, &after_optimization).await?;    
-        Ok(())   
+        test_sql(&ctx, &before_optimization, &after_optimization).await?;
+        Ok(())
     }
 
     async fn test_sql(
@@ -993,7 +1012,6 @@ ORDER  BY custdist DESC NULLS FIRST,
         let rewritten_plan = rewrite_table_scans(data_frame.logical_plan(), &mut known_rewrites)?;
 
         println!("rewritten_plan: \n{:#?}", rewritten_plan);
-
         let unparsed_sql = plan_to_sql(&rewritten_plan)?;
 
         println!("unparsed_sql: \n{unparsed_sql}");
