@@ -256,6 +256,8 @@ fn rewrite_table_scans_in_expr(
             if let Some(rewrite) = col.relation.as_ref().and_then(|r| known_rewrites.get(r)) {
                 Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
             } else {
+                // This prevent over-eager rewirte and only pass the column into below rewritten
+                // rule like MAX(...)
                 if col.relation.is_some() {
                     return Ok(Expr::Column(col));
                 }
@@ -838,6 +840,10 @@ mod tests {
                 r#"SELECT MAX(remote_table.a) FROM remote_table"#,
             ),
             (
+                "SELECT foo.df_table.a FROM foo.df_table",
+                r#"SELECT remote_table.a FROM remote_table"#,
+            ),
+            (
                 "SELECT MIN(a) FROM foo.df_table",
                 r#"SELECT MIN(remote_table.a) FROM remote_table"#,
             ),
@@ -864,6 +870,10 @@ mod tests {
             (
                 "SELECT app_table from (SELECT a as app_table FROM app_table) b",
                 r#"SELECT b.app_table FROM (SELECT remote_table.a AS app_table FROM remote_table) AS b"#,
+            ),
+            (
+                "SELECT MAX(app_table) from (SELECT a as app_table FROM app_table) b",
+                r#"SELECT MAX(b.app_table) FROM (SELECT remote_table.a AS app_table FROM remote_table) AS b"#,
             ),
             // multiple occurrences of the same table in single aggregation expression
             (
