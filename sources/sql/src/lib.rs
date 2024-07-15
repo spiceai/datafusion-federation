@@ -256,7 +256,7 @@ fn rewrite_table_scans_in_expr(
             if let Some(rewrite) = col.relation.as_ref().and_then(|r| known_rewrites.get(r)) {
                 Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
             } else {
-                // This prevent over-eager rewirte and only pass the column into below rewritten
+                // This prevent over-eager rewrite and only pass the column into below rewritten
                 // rule like MAX(...)
                 if col.relation.is_some() {
                     return Ok(Expr::Column(col));
