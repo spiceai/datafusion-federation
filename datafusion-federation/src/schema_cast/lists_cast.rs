@@ -1,8 +1,10 @@
+use arrow_json::ReaderBuilder;
 use datafusion::arrow::{
     array::{
-        Array, ArrayRef, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
-        Int16Builder, Int32Builder, Int64Builder, Int8Builder, LargeListBuilder, ListBuilder,
-        StringArray, StringBuilder,
+        Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeListBuilder, Float32Array,
+        Float32Builder, Float64Array, Float64Builder, Int16Array, Int16Builder, Int32Array,
+        Int32Builder, Int64Array, Int64Builder, Int8Array, Int8Builder, LargeListBuilder,
+        LargeStringArray, LargeStringBuilder, ListArray, ListBuilder, StringArray, StringBuilder,
     },
     datatypes::{DataType, Field, FieldRef},
     error::ArrowError,
@@ -12,55 +14,132 @@ use std::sync::Arc;
 pub type Result<T, E = crate::schema_cast::record_convert::Error> = std::result::Result<T, E>;
 
 macro_rules! cast_string_to_list_array {
-    ($string_array:expr, $field_name:expr, $data_type:expr, $builder_type:expr, $item_type:ty) => {{
-        let item_field = Field::new($field_name, $data_type, true);
+    ($string_array:expr, $field_name:expr, $data_type:expr, $builder_type:expr, $primitive_type:ty) => {{
+        let item_field = Arc::new(Field::new($field_name, $data_type, true));
         let mut list_builder = ListBuilder::with_capacity($builder_type, $string_array.len())
-            .with_field(Arc::new(item_field));
+            .with_field(Arc::clone(&item_field));
+
+        let list_field = Arc::new(Field::new_list("i", item_field, true));
+        let mut decoder = ReaderBuilder::new_with_field(Arc::clone(&list_field))
+            .build_decoder()
+            .map_err(|e| ArrowError::CastError(format!("Failed to create decoder: {e}")))?;
 
         for value in $string_array {
             match value {
                 None => list_builder.append_null(),
                 Some(string_value) => {
-                    let items = serde_json::from_str::<Vec<Option<$item_type>>>(string_value)
-                        .map_err(|e| {
-                            ArrowError::CastError(format!("Failed to parse value: {e}"))
-                        })?;
-                    list_builder.append_value(items);
+                    decoder.decode(string_value.as_bytes()).map_err(|e| {
+                        ArrowError::CastError(format!("Failed to decode value: {e}"))
+                    })?;
+
+                    if let Some(b) = decoder.flush().map_err(|e| {
+                        ArrowError::CastError(format!("Failed to decode decoder: {e}"))
+                    })? {
+                        let list_array = b
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError(
+                                    "Failed to decode value: unable to downcast to ListArray"
+                                        .to_string(),
+                                )
+                            })?;
+                        let primitive_array = list_array
+                            .values()
+                            .as_any()
+                            .downcast_ref::<$primitive_type>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError(
+                                    "Failed to decode value: unable to downcast to PrimitiveType"
+                                        .to_string(),
+                                )
+                            })?;
+                        primitive_array
+                            .iter()
+                            .for_each(|maybe_value| match maybe_value {
+                                Some(value) => list_builder.values().append_value(value),
+                                None => list_builder.values().append_null(),
+                            });
+                        list_builder.append(true);
+                    }
                 }
             }
         }
+
         Ok(Arc::new(list_builder.finish()))
     }};
 }
 
 macro_rules! cast_string_to_large_list_array {
-    ($string_array:expr, $field_name:expr, $data_type:expr, $builder_type:expr, $item_type:ty) => {{
-        let item_field = Field::new($field_name, $data_type, true);
+    ($string_array:expr, $field_name:expr, $data_type:expr, $builder_type:expr, $primitive_type:ty) => {{
+        let item_field = Arc::new(Field::new($field_name, $data_type, true));
         let mut list_builder = LargeListBuilder::with_capacity($builder_type, $string_array.len())
-            .with_field(Arc::new(item_field));
+            .with_field(Arc::clone(&item_field));
+
+        let list_field = Arc::new(Field::new_list("i", item_field, true));
+        let mut decoder = ReaderBuilder::new_with_field(Arc::clone(&list_field))
+            .build_decoder()
+            .map_err(|e| ArrowError::CastError(format!("Failed to create decoder: {e}")))?;
 
         for value in $string_array {
             match value {
                 None => list_builder.append_null(),
                 Some(string_value) => {
-                    let items = serde_json::from_str::<Vec<Option<$item_type>>>(string_value)
-                        .map_err(|e| {
-                            ArrowError::CastError(format!("Failed to parse value: {e}"))
-                        })?;
-                    list_builder.append_value(items);
+                    decoder.decode(string_value.as_bytes()).map_err(|e| {
+                        ArrowError::CastError(format!("Failed to decode value: {e}"))
+                    })?;
+
+                    if let Some(b) = decoder.flush().map_err(|e| {
+                        ArrowError::CastError(format!("Failed to decode decoder: {e}"))
+                    })? {
+                        let list_array = b
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError(
+                                    "Failed to decode value: unable to downcast to ListArray"
+                                        .to_string(),
+                                )
+                            })?;
+                        let primitive_array = list_array
+                            .values()
+                            .as_any()
+                            .downcast_ref::<$primitive_type>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError(
+                                    "Failed to decode value: unable to downcast to PrimitiveType"
+                                        .to_string(),
+                                )
+                            })?;
+                        primitive_array
+                            .iter()
+                            .for_each(|maybe_value| match maybe_value {
+                                Some(value) => list_builder.values().append_value(value),
+                                None => list_builder.values().append_null(),
+                            });
+                        list_builder.append(true);
+                    }
                 }
             }
         }
+
         Ok(Arc::new(list_builder.finish()))
     }};
 }
 
 macro_rules! cast_string_to_fixed_size_list_array {
-    ($string_array:expr, $field_name:expr, $data_type:expr, $builder_type:expr, $item_type:ty, $value_length:expr) => {{
-        let item_field = Field::new($field_name, $data_type, true);
+    ($string_array:expr, $field_name:expr, $data_type:expr, $builder_type:expr, $primitive_type:ty, $value_length:expr) => {{
+        let item_field = Arc::new(Field::new($field_name, $data_type, true));
         let mut list_builder =
             FixedSizeListBuilder::with_capacity($builder_type, $value_length, $string_array.len())
-                .with_field(Arc::new(item_field));
+                .with_field(Arc::clone(&item_field));
+
+        let list_field = Arc::new(Field::new_list("i", item_field, true));
+        let mut decoder = ReaderBuilder::new_with_field(Arc::clone(&list_field))
+            .build_decoder()
+            .map_err(|e| ArrowError::CastError(format!("Failed to create decoder: {e}")))?;
 
         for value in $string_array {
             match value {
@@ -71,20 +150,45 @@ macro_rules! cast_string_to_fixed_size_list_array {
                     list_builder.append(true)
                 }
                 Some(string_value) => {
-                    let items = serde_json::from_str::<Vec<Option<$item_type>>>(string_value)
-                        .map_err(|e| {
-                            ArrowError::CastError(format!("Failed to parse value: {e}"))
-                        })?;
-                    for item in items {
-                        match item {
-                            Some(val) => list_builder.values().append_value(val),
-                            None => list_builder.values().append_null(),
-                        }
+                    decoder.decode(string_value.as_bytes()).map_err(|e| {
+                        ArrowError::CastError(format!("Failed to decode value: {e}"))
+                    })?;
+
+                    if let Some(b) = decoder.flush().map_err(|e| {
+                        ArrowError::CastError(format!("Failed to decode decoder: {e}"))
+                    })? {
+                        let list_array = b
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError(
+                                    "Failed to decode value: unable to downcast to ListArray"
+                                        .to_string(),
+                                )
+                            })?;
+                        let primitive_array = list_array
+                            .values()
+                            .as_any()
+                            .downcast_ref::<$primitive_type>()
+                            .ok_or_else(|| {
+                                ArrowError::CastError(
+                                    "Failed to decode value: unable to downcast to PrimitiveType"
+                                        .to_string(),
+                                )
+                            })?;
+                        primitive_array
+                            .iter()
+                            .for_each(|maybe_value| match maybe_value {
+                                Some(value) => list_builder.values().append_value(value),
+                                None => list_builder.values().append_null(),
+                            });
+                        list_builder.append(true);
                     }
-                    list_builder.append(true);
                 }
             }
         }
+
         Ok(Arc::new(list_builder.finish()))
     }};
 }
@@ -96,7 +200,11 @@ pub(crate) fn cast_string_to_list(
     let string_array = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| ArrowError::CastError("Failed to downcast to StringArray".to_string()))?;
+        .ok_or_else(|| {
+            ArrowError::CastError(
+                "Failed to decode value: unable to downcast to StringArray".to_string(),
+            )
+        })?;
 
     let field_name = list_item_field.name();
 
@@ -107,7 +215,16 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Utf8,
                 StringBuilder::new(),
-                String
+                StringArray
+            )
+        }
+        DataType::LargeUtf8 => {
+            cast_string_to_list_array!(
+                string_array,
+                field_name,
+                DataType::LargeUtf8,
+                LargeStringBuilder::new(),
+                LargeStringArray
             )
         }
         DataType::Boolean => {
@@ -116,7 +233,7 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Boolean,
                 BooleanBuilder::new(),
-                bool
+                BooleanArray
             )
         }
         DataType::Int8 => {
@@ -125,7 +242,7 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Int8,
                 Int8Builder::new(),
-                i8
+                Int8Array
             )
         }
         DataType::Int16 => {
@@ -134,7 +251,7 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Int16,
                 Int16Builder::new(),
-                i16
+                Int16Array
             )
         }
         DataType::Int32 => {
@@ -143,7 +260,7 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Int32,
                 Int32Builder::new(),
-                i32
+                Int32Array
             )
         }
         DataType::Int64 => {
@@ -152,7 +269,7 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Int64,
                 Int64Builder::new(),
-                i64
+                Int64Array
             )
         }
         DataType::Float32 => {
@@ -161,7 +278,7 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Float32,
                 Float32Builder::new(),
-                f32
+                Float32Array
             )
         }
         DataType::Float64 => {
@@ -170,7 +287,7 @@ pub(crate) fn cast_string_to_list(
                 field_name,
                 DataType::Float64,
                 Float64Builder::new(),
-                f64
+                Float64Array
             )
         }
         _ => Err(ArrowError::CastError(format!(
@@ -187,7 +304,11 @@ pub(crate) fn cast_string_to_large_list(
     let string_array = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| ArrowError::CastError("Failed to downcast to StringArray".to_string()))?;
+        .ok_or_else(|| {
+            ArrowError::CastError(
+                "Failed to decode value: unable to downcast to StringArray".to_string(),
+            )
+        })?;
 
     let field_name = list_item_field.name();
 
@@ -198,7 +319,16 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Utf8,
                 StringBuilder::new(),
-                String
+                StringArray
+            )
+        }
+        DataType::LargeUtf8 => {
+            cast_string_to_large_list_array!(
+                string_array,
+                field_name,
+                DataType::LargeUtf8,
+                LargeStringBuilder::new(),
+                LargeStringArray
             )
         }
         DataType::Boolean => {
@@ -207,7 +337,7 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Boolean,
                 BooleanBuilder::new(),
-                bool
+                BooleanArray
             )
         }
         DataType::Int8 => {
@@ -216,7 +346,7 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Int8,
                 Int8Builder::new(),
-                i8
+                Int8Array
             )
         }
         DataType::Int16 => {
@@ -225,7 +355,7 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Int16,
                 Int16Builder::new(),
-                i16
+                Int16Array
             )
         }
         DataType::Int32 => {
@@ -234,7 +364,7 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Int32,
                 Int32Builder::new(),
-                i32
+                Int32Array
             )
         }
         DataType::Int64 => {
@@ -243,7 +373,7 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Int64,
                 Int64Builder::new(),
-                i64
+                Int64Array
             )
         }
         DataType::Float32 => {
@@ -252,7 +382,7 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Float32,
                 Float32Builder::new(),
-                f32
+                Float32Array
             )
         }
         DataType::Float64 => {
@@ -261,7 +391,7 @@ pub(crate) fn cast_string_to_large_list(
                 field_name,
                 DataType::Float64,
                 Float64Builder::new(),
-                f64
+                Float64Array
             )
         }
         _ => Err(ArrowError::CastError(format!(
@@ -279,7 +409,11 @@ pub(crate) fn cast_string_to_fixed_size_list(
     let string_array = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| ArrowError::CastError("Failed to downcast to StringArray".to_string()))?;
+        .ok_or_else(|| {
+            ArrowError::CastError(
+                "Failed to decode value: unable to downcast to StringArray".to_string(),
+            )
+        })?;
 
     let field_name = list_item_field.name();
 
@@ -290,7 +424,17 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Utf8,
                 StringBuilder::new(),
-                String,
+                StringArray,
+                value_length
+            )
+        }
+        DataType::LargeUtf8 => {
+            cast_string_to_fixed_size_list_array!(
+                string_array,
+                field_name,
+                DataType::LargeUtf8,
+                LargeStringBuilder::new(),
+                LargeStringArray,
                 value_length
             )
         }
@@ -300,7 +444,7 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Boolean,
                 BooleanBuilder::new(),
-                bool,
+                BooleanArray,
                 value_length
             )
         }
@@ -310,7 +454,7 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Int8,
                 Int8Builder::new(),
-                i8,
+                Int8Array,
                 value_length
             )
         }
@@ -320,7 +464,7 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Int16,
                 Int16Builder::new(),
-                i16,
+                Int16Array,
                 value_length
             )
         }
@@ -330,7 +474,7 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Int32,
                 Int32Builder::new(),
-                i32,
+                Int32Array,
                 value_length
             )
         }
@@ -340,7 +484,7 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Int64,
                 Int64Builder::new(),
-                i64,
+                Int64Array,
                 value_length
             )
         }
@@ -350,7 +494,7 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Float32,
                 Float32Builder::new(),
-                f32,
+                Float32Array,
                 value_length
             )
         }
@@ -360,7 +504,7 @@ pub(crate) fn cast_string_to_fixed_size_list(
                 field_name,
                 DataType::Float64,
                 Float64Builder::new(),
-                f64,
+                Float64Array,
                 value_length
             )
         }
