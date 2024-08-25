@@ -17,26 +17,24 @@ pub(crate) fn cast_string_to_struct(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| ArrowError::CastError("Failed to downcast to StringArray".to_string()))?;
 
-    let mut json: String = "".to_string();
-
-    for value in string_array {
-        match value {
-            Some(v) => {
-                json.push_str(v);
-            }
-            None => {
-                json.push_str("null");
-            }
-        }
-    }
-
     let mut decoder = ReaderBuilder::new_with_field(struct_field)
         .build_decoder()
         .map_err(|e| ArrowError::CastError(format!("Failed to create JSON decoder: {e}")))?;
 
-    decoder
-        .decode(json.as_bytes())
-        .map_err(|e| ArrowError::CastError(format!("Failed to decode struct array: {e}")))?;
+    for value in string_array {
+        match value {
+            Some(v) => {
+                decoder.decode(v.as_bytes()).map_err(|e| {
+                    ArrowError::CastError(format!("Failed to decode struct array: {e}"))
+                })?;
+            }
+            None => {
+                decoder.decode("null".as_bytes()).map_err(|e| {
+                    ArrowError::CastError(format!("Failed to decode struct array: {e}"))
+                })?;
+            }
+        }
+    }
 
     let record = match decoder.flush() {
         Ok(Some(record)) => record,
@@ -94,6 +92,7 @@ mod test {
             vec![Arc::new(StringArray::from(vec![
                 Some(r#"{"name":"John","age":30}"#),
                 None,
+                None,
                 Some(r#"{"name":"Jane","age":25}"#),
             ]))],
         )
@@ -121,6 +120,16 @@ mod test {
             .expect("should return field builder")
             .append_value(30);
         struct_builder.append(true);
+
+        struct_builder
+            .field_builder::<StringBuilder>(0)
+            .expect("should return field builder")
+            .append_null();
+        struct_builder
+            .field_builder::<Int32Builder>(1)
+            .expect("should return field builder")
+            .append_null();
+        struct_builder.append(false);
 
         struct_builder
             .field_builder::<StringBuilder>(0)
