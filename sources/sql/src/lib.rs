@@ -648,7 +648,7 @@ impl VirtualExecutionPlan {
 impl DisplayAs for VirtualExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(f, "VirtualExecutionPlan")?;
-        let Ok(mut ast) = plan_to_sql(&self.plan) else {
+        let Ok(ast) = plan_to_sql(&self.plan) else {
             return Ok(());
         };
         write!(f, " name={}", self.executor.name())?;
