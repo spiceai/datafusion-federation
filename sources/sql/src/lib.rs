@@ -654,15 +654,7 @@ impl DisplayAs for VirtualExecutionPlan {
         write!(f, " name={}", self.executor.name())?;
         if let Some(ctx) = self.executor.compute_context() {
             write!(f, " compute_context={ctx}")?;
-        }
-
-        if let Some(analyzer) = self.executor.ast_analyzer() {
-            let Ok(result_ast) = analyzer(ast) else {
-                return Ok(());
-            };
-
-            ast = result_ast;
-        }
+        };
 
         write!(f, " sql={ast}")?;
         if let Ok(query) = self.sql() {
