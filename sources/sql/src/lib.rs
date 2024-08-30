@@ -634,8 +634,13 @@ impl VirtualExecutionPlan {
     fn sql(&self) -> Result<String> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
-        let ast = Unparser::new(self.executor.dialect().as_ref())
+        let mut ast = Unparser::new(self.executor.dialect().as_ref())
             .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
+
+        if let Some(analyzer) = self.executor.ast_analyzer() {
+            ast = analyzer(ast)?;
+        }
+
         Ok(format!("{ast}"))
     }
 }
@@ -643,13 +648,22 @@ impl VirtualExecutionPlan {
 impl DisplayAs for VirtualExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(f, "VirtualExecutionPlan")?;
-        let Ok(ast) = plan_to_sql(&self.plan) else {
+        let Ok(mut ast) = plan_to_sql(&self.plan) else {
             return Ok(());
         };
         write!(f, " name={}", self.executor.name())?;
         if let Some(ctx) = self.executor.compute_context() {
             write!(f, " compute_context={ctx}")?;
         }
+
+        if let Some(analyzer) = self.executor.ast_analyzer() {
+            let Ok(result_ast) = analyzer(ast) else {
+                return Ok(());
+            };
+
+            ast = result_ast;
+        }
+
         write!(f, " sql={ast}")?;
         if let Ok(query) = self.sql() {
             write!(f, " rewritten_sql={query}")?;
