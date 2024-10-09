@@ -4,7 +4,8 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties,
 };
 use futures::StreamExt;
 use std::any::Any;
@@ -67,6 +68,14 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// Enforces a 1-1 relationship between `SchemaCastScanExec` and its input, 
+    /// preventing the introduction of `RepartitionExec` and ensuring that the input 
+    /// is not split into sub-inputs. This guarantees that the input is processed 
+    /// as a single stream, preserving the order of the data.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
     }
 
     fn with_new_children(
