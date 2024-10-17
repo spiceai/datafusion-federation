@@ -221,7 +221,7 @@ fn rewrite_unnest_plan(
     let updated_unnest_inner_projection =
         Projection::try_new(new_expressions, Arc::clone(&projection.input))?;
 
-    // reconstruct the unnest plan with updated projection and rewrittem column names
+    // reconstruct the unnest plan with updated projection and rewritten column names
     let new_plan =
         LogicalPlanBuilder::new(LogicalPlan::Projection(updated_unnest_inner_projection))
             .unnest_columns_with_options(unnest_columns, unnest.options.clone())?
