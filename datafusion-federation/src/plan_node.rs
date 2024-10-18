@@ -1,8 +1,6 @@
 use core::fmt;
 use std::{
-    fmt::Debug,
-    hash::{Hash, Hasher},
-    sync::Arc,
+    fmt::Debug, hash::{Hash, Hasher}, sync::Arc
 };
 
 use async_trait::async_trait;
@@ -85,14 +83,15 @@ impl QueryPlanner for FederatedQueryPlanner {
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Get provider here?
-
         let physical_planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![
                 Arc::new(FederatedPlanner::new()),
             ]);
-        physical_planner
+        let plan = physical_planner
             .create_physical_plan(logical_plan, session_state)
-            .await
+            .await;
+        println!("{plan:?}");
+        plan
     }
 }
 
@@ -139,6 +138,7 @@ impl ExtensionPlanner for FederatedPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        println!("EXTENSION PLANNER");
         let dc_node = node.as_any().downcast_ref::<FederatedPlanNode>();
         if let Some(fed_node) = dc_node {
             assert_eq!(logical_inputs.len(), 0, "Inconsistent number of inputs");

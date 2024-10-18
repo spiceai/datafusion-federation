@@ -4,10 +4,14 @@ use std::{
     sync::Arc,
 };
 
-use datafusion::optimizer::analyzer::Analyzer;
+use datafusion::optimizer::Optimizer;
 
-mod analyzer;
-pub use analyzer::*;
+//mod analyzer;
+mod optimizer;
+pub use optimizer::*;
+pub use optimizer::FederationOptimizerRule;
+
+//pub use analyzer::*;
 mod table_provider;
 pub use table_provider::*;
 
@@ -24,9 +28,9 @@ pub trait FederationProvider: Send + Sync {
     // will execute a query. For example: database instance & catalog.
     fn compute_context(&self) -> Option<String>;
 
-    // Returns an analyzer that can cut out part of the plan
+    // Returns an optimizer that can cut out part of the plan
     // to federate it.
-    fn analyzer(&self) -> Option<Arc<Analyzer>>;
+    fn optimizer(&self) -> Option<Arc<Optimizer>>;
 }
 
 impl fmt::Display for dyn FederationProvider {

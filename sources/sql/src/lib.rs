@@ -17,7 +17,7 @@ use datafusion::{
         Between, BinaryExpr, Case, Cast, Expr, Extension, GroupingSet, Like, LogicalPlan,
         LogicalPlanBuilder, Projection, Subquery, TryCast,
     },
-    optimizer::analyzer::{Analyzer, AnalyzerRule},
+    optimizer::{analyzer::{Analyzer, AnalyzerRule}, Optimizer, OptimizerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
@@ -29,7 +29,7 @@ use datafusion::{
     },
 };
 use datafusion_federation::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederationOptimizerRule, FederationPlanner, FederationProvider
 };
 
 mod schema;
@@ -45,17 +45,18 @@ pub use executor::*;
 
 // SQLFederationProvider provides federation to SQL DMBSs.
 pub struct SQLFederationProvider {
-    analyzer: Arc<Analyzer>,
+    optimizer: Arc<Optimizer>,
     executor: Arc<dyn SQLExecutor>,
 }
 
 impl SQLFederationProvider {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
+        let rules: Vec<Arc<dyn OptimizerRule + Sync + Send>> = vec![
+            Arc::new(SQLFederationOptimizerRule::new(executor.clone())),
+        ];
         Self {
-            analyzer: Arc::new(Analyzer::with_rules(vec![Arc::new(
-                SQLFederationAnalyzerRule::new(Arc::clone(&executor)),
-            )])),
-            executor,
+            optimizer: Arc::new(Optimizer::with_rules(rules)),
+            executor, 
         }
     }
 }
@@ -68,10 +69,62 @@ impl FederationProvider for SQLFederationProvider {
     fn compute_context(&self) -> Option<String> {
         self.executor.compute_context()
     }
-
-    fn analyzer(&self) -> Option<Arc<Analyzer>> {
-        Some(Arc::clone(&self.analyzer))
+    
+    fn optimizer(&self) -> Option<Arc<Optimizer>> {
+        Some(self.optimizer.clone())
     }
+}
+
+struct SQLFederationOptimizerRule {
+    planner: Arc<dyn FederationPlanner>, 
+}
+
+impl SQLFederationOptimizerRule {
+    pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
+        Self {
+            planner: Arc::new(SQLFederationPlanner::new(Arc::clone(&executor))),
+        }
+    }
+}
+
+impl OptimizerRule for SQLFederationOptimizerRule {
+    fn try_optimize(
+        &self,
+        plan: &LogicalPlan,
+        _config: &dyn datafusion::optimizer::OptimizerConfig,
+    ) -> Result<Option<LogicalPlan>> {
+        println!("SQL OPTIMIZER {}", plan.display());
+        if let LogicalPlan::Extension ( enode ) = plan {
+            if let Extension { node } = enode {
+
+                if let Some(fed_plan) = node.as_any().downcast_ref::<FederatedPlanNode>() {
+                    //return Ok(Some(plan.clone()));
+                    println!("SQL OPTIMIZER ALREADY FEDERATED: {:?}", fed_plan);
+                    return Ok(None);
+                }
+            }
+        }
+        let fed_plan = FederatedPlanNode::new(plan.clone(), Arc::clone(&self.planner));
+        //println!("SQL OPTIMIZER FED PLAN {}", fed_plan.display());
+        let ext_node = Extension {
+            node: Arc::new(fed_plan),
+        };
+        println!("SQL OPTIMIZER EXTENSION {:?}", ext_node);
+        Ok(Some(LogicalPlan::Extension(ext_node)))
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        false
+    }
+    
+    fn name(&self) -> &str {
+        "federate_sql"
+    }
+    
+    fn apply_order(&self) -> Option<datafusion::optimizer::optimizer::ApplyOrder> {
+        Some(datafusion::optimizer::optimizer::ApplyOrder::BottomUp)
+    }
+    
 }
 
 struct SQLFederationAnalyzerRule {
@@ -88,6 +141,7 @@ impl SQLFederationAnalyzerRule {
 
 impl AnalyzerRule for SQLFederationAnalyzerRule {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        println!("SQL ANALYZER {}", plan.display());
         let fed_plan = FederatedPlanNode::new(plan.clone(), Arc::clone(&self.planner));
         let ext_node = Extension {
             node: Arc::new(fed_plan),
@@ -106,20 +160,27 @@ fn rewrite_table_scans(
     plan: &LogicalPlan,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
 ) -> Result<LogicalPlan> {
+    println!("Starting rewrite_table_scans for plan: {}", plan.display());
+
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
+            println!("Found TableScan: {:?}", table_scan);
+
             let original_table_name = table_scan.table_name.clone();
+            println!("Original table name: {:?}", original_table_name);
             let mut new_table_scan = table_scan.clone();
 
             let Some(federated_source) = get_table_source(&table_scan.source)? else {
-                // Not a federated source
+                println!("Not a federated source for table: {:?}", table_scan.table_name);
                 return Ok(plan.clone());
             };
 
             match federated_source.as_any().downcast_ref::<SQLTableSource>() {
                 Some(sql_table_source) => {
                     let remote_table_name = TableReference::from(sql_table_source.table_name());
+                    println!("Rewriting table: {:?} to remote table: {:?}", original_table_name, remote_table_name);
                     known_rewrites.insert(original_table_name, remote_table_name.clone());
+                    println!("Known rewrites: {:?}", known_rewrites);
 
                     // Rewrite the schema of this node to have the remote table as the qualifier.
                     let new_schema = (*new_table_scan.projected_schema)
@@ -129,36 +190,47 @@ fn rewrite_table_scans(
                     new_table_scan.table_name = remote_table_name;
                 }
                 None => {
-                    // Not a SQLTableSource (is this possible?)
+                    println!("Not a SQLTableSource for table: {:?}", table_scan.table_name);
                     return Ok(plan.clone());
                 }
             }
 
+            println!("Rewritten TableScan: {:?}", new_table_scan);
             return Ok(LogicalPlan::TableScan(new_table_scan));
         } else {
+            println!("Plan is not a TableScan: {:?}", plan);
             return Ok(plan.clone());
         }
     }
 
+    println!("Processing inputs for plan: {:?}", plan);
     let rewritten_inputs = plan
         .inputs()
         .into_iter()
-        .map(|i| rewrite_table_scans(i, known_rewrites))
+        .map(|i| {
+            let rewritten_input = rewrite_table_scans(i, known_rewrites);
+            println!("Rewritten input: {:?}", rewritten_input);
+            rewritten_input
+        })
         .collect::<Result<Vec<_>>>()?;
 
     match plan {
         LogicalPlan::Unnest(unnest) => {
+            println!("Found Unnest plan: {:?}", unnest);
             // The Union plan cannot be constructed from rewritten expressions. It requires specialized logic to handle
             // the renaming in UNNEST columns and the corresponding column aliases in the underlying projection plan.
             rewrite_unnest_plan(unnest, rewritten_inputs, known_rewrites)
         }
         _ => {
+            println!("Rewriting expressions for plan: {:?}", plan);
             let mut new_expressions = vec![];
             for expression in plan.expressions() {
                 let new_expr = rewrite_table_scans_in_expr(expression.clone(), known_rewrites)?;
+                println!("Rewritten expression: {:?}", new_expr);
                 new_expressions.push(new_expr);
             }
             let new_plan = plan.with_new_exprs(new_expressions, rewritten_inputs)?;
+            println!("Rewritten plan: {:?}", new_plan);
             Ok(new_plan)
         }
     }
@@ -668,10 +740,13 @@ impl FederationPlanner for SQLFederationPlanner {
         _session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = Arc::new(node.plan().schema().as_arrow().clone());
+        println!("Federation planner, plan is {}", node.plan());
         let input = Arc::new(VirtualExecutionPlan::new(
             node.plan().clone(),
             Arc::clone(&self.executor),
         ));
+        println!("Federation planner, input is {:?}", input);
+        //input.
         let schema_cast_exec = schema_cast::SchemaCastScanExec::new(input, schema);
         Ok(Arc::new(schema_cast_exec))
     }
@@ -705,6 +780,7 @@ impl VirtualExecutionPlan {
     }
 
     fn sql(&self) -> Result<String> {
+        println!("VXP: SQL: {}", self.plan.display());
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
         let mut ast = Unparser::new(self.executor.dialect().as_ref())
