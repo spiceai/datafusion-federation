@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
 use datafusion::{
-    common::Column,
-    config::ConfigOptions,
+    common::{tree_node::{Transformed, TreeNode, TreeNodeRewriter}, Column},
+    config::{ConfigOptions, OptimizerOptions},
     datasource::source_as_provider,
     error::Result,
     logical_expr::{Expr, LogicalPlan, Projection, TableScan, TableSource},
-    optimizer::analyzer::AnalyzerRule,
+    optimizer::{analyzer::AnalyzerRule, optimize_projections::OptimizeProjections, optimizer::ApplyOrder, push_down_filter::{self, PushDownFilter}, simplify_expressions::SimplifyExpressions, OptimizerConfig, OptimizerContext},
     sql::TableReference,
 };
 
-use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
+use crate::{optimize::optimize_plan, FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
+
 
 #[derive(Default)]
 pub struct FederationAnalyzerRule {}
@@ -20,6 +21,13 @@ impl AnalyzerRule for FederationAnalyzerRule {
     // TableScans from the same FederationProvider.
     // There 'largest sub-trees' are passed to their respective FederationProvider.optimizer.
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+    
+        if !contains_federated_table(&plan)? {
+            return Ok(plan);
+        }
+
+        let plan = optimize_plan(plan)?;
+
         let (optimized, _) = self.optimize_recursively(&plan, None, config)?;
         if let Some(result) = optimized {
             return Ok(result);
@@ -31,6 +39,17 @@ impl AnalyzerRule for FederationAnalyzerRule {
     fn name(&self) -> &str {
         "federation_optimizer_rule"
     }
+}
+
+fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
+    let federated_table_exists = plan.exists(|x| {
+        if let LogicalPlan::TableScan(TableScan { ref source, .. }) = x {
+            return Ok(get_table_source(source)?.is_some());
+        }
+        Ok(false)
+    })?;
+
+    Ok(federated_table_exists)
 }
 
 impl FederationAnalyzerRule {
@@ -142,6 +161,7 @@ impl FederationAnalyzerRule {
 fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     // TODO: minimize requested columns
     match plan {
+        //LogicalPlan::Projection(_) | LogicalPlan::TableScan(_)  => Ok(plan),
         LogicalPlan::Projection(_) => Ok(plan),
         _ => {
             let expr = plan
