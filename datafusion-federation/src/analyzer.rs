@@ -44,7 +44,7 @@ impl AnalyzerRule for FederationAnalyzerRule {
 fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
     let federated_table_exists = plan.exists(|x| {
         if let Some(provider) = get_federation_provider(x)?  {
-            // federated table provier should have an analyzer
+            // federated table provider should have an analyzer
             return Ok(provider.analyzer().is_some());
         }
         Ok(false)
@@ -162,7 +162,6 @@ fn get_federation_provider(plan: &LogicalPlan) -> Result<Option<FederationProvid
 fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     // TODO: minimize requested columns
     match plan {
-        //LogicalPlan::Projection(_) | LogicalPlan::TableScan(_)  => Ok(plan),
         LogicalPlan::Projection(_) => Ok(plan),
         _ => {
             let expr = plan

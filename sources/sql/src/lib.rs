@@ -714,9 +714,6 @@ impl VirtualExecutionPlan {
             ast = analyzer(ast)?;
         }
 
-        // TODO: remove in final PR 
-        println!("\nSQL:\n {}", ast);
-
         Ok(format!("{ast}"))
     }
 }

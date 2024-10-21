@@ -67,13 +67,8 @@ impl<'a> TreeNodeRewriter for Rewriter<'a> {
 fn should_run_rule_for_node(node: &LogicalPlan, _rule: &dyn OptimizerRule) -> bool {
     // this logic is applicable only for `push_down_filter_rule`; we don't have any other rules
     if let LogicalPlan::Filter(x) = node {
-        // Unaprser is not currently able to handle subquery, aggregate, and cross join optimizations
-        // !matches!(
-        //     x.input.as_ref(),
-        //     LogicalPlan::SubqueryAlias(_) | LogicalPlan::Aggregate(_) | LogicalPlan::CrossJoin(_)
-        // )
-        // LogicalPlan::Join(_) | LogicalPlan::Filter(_) | LogicalPlan::Distinct(_) | LogicalPlan::Sort(_) | LogicalPlan::TableScan(_) | LogicalPlan::Projection(_)
-        // only nodes that filter can be correctly unparsed after filter push down
+        // Applying the `push_down_filter_rule` to certain nodes like `SubqueryAlias`, `Aggregate`, and `CrossJoin`
+        // can cause issues during unparsing, thus the optimization is only applied to nodes that are currently supported.
         matches!(
             x.input.as_ref(),
             LogicalPlan::Join(_) | LogicalPlan::TableScan(_) | LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::Distinct(_) | LogicalPlan::Sort(_)
