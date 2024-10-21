@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use datafusion::{
-    common::{tree_node::{Transformed, TreeNode, TreeNodeRewriter}, Column},
-    config::{ConfigOptions, OptimizerOptions},
+    common::{tree_node::TreeNode, Column},
+    config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
     logical_expr::{Expr, LogicalPlan, Projection, TableScan, TableSource},
-    optimizer::{analyzer::AnalyzerRule, optimize_projections::OptimizeProjections, optimizer::ApplyOrder, push_down_filter::{self, PushDownFilter}, simplify_expressions::SimplifyExpressions, OptimizerConfig, OptimizerContext},
+    optimizer::analyzer::AnalyzerRule,
     sql::TableReference,
 };
 
@@ -43,8 +43,9 @@ impl AnalyzerRule for FederationAnalyzerRule {
 
 fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
     let federated_table_exists = plan.exists(|x| {
-        if let LogicalPlan::TableScan(TableScan { ref source, .. }) = x {
-            return Ok(get_table_source(source)?.is_some());
+        if let Some(provider) = get_federation_provider(x)?  {
+            // federated table provier should have an analyzer
+            return Ok(provider.analyzer().is_some());
         }
         Ok(false)
     })?;
@@ -68,7 +69,7 @@ impl FederationAnalyzerRule {
         _config: &ConfigOptions,
     ) -> Result<(Option<LogicalPlan>, Option<FederationProviderRef>)> {
         // Check if this node determines the FederationProvider
-        let sole_provider = self.get_federation_provider(plan)?;
+        let sole_provider = get_federation_provider(plan)?;
         if sole_provider.is_some() {
             return Ok((None, sole_provider));
         }
@@ -143,18 +144,18 @@ impl FederationAnalyzerRule {
 
         Ok((Some(new_plan), None))
     }
+}
 
-    fn get_federation_provider(&self, plan: &LogicalPlan) -> Result<Option<FederationProviderRef>> {
-        match plan {
-            LogicalPlan::TableScan(TableScan { ref source, .. }) => {
-                let Some(federated_source) = get_table_source(source)? else {
-                    return Ok(None);
-                };
-                let provider = federated_source.federation_provider();
-                Ok(Some(provider))
-            }
-            _ => Ok(None),
+fn get_federation_provider(plan: &LogicalPlan) -> Result<Option<FederationProviderRef>> {
+    match plan {
+        LogicalPlan::TableScan(TableScan { ref source, .. }) => {
+            let Some(federated_source) = get_table_source(source)? else {
+                return Ok(None);
+            };
+            let provider = federated_source.federation_provider();
+            Ok(Some(provider))
         }
+        _ => Ok(None),
     }
 }
 
