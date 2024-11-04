@@ -11,7 +11,7 @@ use datafusion::{
 };
 
 pub(crate) struct Optimizer {
-    state: SessionState,
+    config: SessionState,
     push_down_filter: PushDownFilter,
     optimize_projections: OptimizeProjections,
 }
@@ -19,13 +19,15 @@ pub(crate) struct Optimizer {
 impl Default for Optimizer {
     fn default() -> Self {
         // `push_down_filter` and `optimize_projections` does not use config (except `optimize_projections_preserve_existing_projections`) so it can be default
-        let config =
-            SessionConfig::new().with_optimize_projections_preserve_existing_projections(true);
-        // `SessionState` implements `OptimizerConfig` and allows specifying required configuration for optimization rules
-        let state = SessionStateBuilder::new().with_config(config).build();
+        // `SessionState` implements `OptimizerConfig` allowing specification of the required configuration for optimization rules.
+        let config = SessionStateBuilder::new()
+            .with_config(
+                SessionConfig::new().with_optimize_projections_preserve_existing_projections(true),
+            )
+            .build();
 
         Self {
-            state,
+            config,
             push_down_filter: PushDownFilter::new(),
             optimize_projections: OptimizeProjections::new(),
         }
@@ -42,14 +44,14 @@ impl Optimizer {
             .rewrite(&mut Rewriter::new(
                 ApplyOrder::TopDown,
                 &self.push_down_filter,
-                &self.state,
+                &self.config,
             ))?
             .data;
 
         // `optimize_projections` is applied recursively top down so it can be applied only once to the root node
         optimized_plan = self
             .optimize_projections
-            .rewrite(optimized_plan, &self.state)
+            .rewrite(optimized_plan, &self.config)
             .data()?;
 
         Ok(optimized_plan)
