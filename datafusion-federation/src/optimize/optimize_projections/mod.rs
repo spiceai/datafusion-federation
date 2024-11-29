@@ -1,22 +1,34 @@
-use std::{collections::{HashMap, HashSet}, result, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    result,
+    sync::Arc,
+};
 
-use datafusion::{common::{get_required_group_by_exprs_indices, internal_datafusion_err, internal_err, tree_node::{Transformed, TreeNode, TreeNodeIterator, TreeNodeRecursion}, Column, JoinType}, error::DataFusionError, logical_expr::{expr::Alias, projection_schema, Aggregate, Distinct, LogicalPlan, Projection, TableScan, Unnest, Window}, optimizer::{optimizer::ApplyOrder, utils::NamePreserver, OptimizerConfig, OptimizerRule}, prelude::Expr};
+use datafusion::{
+    common::{
+        get_required_group_by_exprs_indices, internal_datafusion_err, internal_err,
+        tree_node::{Transformed, TreeNode, TreeNodeIterator, TreeNodeRecursion},
+        Column, JoinType,
+    },
+    error::DataFusionError,
+    logical_expr::{
+        expr::Alias, Aggregate, Distinct, LogicalPlan, Projection, TableScan, Unnest, Window,
+    },
+    optimizer::{optimizer::ApplyOrder, utils::NamePreserver, OptimizerConfig, OptimizerRule},
+    prelude::Expr,
+};
 use required_indices::RequiredIndicies;
 
 type Result<T, E = DataFusionError> = result::Result<T, E>;
 
 /// A modified version of DataFusion's [`OptimizeProjections`](https://github.com/apache/datafusion/blob/main/datafusion/optimizer/src/optimize_projections/mod.rs) rule.
 ///
-/// This rule analyzes the input logical plan, determines the necessary column
-/// indices, and removes any unnecessary columns.
-///
-/// Unlike the original DataFusion implementation, this version does not create 
-/// or remove `Projection` nodes. This approach simplifies further conversion 
-/// to SQL, keeping the query layout simple and readable while relying on the 
+/// Unlike the original DataFusion implementation, this version does not create
+/// or remove `Projection` nodes. This is required for `unparser` to correctly convert
+/// `LogicalPlan` to SQL and also keeps the query layout simple and readable while relying on the
 /// underlying SQL engine to apply its own optimizations during execution.
-/// 
+///
 /// For more information, see the [DataFusion discussion](https://github.com/apache/datafusion/pull/13267).
-
 mod required_indices;
 
 #[derive(Default, Debug)]
@@ -137,8 +149,7 @@ fn optimize_projections(
 
             let all_exprs_iter = new_group_bys.iter().chain(new_aggr_expr.iter());
             let schema = aggregate.input.schema();
-            let necessary_indices =
-                RequiredIndicies::new().with_exprs(schema, all_exprs_iter);
+            let necessary_indices = RequiredIndicies::new().with_exprs(schema, all_exprs_iter);
             let necessary_exprs = necessary_indices.get_required_exprs(schema);
 
             return optimize_projections(
@@ -156,12 +167,8 @@ fn optimize_projections(
             .map_data(|aggregate_input| {
                 // Create a new aggregate plan with the updated input and only the
                 // absolutely necessary fields:
-                Aggregate::try_new(
-                    Arc::new(aggregate_input),
-                    new_group_bys,
-                    new_aggr_expr,
-                )
-                .map(LogicalPlan::Aggregate)
+                Aggregate::try_new(Arc::new(aggregate_input), new_group_bys, new_aggr_expr)
+                    .map(LogicalPlan::Aggregate)
             });
         }
         LogicalPlan::Window(window) => {
@@ -193,15 +200,11 @@ fn optimize_projections(
                     // Calculate required expressions at the input of the window.
                     // Please note that we use `input_schema`, because `required_indices`
                     // refers to that schema
-                    let required_exprs =
-                        required_indices.get_required_exprs(&input_schema);
+                    let required_exprs = required_indices.get_required_exprs(&input_schema);
 
-                    let window_child = add_projection_on_top_if_helpful(
-                        window_child,
-                        required_exprs,
-                        config,
-                    )?
-                    .data;
+                    let window_child =
+                        add_projection_on_top_if_helpful(window_child, required_exprs, config)?
+                            .data;
 
                     Window::try_new(new_window_expr, Arc::new(window_child))
                         .map(LogicalPlan::Window)
@@ -225,15 +228,9 @@ fn optimize_projections(
                 Some(projection) => indices.into_mapped_indices(|idx| projection[idx]),
                 None => indices.into_inner(),
             };
-            return TableScan::try_new(
-                table_name,
-                source,
-                Some(projection),
-                filters,
-                fetch,
-            )
-            .map(LogicalPlan::TableScan)
-            .map(Transformed::yes);
+            return TableScan::try_new(table_name, source, Some(projection), filters, fetch)
+                .map(LogicalPlan::TableScan)
+                .map(Transformed::yes);
         }
         // Other node types are handled below
         _ => {}
@@ -324,10 +321,8 @@ fn optimize_projections(
             let left_len = join.left.schema().fields().len();
             let (left_req_indices, right_req_indices) =
                 split_join_requirements(left_len, indices, &join.join_type);
-            let left_indices =
-                left_req_indices.with_plan_exprs(&plan, join.left.schema())?;
-            let right_indices =
-                right_req_indices.with_plan_exprs(&plan, join.right.schema())?;
+            let left_indices = left_req_indices.with_plan_exprs(&plan, join.left.schema())?;
+            let right_indices = right_req_indices.with_plan_exprs(&plan, join.right.schema())?;
             // Joins benefit from "small" input tables (lower memory usage).
             // Therefore, each child benefits from projection:
             vec![
@@ -373,15 +368,13 @@ fn optimize_projections(
         let projection_beneficial = required_indices.projection_beneficial();
         let project_exprs = required_indices.get_required_exprs(child.schema());
 
-        optimize_projections(child, config, required_indices)?.transform_data(
-            |new_input| {
-                if projection_beneficial {
-                    add_projection_on_top_if_helpful(new_input, project_exprs, config)
-                } else {
-                    Ok(Transformed::no(new_input))
-                }
-            },
-        )
+        optimize_projections(child, config, required_indices)?.transform_data(|new_input| {
+            if projection_beneficial {
+                add_projection_on_top_if_helpful(new_input, project_exprs, config)
+            } else {
+                Ok(Transformed::no(new_input))
+            }
+        })
     })?;
 
     // If any of the children are transformed, we need to potentially update the plan's schema
@@ -434,8 +427,7 @@ fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Project
     if column_referral_map.into_iter().any(|(col, usage)| {
         usage > 1
             && !is_expr_trivial(
-                &prev_projection.expr
-                    [prev_projection.schema.index_of_column(col).unwrap()],
+                &prev_projection.expr[prev_projection.schema.index_of_column(col).unwrap()],
             )
     }) {
         // no change
@@ -481,8 +473,7 @@ fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Project
     } else {
         // not rewritten, so put the projection back together
         let input = Arc::new(LogicalPlan::Projection(prev_projection));
-        Projection::try_new_with_schema(new_exprs.data, input, schema)
-            .map(Transformed::no)
+        Projection::try_new_with_schema(new_exprs.data, input, schema).map(Transformed::no)
     }
 }
 
@@ -581,10 +572,7 @@ fn outer_columns<'a>(expr: &'a Expr, columns: &mut HashSet<&'a Column>) {
                 outer_columns_helper_multi(&exists.subquery.outer_ref_columns, columns);
             }
             Expr::InSubquery(insubquery) => {
-                outer_columns_helper_multi(
-                    &insubquery.subquery.outer_ref_columns,
-                    columns,
-                );
+                outer_columns_helper_multi(&insubquery.subquery.outer_ref_columns, columns);
             }
             _ => {}
         };
@@ -669,7 +657,6 @@ fn add_projection_on_top_if_helpful(
 ) -> Result<Transformed<LogicalPlan>> {
     // Always prefer the original query layout.
     Ok(Transformed::no(plan))
-
 }
 
 /// Rewrite the given projection according to the fields required by its
@@ -698,13 +685,12 @@ fn rewrite_projection_given_requirements(
 
     let exprs_used = indices.get_at_indices(&expr);
 
-    let required_indices =
-        RequiredIndicies::new().with_exprs(input.schema(), exprs_used.iter());
+    let required_indices = RequiredIndicies::new().with_exprs(input.schema(), exprs_used.iter());
 
     // rewrite the children projection, and if they are changed rewrite the
     // projection down
-    optimize_projections(Arc::unwrap_or_clone(input), config, required_indices)?
-        .transform_data(|input| {
+    optimize_projections(Arc::unwrap_or_clone(input), config, required_indices)?.transform_data(
+        |input| {
             if is_projection_unnecessary(&input, &exprs_used, config)? {
                 Ok(Transformed::yes(input))
             } else {
@@ -712,7 +698,8 @@ fn rewrite_projection_given_requirements(
                     .map(LogicalPlan::Projection)
                     .map(Transformed::yes)
             }
-        })
+        },
+    )
 }
 
 fn is_projection_unnecessary(
@@ -722,4 +709,322 @@ fn is_projection_unnecessary(
 ) -> Result<bool> {
     // Always prefer the original query layout. Return false to keep the projection.
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema},
+        common::{DFSchema, JoinType},
+        error::DataFusionError,
+        functions_aggregate::{
+            count::{count, count_udaf},
+            min_max::max,
+        },
+        logical_expr::{
+            LogicalPlan, LogicalPlanBuilder, LogicalTableSource, TableSource, UNNAMED_TABLE,
+        },
+        optimizer::{Optimizer, OptimizerContext, OptimizerRule},
+        prelude::{col, lit, Expr, ExprFunctionExt},
+        sql::TableReference,
+    };
+
+    type Result<T, E = DataFusionError> = std::result::Result<T, E>;
+
+    #[test]
+    fn aggregate_filter_pushdown_preserve_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let aggr_with_filter = count_udaf()
+            .call(vec![col("b")])
+            .filter(col("c").gt(lit(42)))
+            .build()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![count(col("b")), aggr_with_filter.alias("count2")],
+            )?
+            .project(vec![col("a"), col("count(test.b)"), col("count2")])?
+            .build()?;
+
+        let expected = "Projection: test.a, count(test.b), count2\
+        \n  Aggregate: groupBy=[[test.a]], aggr=[[count(test.b), count(test.b) FILTER (WHERE test.c > Int32(42)) AS count2]]\
+        \n    TableScan: test projection=[a, b, c]";
+
+        assert_optimized_plan_equal(plan, expected)?;
+
+        Ok(())
+    }
+
+    // Selected tests and helpers from the original DataFusion implementation of `OptimizeProjections` rule to ensure
+    // that the modified version behaves as expected.
+    // See: <https://github.com/apache/datafusion/blob/main/datafusion/optimizer/src/optimize_projections/mod.rs>
+
+    #[test]
+    fn aggregate_no_group_by() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(Vec::<Expr>::new(), vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[]], aggr=[[max(test.b)]]\
+        \n  TableScan: test projection=[b]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_group_by() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(vec![col("c")], vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[test.c]], aggr=[[max(test.b)]]\
+        \n  TableScan: test projection=[b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_group_by_with_table_alias() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .alias("a")?
+            .aggregate(vec![col("c")], vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[a.c]], aggr=[[max(a.b)]]\
+        \n  SubqueryAlias: a\
+        \n    TableScan: test projection=[b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_no_group_by_with_filter() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(col("c").gt(lit(1)))?
+            .aggregate(Vec::<Expr>::new(), vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[]], aggr=[[max(test.b)]]\
+        \n  Filter: test.c > Int32(1)\
+        \n    TableScan: test projection=[b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn join_schema_trim_using_join() -> Result<()> {
+        // shared join columns from using join should be pushed to both sides
+
+        let table_scan = test_table_scan()?;
+
+        let schema = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+        let table2_scan = scan_empty(Some("test2"), &schema, None)?.build()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .join_using(table2_scan, JoinType::Left, vec!["a"])?
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+
+        // make sure projections are pushed down to table scan
+        let expected = "Projection: test.a, test.b\
+        \n  Left Join: Using test.a = test2.a\
+        \n    TableScan: test projection=[a, b]\
+        \n    TableScan: test2 projection=[a]";
+
+        let optimized_plan = optimize(plan)?;
+        let formatted_plan = format!("{optimized_plan}");
+        assert_eq!(formatted_plan, expected);
+
+        // make sure schema for join node include both join columns
+        let optimized_join = optimized_plan.inputs()[0];
+        assert_eq!(
+            **optimized_join.schema(),
+            DFSchema::new_with_metadata(
+                vec![
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("a", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("b", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test2".into()),
+                        Arc::new(Field::new("a", DataType::UInt32, true))
+                    ),
+                ],
+                HashMap::new()
+            )?,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn redundant_project() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a"), col("b"), col("c")])?
+            .project(vec![col("a"), col("c"), col("b")])?
+            .build()?;
+        let expected = "Projection: test.a, test.c, test.b\
+        \n  TableScan: test projection=[a, b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn reorder_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("c"), col("b"), col("a")])?
+            .build()?;
+        let expected = "Projection: test.c, test.b, test.a\
+        \n  TableScan: test projection=[a, b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn table_scan_without_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(table_scan).build()?;
+        // should expand projection to all columns without projection
+        let expected = "TableScan: test projection=[a, b, c]";
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn table_unused_column() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        assert_eq!(3, table_scan.schema().fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+
+        // we never use "b" in the first projection => remove it
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("c"), col("a"), col("b")])?
+            .filter(col("c").gt(lit(1)))?
+            .aggregate(vec![col("c")], vec![max(col("a"))])?
+            .build()?;
+
+        assert_fields_eq(&plan, vec!["c", "max(test.a)"]);
+
+        let plan = optimize(plan).expect("failed to optimize plan");
+        let expected = "\
+        Aggregate: groupBy=[[test.c]], aggr=[[max(test.a)]]\
+        \n  Filter: test.c > Int32(1)\
+        \n    Projection: test.c, test.a\
+        \n      TableScan: test projection=[a, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
+
+    fn assert_optimized_plan_equal(plan: LogicalPlan, expected: &str) -> Result<()> {
+        assert_optimized_plan_eq(Arc::new(super::OptimizeProjections::new()), plan, expected)
+    }
+
+    pub fn assert_optimized_plan_eq(
+        rule: Arc<dyn OptimizerRule + Send + Sync>,
+        plan: LogicalPlan,
+        expected: &str,
+    ) -> Result<()> {
+        // Apply the rule once
+        let opt_context = OptimizerContext::new().with_max_passes(1);
+
+        let optimizer = Optimizer::with_rules(vec![Arc::clone(&rule)]);
+        let optimized_plan = optimizer.optimize(plan, &opt_context, observe)?;
+        let formatted_plan = format!("{optimized_plan}");
+        assert_eq!(formatted_plan, expected);
+
+        Ok(())
+    }
+
+    fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
+        let optimizer = Optimizer::with_rules(vec![Arc::new(super::OptimizeProjections::new())]);
+        let optimized_plan = optimizer.optimize(plan, &OptimizerContext::new(), observe)?;
+        Ok(optimized_plan)
+    }
+
+    pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
+        let actual: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    pub fn test_table_scan_fields() -> Vec<Field> {
+        vec![
+            Field::new("a", DataType::UInt32, false),
+            Field::new("b", DataType::UInt32, false),
+            Field::new("c", DataType::UInt32, false),
+        ]
+    }
+
+    /// some tests share a common table with different names
+    pub fn test_table_scan_with_name(name: &str) -> Result<LogicalPlan> {
+        let schema = Schema::new(test_table_scan_fields());
+        table_scan(Some(name), &schema, None)?.build()
+    }
+
+    /// some tests share a common table
+    pub fn test_table_scan() -> Result<LogicalPlan> {
+        test_table_scan_with_name("test")
+    }
+
+    /// Scan an empty data source, mainly used in tests
+    pub fn scan_empty(
+        name: Option<&str>,
+        table_schema: &Schema,
+        projection: Option<Vec<usize>>,
+    ) -> Result<LogicalPlanBuilder> {
+        table_scan(name, table_schema, projection)
+    }
+    /// Create a LogicalPlanBuilder representing a scan of a table with the provided name and schema.
+    /// This is mostly used for testing and documentation.
+    pub fn table_scan(
+        name: Option<impl Into<TableReference>>,
+        table_schema: &Schema,
+        projection: Option<Vec<usize>>,
+    ) -> Result<LogicalPlanBuilder> {
+        table_scan_with_filters(name, table_schema, projection, vec![])
+    }
+
+    /// Create a LogicalPlanBuilder representing a scan of a table with the provided name and schema,
+    /// and inlined filters.
+    /// This is mostly used for testing and documentation.
+    pub fn table_scan_with_filters(
+        name: Option<impl Into<TableReference>>,
+        table_schema: &Schema,
+        projection: Option<Vec<usize>>,
+        filters: Vec<Expr>,
+    ) -> Result<LogicalPlanBuilder> {
+        let table_source = table_source(table_schema);
+        let name = name
+            .map(|n| n.into())
+            .unwrap_or_else(|| TableReference::bare(UNNAMED_TABLE));
+        LogicalPlanBuilder::scan_with_filters(name, table_source, projection, filters)
+    }
+
+    fn table_source(table_schema: &Schema) -> Arc<dyn TableSource> {
+        let table_schema = Arc::new(table_schema.clone());
+        Arc::new(LogicalTableSource::new(table_schema))
+    }
 }

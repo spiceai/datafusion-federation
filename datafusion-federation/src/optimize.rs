@@ -31,10 +31,6 @@ impl Default for Optimizer {
 }
 
 impl Optimizer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn optimize_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let mut optimized_plan = plan
             .rewrite(&mut Rewriter::new(

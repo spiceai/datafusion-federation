@@ -6,6 +6,8 @@ use super::outer_columns;
 
 type Result<T, E = DataFusionError> = result::Result<T, E>;
 
+/// Copy of DataFusion's [`RequiredIndicies`](https://github.com/apache/datafusion/blob/main/datafusion/optimizer/src/optimize_projections/required_indices.rs) implementation.
+
 /// Represents columns in a schema which are required (used) by a plan node
 ///
 /// Also carries a flag indicating if putting a projection above children is
