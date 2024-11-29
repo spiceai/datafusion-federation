@@ -19,7 +19,7 @@ pub(crate) struct Optimizer {
 
 impl Default for Optimizer {
     fn default() -> Self {
-        // `push_down_filter` and `optimize_projections` does not use confi so it can be default
+        // `push_down_filter` and `optimize_projections` does not use config so it can be default
         let config = OptimizerContext::default();
 
         Self {
