@@ -93,16 +93,17 @@ impl FederationAnalyzerRule {
             .into_iter()
             .unzip();
 
-        let _ = plan.clone().map_subqueries(|sub_query| {
-            let (_, subquery_provider) =
-                self.optimize_recursively(&sub_query, Some(plan), _config)?;
-            providers.push(subquery_provider);
-            Ok(Transformed::no(sub_query))
+        let mut subquery_provider = None;
+        let _ = plan.apply_subqueries(|sub_query| {
+            let (_, provider) = self.optimize_recursively(sub_query, Some(plan), _config)?;
+            subquery_provider = provider;
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop)
         });
 
         // Note: assumes provider is None if ambiguous
         let first_provider = providers.first().unwrap();
-        let is_singular = providers.iter().all(|p| p.is_some() && p == first_provider);
+        let is_singular = providers.iter().all(|p| p.is_some() && p == first_provider)
+            && first_provider == &subquery_provider;
 
         if is_singular {
             if parent.is_none() {
