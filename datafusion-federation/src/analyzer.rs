@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
+use crate::{
+    optimize::Optimizer, FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef,
+};
+use datafusion::common::tree_node::Transformed;
 use datafusion::{
     common::{tree_node::TreeNode, Column},
     config::ConfigOptions,
-    datasource::source_as_provider,
+    datasource::{provider, source_as_provider},
     error::Result,
     logical_expr::{Expr, LogicalPlan, Projection, TableScan, TableSource},
     optimizer::analyzer::AnalyzerRule,
     sql::TableReference,
-};
-
-use crate::{
-    optimize::Optimizer, FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef,
 };
 
 #[derive(Default, Debug)]
@@ -25,10 +25,13 @@ impl AnalyzerRule for FederationAnalyzerRule {
     // There 'largest sub-trees' are passed to their respective FederationProvider.optimizer.
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
         if !contains_federated_table(&plan)? {
+            // println!("Plan doesn't contain federated table");
             return Ok(plan);
         }
 
-        let plan = self.optimizer.optimize_plan(plan)?;
+        // println!("Plan contains federated table");
+
+        // let plan = self.optimizer.optimize_plan(plan)?;
 
         let (optimized, _) = self.optimize_recursively(&plan, None, config)?;
         if let Some(result) = optimized {
@@ -70,6 +73,7 @@ impl FederationAnalyzerRule {
         parent: Option<&LogicalPlan>,
         _config: &ConfigOptions,
     ) -> Result<(Option<LogicalPlan>, Option<FederationProviderRef>)> {
+        println!("{:?}", plan);
         // Check if this node determines the FederationProvider
         let sole_provider = get_federation_provider(plan)?;
         if sole_provider.is_some() {
@@ -82,12 +86,19 @@ impl FederationAnalyzerRule {
             return Ok((None, None));
         }
 
-        let (new_inputs, providers): (Vec<_>, Vec<_>) = inputs
+        let (new_inputs, mut providers): (Vec<_>, Vec<_>) = inputs
             .iter()
             .map(|i| self.optimize_recursively(i, Some(plan), _config))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .unzip();
+
+        let _ = plan.clone().map_subqueries(|sub_query| {
+            let (_, subquery_provider) =
+                self.optimize_recursively(&sub_query, Some(plan), _config)?;
+            providers.push(subquery_provider);
+            Ok(Transformed::no(sub_query))
+        });
 
         // Note: assumes provider is None if ambiguous
         let first_provider = providers.first().unwrap();
