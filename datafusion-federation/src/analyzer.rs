@@ -25,7 +25,6 @@ impl AnalyzerRule for FederationAnalyzerRule {
     // There 'largest sub-trees' are passed to their respective FederationProvider.optimizer.
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
         if !contains_federated_table(&plan)? {
-            // println!("Plan doesn't contain federated table");
             return Ok(plan);
         }
 
