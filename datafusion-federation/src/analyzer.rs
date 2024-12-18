@@ -7,7 +7,7 @@ use datafusion::common::tree_node::Transformed;
 use datafusion::{
     common::{tree_node::TreeNode, Column},
     config::ConfigOptions,
-    datasource::{provider, source_as_provider},
+    datasource::source_as_provider,
     error::Result,
     logical_expr::{Expr, LogicalPlan, Projection, TableScan, TableSource},
     optimizer::analyzer::AnalyzerRule,
@@ -29,10 +29,7 @@ impl AnalyzerRule for FederationAnalyzerRule {
             return Ok(plan);
         }
 
-        // println!("Plan contains federated table");
-
-        // let plan = self.optimizer.optimize_plan(plan)?;
-
+        let plan = self.optimizer.optimize_plan(plan)?;
         let (optimized, _) = self.optimize_recursively(&plan, None, config)?;
         if let Some(result) = optimized {
             return Ok(result);
@@ -73,7 +70,6 @@ impl FederationAnalyzerRule {
         parent: Option<&LogicalPlan>,
         _config: &ConfigOptions,
     ) -> Result<(Option<LogicalPlan>, Option<FederationProviderRef>)> {
-        println!("{:?}", plan);
         // Check if this node determines the FederationProvider
         let sole_provider = get_federation_provider(plan)?;
         if sole_provider.is_some() {
@@ -86,24 +82,35 @@ impl FederationAnalyzerRule {
             return Ok((None, None));
         }
 
-        let (new_inputs, mut providers): (Vec<_>, Vec<_>) = inputs
+        let (new_inputs, providers): (Vec<_>, Vec<_>) = inputs
             .iter()
             .map(|i| self.optimize_recursively(i, Some(plan), _config))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .unzip();
 
+        let mut subquery_provider_exist = false;
         let mut subquery_provider = None;
-        let _ = plan.apply_subqueries(|sub_query| {
-            let (_, provider) = self.optimize_recursively(sub_query, Some(plan), _config)?;
-            subquery_provider = provider;
-            Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop)
-        });
+
+        let plan_with_updated_subquery = plan
+            .clone()
+            .map_subqueries(|sub_query| {
+                let (subquery, provider) =
+                    self.optimize_recursively(&sub_query, Some(plan), _config)?;
+                subquery_provider_exist = true;
+                subquery_provider = provider;
+
+                match subquery {
+                    Some(s) => Ok(Transformed::yes(s)),
+                    None => Ok(Transformed::no(sub_query)),
+                }
+            })?
+            .data;
 
         // Note: assumes provider is None if ambiguous
         let first_provider = providers.first().unwrap();
         let is_singular = providers.iter().all(|p| p.is_some() && p == first_provider)
-            && first_provider == &subquery_provider;
+            && (!subquery_provider_exist || &subquery_provider == first_provider);
 
         if is_singular {
             if parent.is_none() {
@@ -153,7 +160,7 @@ impl FederationAnalyzerRule {
             // Unnest returns columns to unnest as `expressions` but does not support passing them back to `with_new_exprs`.
             // Instead, it uses data from its internal representation to create a new plan.
             LogicalPlan::Unnest(_) => plan.with_new_exprs(vec![], new_inputs)?,
-            _ => plan.with_new_exprs(plan.expressions(), new_inputs)?,
+            _ => plan.with_new_exprs(plan_with_updated_subquery.expressions(), new_inputs)?,
         };
 
         Ok((Some(new_plan), None))
