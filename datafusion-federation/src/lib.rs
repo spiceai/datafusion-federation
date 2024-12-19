@@ -4,13 +4,10 @@ use std::{
     sync::Arc,
 };
 
-// use datafusion::optimizer::analyzer::Analyzer;
-use datafusion::optimizer::{optimizer::Optimizer, OptimizerRule};
-pub use optimizer::{get_table_source, FederationOptimizerRule};
+use datafusion::optimizer::analyzer::Analyzer;
 
-mod optimizer;
-// mod analyzer;
-// pub use analyzer::*;
+mod analyzer;
+pub use analyzer::*;
 mod optimize;
 mod table_provider;
 pub use table_provider::*;
@@ -18,28 +15,6 @@ pub use table_provider::*;
 mod plan_node;
 pub use plan_node::*;
 pub mod schema_cast;
-
-pub fn default_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    // Get the default optimizer
-    let df_default = Optimizer::new();
-    let mut default_rules = df_default.rules;
-
-    // Insert the FederationOptimizerRule after the ScalarSubqueryToJoin.
-    // This ensures ScalarSubquery are replaced before we try to federate.
-    let Some(pos) = default_rules
-        .iter()
-        .position(|x| x.name() == "scalar_subquery_to_join")
-    else {
-        panic!("Could not locate ScalarSubqueryToJoin");
-    };
-
-    // TODO: check if we should allow other optimizers to run before the federation rule.
-
-    let federation_rule = Arc::new(FederationOptimizerRule::new());
-    default_rules.insert(pos + 1, federation_rule);
-
-    default_rules
-}
 
 pub type FederationProviderRef = Arc<dyn FederationProvider>;
 pub trait FederationProvider: Send + Sync {
@@ -50,9 +25,9 @@ pub trait FederationProvider: Send + Sync {
     // will execute a query. For example: database instance & catalog.
     fn compute_context(&self) -> Option<String>;
 
-    // Returns an optimizer that can cut out part of the plan
+    // Returns an analyzer that can cut out part of the plan
     // to federate it.
-    fn optimizer(&self) -> Option<Arc<Optimizer>>;
+    fn analyzer(&self) -> Option<Arc<Analyzer>>;
 }
 
 impl fmt::Display for dyn FederationProvider {

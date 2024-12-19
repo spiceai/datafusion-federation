@@ -4,7 +4,8 @@ use std::{any::Any, collections::HashMap, sync::Arc, vec};
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
-    common::{tree_node::Transformed, Column},
+    common::Column,
+    config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
     logical_expr::{
@@ -16,7 +17,7 @@ use datafusion::{
         Between, BinaryExpr, Case, Cast, Expr, Extension, GroupingSet, Like, LogicalPlan,
         LogicalPlanBuilder, Projection, Subquery, TryCast,
     },
-    optimizer::{optimizer::Optimizer, OptimizerConfig, OptimizerRule},
+    optimizer::analyzer::{Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
@@ -44,15 +45,15 @@ pub use executor::*;
 
 // SQLFederationProvider provides federation to SQL DMBSs.
 pub struct SQLFederationProvider {
-    optimizer: Arc<Optimizer>,
+    analyzer: Arc<Analyzer>,
     executor: Arc<dyn SQLExecutor>,
 }
 
 impl SQLFederationProvider {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
-            optimizer: Arc::new(Optimizer::with_rules(vec![Arc::new(
-                SQLFederationOptimizerRule::new(executor.clone()),
+            analyzer: Arc::new(Analyzer::with_rules(vec![Arc::new(
+                SQLFederationAnalyzerRule::new(Arc::clone(&executor)),
             )])),
             executor,
         }
@@ -68,22 +69,22 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn optimizer(&self) -> Option<Arc<Optimizer>> {
-        Some(self.optimizer.clone())
+    fn analyzer(&self) -> Option<Arc<Analyzer>> {
+        Some(Arc::clone(&self.analyzer))
     }
 }
 
-struct SQLFederationOptimizerRule {
+struct SQLFederationAnalyzerRule {
     planner: Arc<dyn FederationPlanner>,
 }
 
-impl std::fmt::Debug for SQLFederationOptimizerRule {
+impl std::fmt::Debug for SQLFederationAnalyzerRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SQLFederationAnalyzerRule").finish()
     }
 }
 
-impl SQLFederationOptimizerRule {
+impl SQLFederationAnalyzerRule {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
             planner: Arc::new(SQLFederationPlanner::new(Arc::clone(&executor))),
@@ -91,39 +92,18 @@ impl SQLFederationOptimizerRule {
     }
 }
 
-impl OptimizerRule for SQLFederationOptimizerRule {
-    /// Try to rewrite `plan` to an optimized form, returning `Transformed::yes`
-    /// if the plan was rewritten and `Transformed::no` if it was not.
-    ///
-    /// Note: this function is only called if [`Self::supports_rewrite`] returns
-    /// true. Otherwise the Optimizer calls  [`Self::try_optimize`]
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        if let LogicalPlan::Extension(Extension { ref node }) = plan {
-            if node.name() == "Federated" {
-                // Avoid attempting double federation
-                return Ok(Transformed::no(plan));
-            }
-        }
-        // Simply accept the entire plan for now
-        let fed_plan = FederatedPlanNode::new(plan.clone(), self.planner.clone());
+impl AnalyzerRule for SQLFederationAnalyzerRule {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        let fed_plan = FederatedPlanNode::new(plan.clone(), Arc::clone(&self.planner));
         let ext_node = Extension {
             node: Arc::new(fed_plan),
         };
-        Ok(Transformed::yes(LogicalPlan::Extension(ext_node)))
+        Ok(LogicalPlan::Extension(ext_node))
     }
 
     /// A human readable name for this analyzer rule
     fn name(&self) -> &str {
         "federate_sql"
-    }
-
-    /// Does this rule support rewriting owned plans (rather than by reference)?
-    fn supports_rewrite(&self) -> bool {
-        true
     }
 }
 

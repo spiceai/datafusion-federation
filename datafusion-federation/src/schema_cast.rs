@@ -4,7 +4,8 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties,
 };
 use futures::StreamExt;
 use std::any::Any;
@@ -14,8 +15,8 @@ use std::sync::Arc;
 
 mod intervals_cast;
 mod lists_cast;
-pub mod record_convert;
 mod struct_cast;
+pub mod record_convert;
 
 #[derive(Debug)]
 #[allow(clippy::module_name_repetitions)]
@@ -69,7 +70,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         vec![&self.input]
     }
 
-    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
+    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel. 
     /// This guarantees that the input is processed as a single stream, preserving the order of the data.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
