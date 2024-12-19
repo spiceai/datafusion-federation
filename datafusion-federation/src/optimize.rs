@@ -3,7 +3,11 @@ use datafusion::{
     error::Result,
     logical_expr::LogicalPlan,
     optimizer::{
-        optimizer::ApplyOrder, push_down_filter::PushDownFilter, OptimizerConfig, OptimizerContext, OptimizerRule
+        decorrelate_predicate_subquery::DecorrelatePredicateSubquery,
+        optimizer::ApplyOrder,
+        push_down_filter::PushDownFilter,
+        scalar_subquery_to_join::{self, ScalarSubqueryToJoin},
+        OptimizerConfig, OptimizerContext, OptimizerRule,
     },
 };
 use optimize_projections::OptimizeProjections;
@@ -43,6 +47,12 @@ impl Optimizer {
         // `optimize_projections` is applied recursively top down so it can be applied only once to the root node
         optimized_plan = self
             .optimize_projections
+            .rewrite(optimized_plan, &self.config)
+            .data()?;
+
+        // Run the ScalarSubqueryToJoin before federation
+        let scalar_subquery_to_join_optimizer = ScalarSubqueryToJoin::new();
+        optimized_plan = scalar_subquery_to_join_optimizer
             .rewrite(optimized_plan, &self.config)
             .data()?;
 
