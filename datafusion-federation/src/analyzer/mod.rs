@@ -4,7 +4,9 @@ use crate::FederationProvider;
 use crate::{
     optimize::Optimizer, FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef,
 };
+use datafusion::logical_expr::col;
 use datafusion::logical_expr::expr::InSubquery;
+use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{logical_plan, LogicalPlanBuilder, LogicalTableSource};
 use datafusion::physical_plan::projection;
 use datafusion::{
@@ -299,9 +301,24 @@ impl FederationAnalyzerRule {
                 };
 
                 // DecorrelatePredicateSubquery doesn't support federated node (LogicalPlan::Extension(_)) as subquery
-                // Return the non-federated query
+                // Wrap a `non-op` Projection LogicalPlan outside the federated node to facilitate DecorrelatePredicateSubquery optimization
                 if matches!(new_subquery, LogicalPlan::Extension(_)) {
-                    return Ok(Transformed::no(expr));
+                    let all_columns = new_subquery
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| col(field.name()))
+                        .collect::<Vec<_>>();
+
+                    let projection_plan = LogicalPlanBuilder::from(new_subquery)
+                        .project(all_columns)?
+                        .build()?;
+
+                    return Ok(Transformed::yes(Expr::InSubquery(InSubquery::new(
+                        in_subquery.expr.clone(),
+                        subquery.with_plan(projection_plan.into()),
+                        in_subquery.negated,
+                    ))));
                 }
 
                 Ok(Transformed::yes(Expr::InSubquery(InSubquery::new(
