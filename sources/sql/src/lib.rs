@@ -24,8 +24,7 @@ use datafusion::{
         SendableRecordBatchStream,
     },
     sql::{
-        unparser::{plan_to_sql, Unparser},
-        TableReference,
+       unparser::{dialect::Dialect, plan_to_sql, Unparser}, TableReference
     },
 };
 use datafusion_federation::{
@@ -58,9 +57,17 @@ impl SQLFederationProvider {
             executor,
         }
     }
+
+    pub fn dialect(&self) -> Arc<dyn Dialect> {
+        self.executor.dialect()
+    }
 }
 
 impl FederationProvider for SQLFederationProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
     fn name(&self) -> &str {
         "sql_federation_provider"
     }

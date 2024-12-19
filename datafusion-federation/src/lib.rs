@@ -1,7 +1,6 @@
 use core::fmt;
 use std::{
-    hash::{Hash, Hasher},
-    sync::Arc,
+    any::Any, hash::{Hash, Hasher}, sync::Arc
 };
 
 use datafusion::optimizer::analyzer::Analyzer;
@@ -18,6 +17,8 @@ pub mod schema_cast;
 
 pub type FederationProviderRef = Arc<dyn FederationProvider>;
 pub trait FederationProvider: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    
     // Returns the name of the provider, used for comparison.
     fn name(&self) -> &str;
 

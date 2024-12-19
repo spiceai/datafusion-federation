@@ -28,6 +28,10 @@ impl FederatedPlanNode {
     pub fn plan(&self) -> &LogicalPlan {
         &self.plan
     }
+
+    pub fn planner(&self) -> Arc<dyn FederationPlanner> {
+        Arc::clone(&self.planner)
+    }
 }
 
 impl PartialOrd for FederatedPlanNode {
