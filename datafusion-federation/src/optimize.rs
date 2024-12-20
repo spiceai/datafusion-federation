@@ -3,6 +3,7 @@ use datafusion::{
     error::Result,
     logical_expr::LogicalPlan,
     optimizer::{
+        decorrelate::PullUpCorrelatedExpr,
         decorrelate_predicate_subquery::DecorrelatePredicateSubquery,
         optimizer::ApplyOrder,
         push_down_filter::PushDownFilter,
