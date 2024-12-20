@@ -4,18 +4,10 @@ use crate::FederationProvider;
 use crate::{
     optimize::Optimizer, FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef,
 };
-use datafusion::common::tree_node::TreeNodeVisitor;
-use datafusion::logical_expr::expr::InSubquery;
-use datafusion::logical_expr::lit;
-use datafusion::logical_expr::{col, expr};
-use datafusion::logical_expr::{logical_plan, LogicalPlanBuilder, LogicalTableSource};
-use datafusion::physical_plan::projection;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
 use datafusion::{
-    common::{
-        not_impl_err,
-        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
-        Column,
-    },
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
@@ -25,7 +17,6 @@ use datafusion::{
 };
 use scan_result::ScanResult;
 use std::collections::HashMap;
-use std::fmt::format;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -55,12 +46,8 @@ impl AnalyzerRule for FederationAnalyzerRule {
         // Run selected optimizer rules before federation
         let plan = self.optimizer.optimize_plan(plan)?;
 
-        let _ = self.get_plan_provider_recursively(&plan)?;
-        let map = self.provider_map.read().unwrap();
-        for (key, value) in map.iter() {
-            println!("MAP!");
-            println!("{:?}, {:?}", key, value);
-        }
+        // Find all federation provider for TableReference appeared in the plan
+        self.get_plan_provider_recursively(&plan)?;
 
         match self.optimize_plan_recursively(&plan, true, config)? {
             (Some(optimized_plan), _) => Ok(optimized_plan),
@@ -79,13 +66,14 @@ impl FederationAnalyzerRule {
         Self::default()
     }
 
+    /// Recursively find the [`FederationProvider`] for all [`TableReference`] instances in the plan.
+    /// This information is used to resolve the federation provider for [`Expr::OuterReferenceColumn`].
     fn get_plan_provider_recursively(&self, plan: &LogicalPlan) -> Result<()> {
         let mut providers_to_insert: Vec<(TableReference, ScanResult)> = Vec::new();
 
         plan.apply(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
             let (federation_provider, table_reference) = get_leaf_provider(p)?;
             if let Some(table_reference) = table_reference {
-                println!("FOUND {:?}", table_reference);
                 providers_to_insert.push((table_reference, federation_provider.into()));
             }
 
@@ -97,12 +85,13 @@ impl FederationAnalyzerRule {
             Ok(TreeNodeRecursion::Continue)
         })?;
 
-        // Acquire the write lock and update the provider_map
-        {
-            let mut map = self.provider_map.write().unwrap();
-            for (table_reference, federation_provider) in providers_to_insert {
-                map.insert(table_reference, federation_provider);
-            }
+        let mut map = self.provider_map.write().map_err(|_| {
+            DataFusionError::External(
+                "Failed to create federated plan: failed to find all federated providers.".into(),
+            )
+        })?;
+        for (table_reference, federation_provider) in providers_to_insert {
+            map.insert(table_reference, federation_provider);
         }
 
         Ok(())
@@ -131,7 +120,6 @@ impl FederationAnalyzerRule {
 
     /// Scans a plan's expressions to see if it belongs to a single [`FederationProvider`].
     fn scan_plan_exprs(&self, plan: &LogicalPlan) -> Result<ScanResult> {
-        let plan_formatted = format!("{}", plan.display_indent());
         let mut sole_provider: ScanResult = ScanResult::None;
 
         let exprs = plan.expressions();
@@ -167,9 +155,12 @@ impl FederationAnalyzerRule {
                     Ok(sole_provider.check_recursion())
                 }
                 Expr::OuterReferenceColumn(_, ref col) => {
-                    println!("Outer ref column {:?}", e);
                     if let Some(table) = &col.relation {
-                        let map = self.provider_map.read().unwrap();
+                        let map = self.provider_map.read().map_err(|_| {
+                            DataFusionError::External(
+                                "Failed to create federated plan: failed to obtain a read lock on federated providers.".into(),
+                            )
+                        })?;
                         if let Some(plan_result) = map.get(table) {
                             sole_provider.merge(plan_result.clone());
                             return Ok(sole_provider.check_recursion());
@@ -351,8 +342,8 @@ impl FederationAnalyzerRule {
                     return Ok(Transformed::no(expr));
                 };
 
-                // DecorrelatePredicateSubquery doesn't support federated node (LogicalPlan::Extension(_)) as subquery
-                // Wrap a `non-op` Projection LogicalPlan outside the federated node to facilitate DecorrelatePredicateSubquery optimization
+                // ScalarSubqueryToJoin optimizer rule doesn't support federated node (LogicalPlan::Extension(_)) as subquery
+                // Wrap a `non-op` Projection LogicalPlan outside the federated node to facilitate ScalarSubqueryToJoin optimization
                 if matches!(new_subquery, LogicalPlan::Extension(_)) {
                     let all_columns = new_subquery
                         .schema()
@@ -382,7 +373,7 @@ impl FederationAnalyzerRule {
                     return Ok(Transformed::no(expr));
                 };
 
-                // DecorrelatePredicateSubquery doesn't support federated node (LogicalPlan::Extension(_)) as subquery
+                // DecorrelatePredicateSubquery  optimizer rule doesn't support federated node (LogicalPlan::Extension(_)) as subquery
                 // Wrap a `non-op` Projection LogicalPlan outside the federated node to facilitate DecorrelatePredicateSubquery optimization
                 if matches!(new_subquery, LogicalPlan::Extension(_)) {
                     let all_columns = new_subquery
@@ -472,7 +463,6 @@ fn get_leaf_provider(
             ref source,
             ..
         }) => {
-            println!("TABLE PROVIDER! {:?}", table_name);
             let table_reference = table_name.clone();
             let Some(federated_source) = get_table_source(source)? else {
                 // Table is not federated but provided by a standard table provider.

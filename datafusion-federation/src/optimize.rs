@@ -3,12 +3,8 @@ use datafusion::{
     error::Result,
     logical_expr::LogicalPlan,
     optimizer::{
-        decorrelate::PullUpCorrelatedExpr,
-        decorrelate_predicate_subquery::DecorrelatePredicateSubquery,
-        optimizer::ApplyOrder,
-        push_down_filter::PushDownFilter,
-        scalar_subquery_to_join::{self, ScalarSubqueryToJoin},
-        OptimizerConfig, OptimizerContext, OptimizerRule,
+        optimizer::ApplyOrder, push_down_filter::PushDownFilter, OptimizerConfig, OptimizerContext,
+        OptimizerRule,
     },
 };
 use optimize_projections::OptimizeProjections;
