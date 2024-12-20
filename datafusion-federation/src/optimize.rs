@@ -50,12 +50,6 @@ impl Optimizer {
             .rewrite(optimized_plan, &self.config)
             .data()?;
 
-        // Run the ScalarSubqueryToJoin before federation
-        let scalar_subquery_to_join_optimizer = ScalarSubqueryToJoin::new();
-        optimized_plan = scalar_subquery_to_join_optimizer
-            .rewrite(optimized_plan, &self.config)
-            .data()?;
-
         Ok(optimized_plan)
     }
 }

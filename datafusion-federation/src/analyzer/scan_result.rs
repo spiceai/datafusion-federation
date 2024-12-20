@@ -77,6 +77,19 @@ impl PartialEq<Option<FederationProviderRef>> for ScanResult {
     }
 }
 
+impl PartialEq for ScanResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ScanResult::None, ScanResult::None) => true,
+            (ScanResult::Distinct(provider1), ScanResult::Distinct(provider2)) => {
+                provider1 == provider2
+            }
+            (ScanResult::Ambiguous, ScanResult::Ambiguous) => true,
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for ScanResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

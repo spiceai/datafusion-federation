@@ -4,9 +4,9 @@ use crate::FederationProvider;
 use crate::{
     optimize::Optimizer, FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef,
 };
-use datafusion::logical_expr::col;
 use datafusion::logical_expr::expr::InSubquery;
 use datafusion::logical_expr::lit;
+use datafusion::logical_expr::{col, expr};
 use datafusion::logical_expr::{logical_plan, LogicalPlanBuilder, LogicalTableSource};
 use datafusion::physical_plan::projection;
 use datafusion::{
@@ -23,6 +23,7 @@ use datafusion::{
     sql::TableReference,
 };
 use scan_result::ScanResult;
+use std::fmt::format;
 use std::sync::Arc;
 
 #[derive(Default, Debug)]
@@ -35,6 +36,9 @@ impl AnalyzerRule for FederationAnalyzerRule {
     // TableScans from the same FederationProvider.
     // There 'largest sub-trees' are passed to their respective FederationProvider.optimizer.
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+        if !contains_federated_table(&plan)? {
+            return Ok(plan);
+        }
         // Run selected optimizer rules before federation
         let plan = self.optimizer.optimize_plan(plan)?;
 
@@ -78,6 +82,7 @@ impl FederationAnalyzerRule {
 
     /// Scans a plan's expressions to see if it belongs to a single [`FederationProvider`].
     fn scan_plan_exprs(&self, plan: &LogicalPlan) -> Result<ScanResult> {
+        let plan_formatted = format!("{}", plan.display_indent());
         let mut sole_provider: ScanResult = ScanResult::None;
 
         let exprs = plan.expressions();
@@ -152,7 +157,7 @@ impl FederationAnalyzerRule {
 
         // Check if the expressions contain, a potentially different, FederationProvider
         let exprs_result = self.scan_plan_exprs(plan)?;
-        let optimize_expressions = exprs_result.is_some();
+        let mut optimize_expressions = exprs_result.is_some();
 
         // Return early if this is a leaf and there is no ambiguity with the expressions.
         if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
@@ -288,6 +293,26 @@ impl FederationAnalyzerRule {
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
                 };
+
+                // DecorrelatePredicateSubquery doesn't support federated node (LogicalPlan::Extension(_)) as subquery
+                // Wrap a `non-op` Projection LogicalPlan outside the federated node to facilitate DecorrelatePredicateSubquery optimization
+                if matches!(new_subquery, LogicalPlan::Extension(_)) {
+                    let all_columns = new_subquery
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| col(field.name()))
+                        .collect::<Vec<_>>();
+
+                    let projection_plan = LogicalPlanBuilder::from(new_subquery)
+                        .project(all_columns)?
+                        .build()?;
+
+                    return Ok(Transformed::yes(Expr::ScalarSubquery(
+                        subquery.with_plan(projection_plan.into()),
+                    )));
+                }
+
                 Ok(Transformed::yes(Expr::ScalarSubquery(
                     subquery.with_plan(new_subquery.into()),
                 )))
@@ -367,6 +392,18 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
             )?))
         }
     }
+}
+
+fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
+    let federated_table_exists = plan.exists(|x| {
+        if let Some(provider) = get_leaf_provider(x)? {
+            // federated table provider should have an analyzer
+            return Ok(provider.analyzer().is_some());
+        }
+        Ok(false)
+    })?;
+
+    Ok(federated_table_exists)
 }
 
 fn get_leaf_provider(plan: &LogicalPlan) -> Result<Option<FederationProviderRef>> {
