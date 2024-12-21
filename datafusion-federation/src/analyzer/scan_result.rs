@@ -1,6 +1,6 @@
-use datafusion::common::tree_node::TreeNodeRecursion;
-
 use crate::FederationProviderRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::{DataFusionError, Result};
 
 /// Used to track if all sources, including tableScan, plan inputs and
 /// expressions, represents an un-ambiguous, none or a sole' [`crate::FederationProvider`].
@@ -41,11 +41,13 @@ impl ScanResult {
         !self.is_none()
     }
 
-    pub fn unwrap(self) -> Option<FederationProviderRef> {
+    pub fn unwrap(self) -> Result<Option<FederationProviderRef>> {
         match self {
-            ScanResult::None => None,
-            ScanResult::Distinct(provider) => Some(provider),
-            ScanResult::Ambiguous => panic!("called `ScanResult::unwrap()` on a `Ambiguous` value"),
+            ScanResult::None => Ok(None),
+            ScanResult::Distinct(provider) => Ok(Some(provider)),
+            ScanResult::Ambiguous => Err(DataFusionError::External(
+                "called `ScanResult::unwrap()` on a `Ambiguous` value".into(),
+            )),
         }
     }
 

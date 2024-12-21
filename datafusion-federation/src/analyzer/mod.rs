@@ -256,7 +256,7 @@ impl FederationAnalyzerRule {
                     return Ok(original_input);
                 }
 
-                let provider = input_result.unwrap();
+                let provider = input_result.unwrap()?;
                 let Some(provider) = provider else {
                     // No provider for this input; use the original input.
                     return Ok(original_input);
