@@ -46,8 +46,16 @@ impl AnalyzerRule for FederationAnalyzerRule {
         // Run selected optimizer rules before federation
         let plan = self.optimizer.optimize_plan(plan)?;
 
+        let mut write_map = self.provider_map.write().map_err(|_| {
+            DataFusionError::External(
+                "Failed to create federated plan: failed to find all federated providers.".into(),
+            )
+        })?;
+
         // Find all federation provider for TableReference appeared in the plan
-        self.get_plan_provider_recursively(&plan)?;
+        let providers = get_plan_provider_recursively(&plan)?;
+        write_map.extend(providers);
+        drop(write_map);
 
         match self.optimize_plan_recursively(&plan, true, config)? {
             (Some(optimized_plan), _) => Ok(optimized_plan),
@@ -64,37 +72,6 @@ impl AnalyzerRule for FederationAnalyzerRule {
 impl FederationAnalyzerRule {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Recursively find the [`FederationProvider`] for all [`TableReference`] instances in the plan.
-    /// This information is used to resolve the federation provider for [`Expr::OuterReferenceColumn`].
-    fn get_plan_provider_recursively(&self, plan: &LogicalPlan) -> Result<()> {
-        let mut providers_to_insert: Vec<(TableReference, ScanResult)> = Vec::new();
-
-        plan.apply(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
-            let (federation_provider, table_reference) = get_leaf_provider(p)?;
-            if let Some(table_reference) = table_reference {
-                providers_to_insert.push((table_reference, federation_provider.into()));
-            }
-
-            let _ = p.apply_subqueries(|sub_query| {
-                self.get_plan_provider_recursively(sub_query)?;
-                Ok(TreeNodeRecursion::Continue)
-            });
-
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        let mut map = self.provider_map.write().map_err(|_| {
-            DataFusionError::External(
-                "Failed to create federated plan: failed to find all federated providers.".into(),
-            )
-        })?;
-        for (table_reference, federation_provider) in providers_to_insert {
-            map.insert(table_reference, federation_provider);
-        }
-
-        Ok(())
     }
 
     /// Scans a plan to see if it belongs to a single [`FederationProvider`].
@@ -213,7 +190,7 @@ impl FederationAnalyzerRule {
         }
         // Aggregate leaf & expression providers
         sole_provider.add(leaf_provider);
-        sole_provider.merge(exprs_result);
+        sole_provider.merge(exprs_result.clone());
 
         let inputs = plan.inputs();
         // Return early if there are no sources.
@@ -237,6 +214,11 @@ impl FederationAnalyzerRule {
             // TODO: Is/should this be reachable?
             return Ok((None, ScanResult::None));
         }
+
+        // Federate Exprs when Exprs provider is ambiguous or Exprs provider differs from the sole_provider of current plan
+        // When Exprs provider is the same as sole_provider and non-ambiguous, the larger sub-plan is higher up
+        let optimize_expressions = exprs_result.is_some()
+            && (!(sole_provider == exprs_result) || exprs_result.is_ambiguous());
 
         // If all sources are federated to the same provider
         if let ScanResult::Distinct(provider) = sole_provider {
@@ -421,6 +403,42 @@ impl FederationProvider for NopFederationProvider {
     fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
         None
     }
+}
+
+/// Recursively find the [`FederationProvider`] for all [`TableReference`] instances in the plan.
+/// This information is used to resolve the federation provider for [`Expr::OuterReferenceColumn`].
+fn get_plan_provider_recursively(
+    plan: &LogicalPlan,
+) -> Result<HashMap<TableReference, ScanResult>> {
+    let mut providers: HashMap<TableReference, ScanResult> = HashMap::new();
+
+    plan.apply(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
+        // LogicalPlan::SubqueryAlias can also be referred by OuterReferenceColumn
+        // Get the federation provider for TableReference representing LogicalPlan::SubqueryAlias
+        if let LogicalPlan::SubqueryAlias(a) = p {
+            let subquery_alias_providers = get_plan_provider_recursively(&Arc::clone(&a.input))?;
+            let mut provider: ScanResult = ScanResult::None;
+            for (_, i) in subquery_alias_providers {
+                provider.merge(i);
+            }
+            providers.insert(a.alias.clone(), provider);
+        }
+
+        let (federation_provider, table_reference) = get_leaf_provider(p)?;
+        if let Some(table_reference) = table_reference {
+            providers.insert(table_reference, federation_provider.into());
+        }
+
+        let _ = p.apply_subqueries(|sub_query| {
+            let subquery_providers = get_plan_provider_recursively(sub_query)?;
+            providers.extend(subquery_providers);
+            Ok(TreeNodeRecursion::Continue)
+        });
+
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    Ok(providers)
 }
 
 fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
