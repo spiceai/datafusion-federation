@@ -46,20 +46,19 @@ impl AnalyzerRule for FederationAnalyzerRule {
         // Run selected optimizer rules before federation
         let plan = self.optimizer.optimize_plan(plan)?;
 
+        // Find all federation providers for TableReference appeared in the plan
+        let providers = get_plan_provider_recursively(&plan)?;
         let mut write_map = self.provider_map.write().map_err(|_| {
             DataFusionError::External(
                 "Failed to create federated plan: failed to find all federated providers.".into(),
             )
         })?;
-
-        // Find all federation provider for TableReference appeared in the plan
-        let providers = get_plan_provider_recursively(&plan)?;
         write_map.extend(providers);
         drop(write_map);
 
         match self.optimize_plan_recursively(&plan, true, config)? {
             (Some(optimized_plan), _) => Ok(optimized_plan),
-            (None, _) => Ok(plan.clone()),
+            (None, _) => Ok(plan),
         }
     }
 
@@ -182,7 +181,6 @@ impl FederationAnalyzerRule {
 
         // Check if the expressions contain, a potentially different, FederationProvider
         let exprs_result = self.scan_plan_exprs(plan)?;
-        let optimize_expressions = exprs_result.is_some();
 
         // Return early if this is a leaf and there is no ambiguity with the expressions.
         if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
@@ -348,9 +346,8 @@ impl FederationAnalyzerRule {
                 )))
             }
             Expr::InSubquery(ref in_subquery) => {
-                let subquery = in_subquery.subquery.clone();
                 let (new_subquery, _) =
-                    self.optimize_plan_recursively(&subquery.subquery, true, _config)?;
+                    self.optimize_plan_recursively(&in_subquery.subquery.subquery, true, _config)?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
                 };
@@ -371,14 +368,14 @@ impl FederationAnalyzerRule {
 
                     return Ok(Transformed::yes(Expr::InSubquery(InSubquery::new(
                         in_subquery.expr.clone(),
-                        subquery.with_plan(projection_plan.into()),
+                        in_subquery.subquery.with_plan(projection_plan.into()),
                         in_subquery.negated,
                     ))));
                 }
 
                 Ok(Transformed::yes(Expr::InSubquery(InSubquery::new(
                     in_subquery.expr.clone(),
-                    subquery.with_plan(new_subquery.into()),
+                    in_subquery.subquery.with_plan(new_subquery.into()),
                     in_subquery.negated,
                 ))))
             }
