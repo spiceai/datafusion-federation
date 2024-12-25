@@ -1,5 +1,10 @@
 use core::fmt;
-use std::{any::Any, collections::HashMap, sync::Arc, vec};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    vec,
+};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -17,7 +22,7 @@ use datafusion::{
         Between, BinaryExpr, Case, Cast, Expr, Extension, GroupingSet, Like, LogicalPlan,
         LogicalPlanBuilder, Projection, Subquery, TryCast,
     },
-    optimizer::analyzer::{Analyzer, AnalyzerRule},
+    optimizer::analyzer::{subquery, Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
@@ -111,7 +116,11 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
 fn rewrite_table_scans(
     plan: &LogicalPlan,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
+    subquery_uses_partial_path: bool,
+    subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<LogicalPlan> {
+    let plan_display = format!("{}", plan.display_indent());
+    println!("{plan_display}");
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
             let original_table_name = table_scan.table_name.clone();
@@ -125,7 +134,11 @@ fn rewrite_table_scans(
             match federated_source.as_any().downcast_ref::<SQLTableSource>() {
                 Some(sql_table_source) => {
                     let remote_table_name = TableReference::from(sql_table_source.table_name());
-                    known_rewrites.insert(original_table_name, remote_table_name.clone());
+                    known_rewrites.insert(original_table_name.clone(), remote_table_name.clone());
+
+                    if let Some(s) = subquery_table_scans {
+                        s.insert(original_table_name);
+                    }
 
                     // Rewrite the schema of this node to have the remote table as the qualifier.
                     let new_schema = (*new_table_scan.projected_schema)
@@ -149,19 +162,37 @@ fn rewrite_table_scans(
     let rewritten_inputs = plan
         .inputs()
         .into_iter()
-        .map(|i| rewrite_table_scans(i, known_rewrites))
+        .map(|i| {
+            rewrite_table_scans(
+                i,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
 
     match plan {
         LogicalPlan::Unnest(unnest) => {
             // The Union plan cannot be constructed from rewritten expressions. It requires specialized logic to handle
             // the renaming in UNNEST columns and the corresponding column aliases in the underlying projection plan.
-            rewrite_unnest_plan(unnest, rewritten_inputs, known_rewrites)
+            rewrite_unnest_plan(
+                unnest,
+                rewritten_inputs,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )
         }
         _ => {
             let mut new_expressions = vec![];
             for expression in plan.expressions() {
-                let new_expr = rewrite_table_scans_in_expr(expression.clone(), known_rewrites)?;
+                let new_expr = rewrite_table_scans_in_expr(
+                    expression.clone(),
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    subquery_table_scans,
+                )?;
                 new_expressions.push(new_expr);
             }
             let new_plan = plan.with_new_exprs(new_expressions, rewritten_inputs)?;
@@ -179,6 +210,8 @@ fn rewrite_unnest_plan(
     unnest: &logical_expr::Unnest,
     mut rewritten_inputs: Vec<LogicalPlan>,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
+    subquery_uses_partial_path: bool,
+    subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<LogicalPlan> {
     // Unnest plan has a single input
     let input = rewritten_inputs.remove(0);
@@ -190,7 +223,12 @@ fn rewrite_unnest_plan(
         .exec_columns
         .iter()
         .map(|c: &Column| {
-            match rewrite_table_scans_in_expr(Expr::Column(c.clone()), known_rewrites)? {
+            match rewrite_table_scans_in_expr(
+                Expr::Column(c.clone()),
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )? {
                 Expr::Column(column) => {
                     known_unnest_rewrites.insert(c.name.clone(), column.name.clone());
                     Ok(column)
@@ -309,14 +347,45 @@ fn rewrite_column_name_in_expr(
 fn rewrite_table_scans_in_expr(
     expr: Expr,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
+    subquery_uses_partial_path: bool,
+    subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<Expr> {
+    println!("expr {:?}", expr);
     match expr {
         Expr::ScalarSubquery(subquery) => {
-            let new_subquery = rewrite_table_scans(&subquery.subquery, known_rewrites)?;
+            // let new_subquery = if subquery_table_scans.is_some() {
+            //     rerturn rewrite_table_scans(&subquery.subquery, known_rewrites, subquery_uses_partial_path, subquery_table_scans)?;
+            // } else {
+            //     let mut scans = Some(HashSet::new());
+            //     rewrite_table_scans(&subquery.subquery, known_rewrites, &mut scans)?;
+            // }
+            let new_subquery = if subquery_table_scans.is_some() && !subquery_uses_partial_path {
+                rewrite_table_scans(
+                    &subquery.subquery,
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    subquery_table_scans,
+                )?
+            } else {
+                let mut scans = Some(HashSet::new());
+                rewrite_table_scans(
+                    &subquery.subquery,
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    &mut scans,
+                )?
+            };
             let outer_ref_columns = subquery
                 .outer_ref_columns
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             Ok(Expr::ScalarSubquery(Subquery {
                 subquery: Arc::new(new_subquery),
@@ -324,8 +393,18 @@ fn rewrite_table_scans_in_expr(
             }))
         }
         Expr::BinaryExpr(binary_expr) => {
-            let left = rewrite_table_scans_in_expr(*binary_expr.left, known_rewrites)?;
-            let right = rewrite_table_scans_in_expr(*binary_expr.right, known_rewrites)?;
+            let left = rewrite_table_scans_in_expr(
+                *binary_expr.left,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
+            let right = rewrite_table_scans_in_expr(
+                *binary_expr.right,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(left),
                 binary_expr.op,
@@ -334,6 +413,16 @@ fn rewrite_table_scans_in_expr(
         }
         Expr::Column(mut col) => {
             if let Some(rewrite) = col.relation.as_ref().and_then(|r| known_rewrites.get(r)) {
+                if let Some(subquery_reference) = subquery_table_scans {
+                    if col
+                        .relation
+                        .as_ref()
+                        .and_then(|r| subquery_reference.get(r))
+                        .is_some()
+                    {
+                        return Ok(Expr::Column(col));
+                    }
+                }
                 Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
             } else {
                 // This prevent over-eager rewrite and only pass the column into below rewritten
@@ -347,6 +436,11 @@ fn rewrite_table_scans_in_expr(
                 let (new_name, was_rewritten) = known_rewrites.iter().fold(
                     (col.name.to_string(), false),
                     |(col_name, was_rewritten), (table_ref, rewrite)| {
+                        if let Some(subquery_reference) = subquery_table_scans {
+                            if subquery_reference.get(table_ref).is_some() {
+                                return (col_name, was_rewritten);
+                            }
+                        }
                         match rewrite_column_name_in_expr(
                             &col_name,
                             &table_ref.to_string(),
@@ -366,7 +460,12 @@ fn rewrite_table_scans_in_expr(
             }
         }
         Expr::Alias(alias) => {
-            let expr = rewrite_table_scans_in_expr(*alias.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *alias.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             if let Some(relation) = &alias.relation {
                 if let Some(rewrite) = known_rewrites.get(relation) {
                     return Ok(Expr::Alias(Alias::new(
@@ -379,8 +478,18 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::Alias(Alias::new(expr, alias.relation, alias.name)))
         }
         Expr::Like(like) => {
-            let expr = rewrite_table_scans_in_expr(*like.expr, known_rewrites)?;
-            let pattern = rewrite_table_scans_in_expr(*like.pattern, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *like.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
+            let pattern = rewrite_table_scans_in_expr(
+                *like.pattern,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::Like(Like::new(
                 like.negated,
                 Box::new(expr),
@@ -390,8 +499,18 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::SimilarTo(similar_to) => {
-            let expr = rewrite_table_scans_in_expr(*similar_to.expr, known_rewrites)?;
-            let pattern = rewrite_table_scans_in_expr(*similar_to.pattern, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *similar_to.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
+            let pattern = rewrite_table_scans_in_expr(
+                *similar_to.pattern,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::SimilarTo(Like::new(
                 similar_to.negated,
                 Box::new(expr),
@@ -401,49 +520,114 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::Not(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::Not(Box::new(expr)))
         }
         Expr::IsNotNull(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsNotNull(Box::new(expr)))
         }
         Expr::IsNull(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsNull(Box::new(expr)))
         }
         Expr::IsTrue(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsTrue(Box::new(expr)))
         }
         Expr::IsFalse(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsFalse(Box::new(expr)))
         }
         Expr::IsUnknown(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsUnknown(Box::new(expr)))
         }
         Expr::IsNotTrue(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsNotTrue(Box::new(expr)))
         }
         Expr::IsNotFalse(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsNotFalse(Box::new(expr)))
         }
         Expr::IsNotUnknown(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::IsNotUnknown(Box::new(expr)))
         }
         Expr::Negative(e) => {
-            let expr = rewrite_table_scans_in_expr(*e, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *e,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::Negative(Box::new(expr)))
         }
         Expr::Between(between) => {
-            let expr = rewrite_table_scans_in_expr(*between.expr, known_rewrites)?;
-            let low = rewrite_table_scans_in_expr(*between.low, known_rewrites)?;
-            let high = rewrite_table_scans_in_expr(*between.high, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *between.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
+            let low = rewrite_table_scans_in_expr(
+                *between.low,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
+            let high = rewrite_table_scans_in_expr(
+                *between.high,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::Between(Between::new(
                 Box::new(expr),
                 between.negated,
@@ -454,20 +638,44 @@ fn rewrite_table_scans_in_expr(
         Expr::Case(case) => {
             let expr = case
                 .expr
-                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        *e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .transpose()?
                 .map(Box::new);
             let else_expr = case
                 .else_expr
-                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        *e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .transpose()?
                 .map(Box::new);
             let when_expr = case
                 .when_then_expr
                 .into_iter()
                 .map(|(when, then)| {
-                    let when = rewrite_table_scans_in_expr(*when, known_rewrites);
-                    let then = rewrite_table_scans_in_expr(*then, known_rewrites);
+                    let when = rewrite_table_scans_in_expr(
+                        *when,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    );
+                    let then = rewrite_table_scans_in_expr(
+                        *then,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    );
 
                     match (when, then) {
                         (Ok(when), Ok(then)) => Ok((Box::new(when), Box::new(then))),
@@ -478,11 +686,21 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::Case(Case::new(expr, when_expr, else_expr)))
         }
         Expr::Cast(cast) => {
-            let expr = rewrite_table_scans_in_expr(*cast.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *cast.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::Cast(Cast::new(Box::new(expr), cast.data_type)))
         }
         Expr::TryCast(try_cast) => {
-            let expr = rewrite_table_scans_in_expr(*try_cast.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *try_cast.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::TryCast(TryCast::new(
                 Box::new(expr),
                 try_cast.data_type,
@@ -492,7 +710,14 @@ fn rewrite_table_scans_in_expr(
             let args = sf
                 .args
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             Ok(Expr::ScalarFunction(ScalarFunction {
                 func: sf.func,
@@ -503,11 +728,25 @@ fn rewrite_table_scans_in_expr(
             let args = af
                 .args
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             let filter = af
                 .filter
-                .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        *e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .transpose()?
                 .map(Box::new);
             let order_by = af
@@ -515,8 +754,13 @@ fn rewrite_table_scans_in_expr(
                 .map(|e| {
                     e.into_iter()
                         .map(|s| {
-                            rewrite_table_scans_in_expr(s.expr, known_rewrites)
-                                .map(|e| Sort::new(e, s.asc, s.nulls_first))
+                            rewrite_table_scans_in_expr(
+                                s.expr,
+                                known_rewrites,
+                                subquery_uses_partial_path,
+                                subquery_table_scans,
+                            )
+                            .map(|e| Sort::new(e, s.asc, s.nulls_first))
                         })
                         .collect::<Result<Vec<Sort>>>()
                 })
@@ -534,19 +778,38 @@ fn rewrite_table_scans_in_expr(
             let args = wf
                 .args
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             let partition_by = wf
                 .partition_by
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             let order_by = wf
                 .order_by
                 .into_iter()
                 .map(|s| {
-                    rewrite_table_scans_in_expr(s.expr, known_rewrites)
-                        .map(|e| Sort::new(e, s.asc, s.nulls_first))
+                    rewrite_table_scans_in_expr(
+                        s.expr,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                    .map(|e| Sort::new(e, s.asc, s.nulls_first))
                 })
                 .collect::<Result<Vec<Sort>>>()?;
             Ok(Expr::WindowFunction(WindowFunction {
@@ -559,21 +822,56 @@ fn rewrite_table_scans_in_expr(
             }))
         }
         Expr::InList(il) => {
-            let expr = rewrite_table_scans_in_expr(*il.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *il.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             let list = il
                 .list
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             Ok(Expr::InList(InList::new(Box::new(expr), list, il.negated)))
         }
         Expr::Exists(exists) => {
-            let subquery_plan = rewrite_table_scans(&exists.subquery.subquery, known_rewrites)?;
+            let subquery_plan = if subquery_table_scans.is_some() && !subquery_uses_partial_path {
+                rewrite_table_scans(
+                    &exists.subquery.subquery,
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    subquery_table_scans,
+                )?
+            } else {
+                let mut scans = Some(HashSet::new());
+                rewrite_table_scans(
+                    &exists.subquery.subquery,
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    &mut scans,
+                )?
+            };
+
             let outer_ref_columns = exists
                 .subquery
                 .outer_ref_columns
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
@@ -582,13 +880,40 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::Exists(Exists::new(subquery, exists.negated)))
         }
         Expr::InSubquery(is) => {
-            let expr = rewrite_table_scans_in_expr(*is.expr, known_rewrites)?;
-            let subquery_plan = rewrite_table_scans(&is.subquery.subquery, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *is.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
+            let subquery_plan = if subquery_table_scans.is_some() && !subquery_uses_partial_path {
+                rewrite_table_scans(
+                    &is.subquery.subquery,
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    subquery_table_scans,
+                )?
+            } else {
+                let mut scans = Some(HashSet::new());
+                rewrite_table_scans(
+                    &is.subquery.subquery,
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    &mut scans,
+                )?
+            };
             let outer_ref_columns = is
                 .subquery
                 .outer_ref_columns
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                .map(|e| {
+                    rewrite_table_scans_in_expr(
+                        e,
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )
+                })
                 .collect::<Result<Vec<Expr>>>()?;
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
@@ -614,14 +939,28 @@ fn rewrite_table_scans_in_expr(
             GroupingSet::Rollup(exprs) => {
                 let exprs = exprs
                     .into_iter()
-                    .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                    .map(|e| {
+                        rewrite_table_scans_in_expr(
+                            e,
+                            known_rewrites,
+                            subquery_uses_partial_path,
+                            subquery_table_scans,
+                        )
+                    })
                     .collect::<Result<Vec<Expr>>>()?;
                 Ok(Expr::GroupingSet(GroupingSet::Rollup(exprs)))
             }
             GroupingSet::Cube(exprs) => {
                 let exprs = exprs
                     .into_iter()
-                    .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                    .map(|e| {
+                        rewrite_table_scans_in_expr(
+                            e,
+                            known_rewrites,
+                            subquery_uses_partial_path,
+                            subquery_table_scans,
+                        )
+                    })
                     .collect::<Result<Vec<Expr>>>()?;
                 Ok(Expr::GroupingSet(GroupingSet::Cube(exprs)))
             }
@@ -631,7 +970,14 @@ fn rewrite_table_scans_in_expr(
                     .map(|exprs| {
                         exprs
                             .into_iter()
-                            .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
+                            .map(|e| {
+                                rewrite_table_scans_in_expr(
+                                    e,
+                                    known_rewrites,
+                                    subquery_uses_partial_path,
+                                    subquery_table_scans,
+                                )
+                            })
                             .collect::<Result<Vec<Expr>>>()
                     })
                     .collect::<Result<Vec<Vec<Expr>>>>()?;
@@ -649,10 +995,22 @@ fn rewrite_table_scans_in_expr(
             }
         }
         Expr::Unnest(unnest) => {
-            let expr = rewrite_table_scans_in_expr(*unnest.expr, known_rewrites)?;
+            let expr = rewrite_table_scans_in_expr(
+                *unnest.expr,
+                known_rewrites,
+                subquery_uses_partial_path,
+                subquery_table_scans,
+            )?;
             Ok(Expr::Unnest(Unnest::new(expr)))
         }
         Expr::ScalarVariable(_, _) | Expr::Literal(_) | Expr::Placeholder(_) => Ok(expr),
+    }
+}
+
+fn rewrite_subquery_use_partial_path(executor_name: &str) -> bool {
+    match executor_name {
+        "dremio" => true,
+        _ => false,
     }
 }
 
@@ -713,8 +1071,15 @@ impl VirtualExecutionPlan {
     fn sql(&self) -> Result<String> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
-        let mut ast = Unparser::new(self.executor.dialect().as_ref())
-            .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
+        let subquery_uses_partial_path = rewrite_subquery_use_partial_path(self.executor.name());
+        let rewritten_plan = rewrite_table_scans(
+            &self.plan,
+            &mut known_rewrites,
+            subquery_uses_partial_path,
+            &mut None,
+        )?;
+        let mut ast =
+            Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(&rewritten_plan)?;
 
         if let Some(analyzer) = self.executor.ast_analyzer() {
             ast = analyzer(ast)?;
