@@ -299,6 +299,7 @@ fn rewrite_column_name_in_expr(
 
     // Check if the rewritten name contains more occurrence of table_ref_str, and rewrite them as well
     // This is done by providing the updated start_pos for search
+    // test
     match rewrite_column_name_in_expr(&rewritten_name, table_ref_str, rewrite, idx + rewrite.len())
     {
         Some(new_name) => Some(new_name), // more occurrences found
