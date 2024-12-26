@@ -1004,7 +1004,7 @@ mod tests {
                 "SELECT COUNT(CASE WHEN a > 0 THEN a ELSE 0 END) FROM app_table",
                 r#"SELECT count(CASE WHEN (remote_table.a > 0) THEN remote_table.a ELSE 0 END) FROM remote_table"#,
             ),
-            // // different tables in single aggregation expression
+            // different tables in single aggregation expression
             (
                 "SELECT COUNT(CASE WHEN appt.a > 0 THEN appt.a ELSE dft.a END) FROM app_table as appt, foo.df_table as dft",
                 "SELECT count(CASE WHEN (appt.a > 0) THEN appt.a ELSE dft.a END) FROM remote_table AS appt JOIN remote_table AS dft"
