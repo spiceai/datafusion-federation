@@ -40,16 +40,10 @@ async fn main() -> Result<()> {
     sleep(Duration::from_secs(3)).await;
 
     // Local context
-    // let state = SessionContext::new().state();
     let known_tables: Vec<String> = ["test"].iter().map(|&x| x.into()).collect();
 
     // Register FederationAnalyzer
     // TODO: Interaction with other analyzers & optimizers.
-    // let mut state = state
-    //     .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
-    //     .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
-    //     .clone();
-
     let mut state = SessionStateBuilder::new()
         .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
         .build();
