@@ -290,6 +290,7 @@ fn rewrite_column_name(
 // The function replaces occurrences of table_ref_str in col_name with the new name defined by rewrite.
 // The name to rewrite should NOT be a substring of another name.
 // Supports multiple occurrences of table_ref_str in col_name.
+// test
 fn rewrite_column_name_in_expr(
     col_name: &str,
     table_ref_str: &str,
