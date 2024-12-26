@@ -35,8 +35,6 @@ use datafusion_federation::{
 mod schema;
 pub use schema::*;
 
-#[cfg(feature = "connectorx")]
-pub mod connectorx;
 mod executor;
 pub use executor::*;
 
