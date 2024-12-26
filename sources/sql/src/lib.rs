@@ -301,9 +301,7 @@ fn rewrite_column_name_in_expr(
     }
 
     // Find the first occurrence of table_ref_str starting from start_pos
-    let Some(idx) = col_name[start_pos..].find(table_ref_str) else {
-        return None;
-    };
+    let idx = col_name[start_pos..].find(table_ref_str)?;
 
     // Calculate the absolute index of the occurrence in string as the index above is relative to start_pos
     let idx = start_pos + idx;
