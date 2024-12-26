@@ -120,7 +120,6 @@ fn rewrite_table_scans(
     subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<LogicalPlan> {
     let plan_display = format!("{}", plan.display_indent());
-    println!("{plan_display}");
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
             let original_table_name = table_scan.table_name.clone();
@@ -415,16 +414,9 @@ fn rewrite_table_scans_in_expr(
     subquery_uses_partial_path: bool,
     subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<Expr> {
-    println!("expr {:?}", expr);
     match expr {
         Expr::ScalarSubquery(subquery) => {
-            // let new_subquery = if subquery_table_scans.is_some() {
-            //     rerturn rewrite_table_scans(&subquery.subquery, known_rewrites, subquery_uses_partial_path, subquery_table_scans)?;
-            // } else {
-            //     let mut scans = Some(HashSet::new());
-            //     rewrite_table_scans(&subquery.subquery, known_rewrites, &mut scans)?;
-            // }
-            let new_subquery = if subquery_table_scans.is_some() && !subquery_uses_partial_path {
+            let new_subquery = if subquery_table_scans.is_some() || !subquery_uses_partial_path {
                 rewrite_table_scans(
                     &subquery.subquery,
                     known_rewrites,
@@ -891,7 +883,7 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::InList(InList::new(Box::new(expr), list, il.negated)))
         }
         Expr::Exists(exists) => {
-            let subquery_plan = if subquery_table_scans.is_some() && !subquery_uses_partial_path {
+            let subquery_plan = if subquery_table_scans.is_some() || !subquery_uses_partial_path {
                 rewrite_table_scans(
                     &exists.subquery.subquery,
                     known_rewrites,
@@ -934,7 +926,7 @@ fn rewrite_table_scans_in_expr(
                 subquery_uses_partial_path,
                 subquery_table_scans,
             )?;
-            let subquery_plan = if subquery_table_scans.is_some() && !subquery_uses_partial_path {
+            let subquery_plan = if subquery_table_scans.is_some() || !subquery_uses_partial_path {
                 rewrite_table_scans(
                     &is.subquery.subquery,
                     known_rewrites,
@@ -1120,6 +1112,11 @@ impl VirtualExecutionPlan {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
         let subquery_uses_partial_path = rewrite_subquery_use_partial_path(self.executor.name());
+
+        println!(
+            "subuqery uses partial path {:?}",
+            subquery_uses_partial_path
+        );
         let rewritten_plan = rewrite_table_scans(
             &self.plan,
             &mut known_rewrites,
