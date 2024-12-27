@@ -1078,6 +1078,23 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_rewrite_same_column_table_name() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let tests = vec![(
+            "SELECT app_table FROM (SELECT a app_table from app_table limit 100);",
+            r#"SELECT app_table FROM (SELECT remote_table.a AS app_table FROM remote_table LIMIT 100)"#,
+        )];
+
+        for test in tests {
+            test_sql(&ctx, test.0, test.1).await?;
+        }
+
+        Ok(())
+    }
+
     async fn test_sql(
         ctx: &SessionContext,
         sql_query: &str,
