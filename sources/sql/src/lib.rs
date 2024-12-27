@@ -304,7 +304,7 @@ fn rewrite_column_name_in_expr(
     // Calculate the absolute index of the occurrence in string as the index above is relative to start_pos
     let idx = start_pos + idx;
 
-    // Table name same as column alias name
+    // Table name same as column name
     // Shouldn't rewrite in this case
     if idx == 0 && start_pos == 0 {
         return None;
