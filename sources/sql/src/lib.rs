@@ -117,7 +117,6 @@ fn rewrite_table_scans(
     subquery_uses_partial_path: bool,
     subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<LogicalPlan> {
-    let plan_display = format!("{}", plan.display_indent());
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
             let original_table_name = table_scan.table_name.clone();
@@ -1056,10 +1055,7 @@ fn rewrite_table_scans_in_expr(
 }
 
 fn rewrite_subquery_use_partial_path(executor_name: &str) -> bool {
-    match executor_name {
-        "dremio" => true,
-        _ => false,
-    }
+    matches!(executor_name, "dremio")
 }
 
 struct SQLFederationPlanner {
