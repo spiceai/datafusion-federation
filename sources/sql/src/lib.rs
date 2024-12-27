@@ -312,17 +312,14 @@ fn rewrite_column_name(
     let (new_col_name, was_rewritten) = known_rewrites.iter().fold(
         (col_name.to_string(), false),
         |(col_name, was_rewritten), (table_ref, rewrite)| {
+            let mut rewrite_string = rewrite.to_string();
             if let Some(subquery_reference) = subquery_table_scans {
                 if subquery_reference.get(table_ref).is_some() {
-                    return (col_name, was_rewritten);
+                    rewrite_string = get_partial_table_name(rewrite);
                 }
             }
-            match rewrite_column_name_in_expr(
-                &col_name,
-                &table_ref.to_string(),
-                &rewrite.to_string(),
-                0,
-            ) {
+            match rewrite_column_name_in_expr(&col_name, &table_ref.to_string(), &rewrite_string, 0)
+            {
                 Some(new_name) => (new_name, true),
                 None => (col_name, was_rewritten),
             }
@@ -334,6 +331,12 @@ fn rewrite_column_name(
     } else {
         None
     }
+}
+
+fn get_partial_table_name(full_table_reference: &TableReference) -> String {
+    let full_table_path = full_table_reference.table().to_owned();
+    let path_parts: Vec<&str> = full_table_path.split('.').collect();
+    path_parts[path_parts.len() - 1].to_owned()
 }
 
 // The function replaces occurrences of table_ref_str in col_name with the new name defined by rewrite.
@@ -473,7 +476,16 @@ fn rewrite_table_scans_in_expr(
                         .and_then(|r| subquery_reference.get(r))
                         .is_some()
                     {
-                        return Ok(Expr::Column(col));
+                        // Use the partial table path from source for rewrite
+                        // e.g. If the fully qualified name is foo_db.foo_schema.foo
+                        // Use foo as partial path
+                        let partial_path = get_partial_table_name(rewrite);
+                        let partial_table_reference = TableReference::from(partial_path);
+
+                        return Ok(Expr::Column(Column::new(
+                            Some(partial_table_reference),
+                            &col.name,
+                        )));
                     }
                 }
                 Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
@@ -1108,11 +1120,6 @@ impl VirtualExecutionPlan {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
         let subquery_uses_partial_path = rewrite_subquery_use_partial_path(self.executor.name());
-
-        println!(
-            "subuqery uses partial path {:?}",
-            subquery_uses_partial_path
-        );
         let rewritten_plan = rewrite_table_scans(
             &self.plan,
             &mut known_rewrites,
@@ -1264,6 +1271,31 @@ mod tests {
         Arc::new(FederatedTableProviderAdaptor::new(table_source))
     }
 
+    fn get_test_table_provider_with_full_path() -> Arc<dyn TableProvider> {
+        let sql_federation_provider =
+            Arc::new(SQLFederationProvider::new(Arc::new(TestSQLExecutor {})));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Date32, false),
+            Field::new(
+                "d",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                false,
+            ),
+        ]));
+        let table_source = Arc::new(
+            SQLTableSource::new_with_schema(
+                sql_federation_provider,
+                "remote_db.remote_schema.remote_table".to_string(),
+                schema,
+            )
+            .expect("to have a valid SQLTableSource"),
+        );
+        Arc::new(FederatedTableProviderAdaptor::new(table_source))
+    }
+
     fn get_test_table_source() -> Arc<DefaultTableSource> {
         Arc::new(DefaultTableSource::new(get_test_table_provider()))
     }
@@ -1288,6 +1320,13 @@ mod tests {
             .register_table("app_table".to_string(), get_test_table_provider())
             .expect("to register table");
 
+        let public_schema = catalog
+            .schema("public")
+            .expect("public schema should exist");
+        public_schema
+            .register_table("bar".to_string(), get_test_table_provider_with_full_path())
+            .expect("to register table");
+
         ctx
     }
 
@@ -1302,7 +1341,8 @@ mod tests {
             ])?;
 
         let mut known_rewrites = HashMap::new();
-        let rewritten_plan = rewrite_table_scans(&plan.build()?, &mut known_rewrites)?;
+        let rewritten_plan =
+            rewrite_table_scans(&plan.build()?, &mut known_rewrites, false, &mut None)?;
 
         println!("rewritten_plan: \n{:#?}", rewritten_plan);
 
@@ -1385,7 +1425,7 @@ mod tests {
         ];
 
         for test in agg_tests {
-            test_sql(&ctx, test.0, test.1).await?;
+            test_sql(&ctx, test.0, test.1, false).await?;
         }
 
         Ok(())
@@ -1412,7 +1452,7 @@ mod tests {
         ];
 
         for test in tests {
-            test_sql(&ctx, test.0, test.1).await?;
+            test_sql(&ctx, test.0, test.1, false).await?;
         }
 
         Ok(())
@@ -1439,7 +1479,32 @@ mod tests {
         ];
 
         for test in tests {
-            test_sql(&ctx, test.0, test.1).await?;
+            test_sql(&ctx, test.0, test.1, false).await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subquery_requires_partial_path() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let tests = vec![
+            (
+                "SELECT a FROM bar where a IN (SELECT a FROM bar)",
+                r#"SELECT remote_db.remote_schema.remote_table.a FROM remote_db.remote_schema.remote_table WHERE remote_db.remote_schema.remote_table.a IN (SELECT a FROM remote_db.remote_schema.remote_table)"#,
+                true,
+            ),
+            (
+                "SELECT a FROM bar where a IN (SELECT a FROM bar)",
+                r#"SELECT remote_db.remote_schema.remote_table.a FROM remote_db.remote_schema.remote_table WHERE remote_db.remote_schema.remote_table.a IN (SELECT remote_db.remote_schema.remote_table.a FROM remote_db.remote_schema.remote_table)"#,
+                false,
+            ),
+        ];
+
+        for test in tests {
+            test_sql(&ctx, test.0, test.1, test.2).await?;
         }
 
         Ok(())
@@ -1449,15 +1514,21 @@ mod tests {
         ctx: &SessionContext,
         sql_query: &str,
         expected_sql: &str,
+        subquery_uses_partial_path: bool,
     ) -> Result<(), datafusion::error::DataFusionError> {
         let data_frame = ctx.sql(sql_query).await?;
 
-        // println!("before optimization: \n{:#?}", data_frame.logical_plan());
+        println!("before optimization: \n{:#?}", data_frame.logical_plan());
 
         let mut known_rewrites = HashMap::new();
-        let rewritten_plan = rewrite_table_scans(data_frame.logical_plan(), &mut known_rewrites)?;
+        let rewritten_plan = rewrite_table_scans(
+            data_frame.logical_plan(),
+            &mut known_rewrites,
+            subquery_uses_partial_path,
+            &mut None,
+        )?;
 
-        // println!("rewritten_plan: \n{:#?}", rewritten_plan);
+        println!("rewritten_plan: \n{:#?}", rewritten_plan);
 
         let unparsed_sql = plan_to_sql(&rewritten_plan)?;
 
