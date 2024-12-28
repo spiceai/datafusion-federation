@@ -1060,10 +1060,6 @@ fn rewrite_table_scans_in_expr(
     }
 }
 
-fn rewrite_subquery_use_partial_path(executor_name: &str) -> bool {
-    matches!(executor_name, "dremio")
-}
-
 struct SQLFederationPlanner {
     executor: Arc<dyn SQLExecutor>,
 }
@@ -1121,7 +1117,7 @@ impl VirtualExecutionPlan {
     fn sql(&self) -> Result<String> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
-        let subquery_uses_partial_path = rewrite_subquery_use_partial_path(self.executor.name());
+        let subquery_uses_partial_path = self.executor.subquery_use_partial_path();
         let rewritten_plan = rewrite_table_scans(
             &self.plan,
             &mut known_rewrites,
@@ -1523,7 +1519,7 @@ mod tests {
         )];
 
         for test in tests {
-            test_sql(&ctx, test.0, test.1).await?;
+            test_sql(&ctx, test.0, test.1, false).await?;
         }
 
         Ok(())
