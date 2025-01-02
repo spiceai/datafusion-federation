@@ -154,9 +154,15 @@ impl VirtualExecutionPlan {
     fn sql(&self) -> Result<String> {
         // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
         let mut known_rewrites = HashMap::new();
-        let mut ast = Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(
-            &rewrite::plan::rewrite_table_scans(&self.plan, &mut known_rewrites)?,
+        let subquery_uses_partial_path = self.executor.subquery_use_partial_path();
+        let rewritten_plan = rewrite::plan::rewrite_table_scans(
+            &self.plan,
+            &mut known_rewrites,
+            subquery_uses_partial_path,
+            &mut None,
         )?;
+        let mut ast =
+            Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(&rewritten_plan)?;
 
         // If there are any MultiPartTableReference, rewrite the AST to use the original table names.
         let multi_table_reference_rewrites = known_rewrites
