@@ -15,6 +15,7 @@ pub use table_provider::*;
 mod plan_node;
 pub use plan_node::*;
 pub mod schema_cast;
+pub mod table_reference;
 
 pub type FederationProviderRef = Arc<dyn FederationProvider>;
 pub trait FederationProvider: Send + Sync {
