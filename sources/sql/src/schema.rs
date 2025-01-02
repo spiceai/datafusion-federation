@@ -8,7 +8,8 @@ use futures::future::join_all;
 use std::{any::Any, sync::Arc};
 
 use datafusion_federation::{
-    FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
+    table_reference::MultiPartTableReference, FederatedTableProviderAdaptor, FederatedTableSource,
+    FederationProvider,
 };
 
 use crate::SQLFederationProvider;
@@ -51,14 +52,17 @@ impl SchemaProvider for SQLSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables.iter().map(|s| s.table_name.clone()).collect()
+        self.tables
+            .iter()
+            .map(|s| s.table_name.to_string())
+            .collect()
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
         if let Some(source) = self
             .tables
             .iter()
-            .find(|s| s.table_name.eq_ignore_ascii_case(name))
+            .find(|s| s.table_name.to_string().eq_ignore_ascii_case(name))
         {
             let adaptor = FederatedTableProviderAdaptor::new(
                 Arc::clone(source) as Arc<dyn FederatedTableSource>
@@ -71,7 +75,7 @@ impl SchemaProvider for SQLSchemaProvider {
     fn table_exist(&self, name: &str) -> bool {
         self.tables
             .iter()
-            .any(|s| s.table_name.eq_ignore_ascii_case(name))
+            .any(|s| s.table_name.to_string().eq_ignore_ascii_case(name))
     }
 }
 
@@ -112,7 +116,7 @@ impl SchemaProvider for MultiSchemaProvider {
 
 pub struct SQLTableSource {
     provider: Arc<SQLFederationProvider>,
-    table_name: String,
+    table_name: MultiPartTableReference,
     schema: SchemaRef,
 }
 
@@ -127,28 +131,32 @@ impl std::fmt::Debug for SQLTableSource {
 
 impl SQLTableSource {
     // creates a SQLTableSource and infers the table schema
-    pub async fn new(provider: Arc<SQLFederationProvider>, table_name: String) -> Result<Self> {
+    pub async fn new(
+        provider: Arc<SQLFederationProvider>,
+        table_name: impl Into<MultiPartTableReference>,
+    ) -> Result<Self> {
+        let table_name = table_name.into();
         let schema = Arc::clone(&provider)
             .executor
-            .get_table_schema(table_name.as_str())
+            .get_table_schema(table_name.to_string().as_str())
             .await?;
         Self::new_with_schema(provider, table_name, schema)
     }
 
     pub fn new_with_schema(
         provider: Arc<SQLFederationProvider>,
-        table_name: String,
+        table_name: impl Into<MultiPartTableReference>,
         schema: SchemaRef,
     ) -> Result<Self> {
         Ok(Self {
             provider,
-            table_name,
+            table_name: table_name.into(),
             schema,
         })
     }
 
-    pub fn table_name(&self) -> &str {
-        self.table_name.as_str()
+    pub fn table_name(&self) -> &MultiPartTableReference {
+        &self.table_name
     }
 }
 

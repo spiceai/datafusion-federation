@@ -29,7 +29,8 @@ use datafusion::{
     },
 };
 use datafusion_federation::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
+    get_table_source, schema_cast, table_reference::MultiPartTableReference, FederatedPlanNode,
+    FederationPlanner, FederationProvider,
 };
 
 mod schema;
@@ -108,7 +109,7 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
 /// Rewrite table scans to use the original federated table name.
 fn rewrite_table_scans(
     plan: &LogicalPlan,
-    known_rewrites: &mut HashMap<TableReference, TableReference>,
+    known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
 ) -> Result<LogicalPlan> {
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
@@ -122,15 +123,22 @@ fn rewrite_table_scans(
 
             match federated_source.as_any().downcast_ref::<SQLTableSource>() {
                 Some(sql_table_source) => {
-                    let remote_table_name = TableReference::from(sql_table_source.table_name());
+                    let remote_table_name = sql_table_source.table_name();
                     known_rewrites.insert(original_table_name, remote_table_name.clone());
+
+                    // If the remote table name is a MultiPartTableReference, we will not rewrite it here, but rewrite it after the final unparsing on the AST directly.
+                    let MultiPartTableReference::TableReference(remote_table_name) =
+                        remote_table_name
+                    else {
+                        return Ok(plan.clone());
+                    };
 
                     // Rewrite the schema of this node to have the remote table as the qualifier.
                     let new_schema = (*new_table_scan.projected_schema)
                         .clone()
                         .replace_qualifier(remote_table_name.clone());
                     new_table_scan.projected_schema = Arc::new(new_schema);
-                    new_table_scan.table_name = remote_table_name;
+                    new_table_scan.table_name = remote_table_name.clone();
                 }
                 None => {
                     // Not a SQLTableSource (is this possible?)
@@ -176,7 +184,7 @@ fn rewrite_table_scans(
 fn rewrite_unnest_plan(
     unnest: &logical_expr::Unnest,
     mut rewritten_inputs: Vec<LogicalPlan>,
-    known_rewrites: &mut HashMap<TableReference, TableReference>,
+    known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
 ) -> Result<LogicalPlan> {
     // Unnest plan has a single input
     let input = rewritten_inputs.remove(0);
@@ -240,7 +248,7 @@ fn rewrite_unnest_plan(
 /// "unnest_placeholder(foo.df_table.a,depth=1)"" -> "unnest_placeholder(remote_table.a,depth=1)""
 fn rewrite_unnest_options(
     options: &UnnestOptions,
-    known_rewrites: &HashMap<TableReference, TableReference>,
+    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
 ) -> UnnestOptions {
     let mut new_options = options.clone();
     new_options
@@ -263,20 +271,26 @@ fn rewrite_unnest_options(
 /// Returns the rewritten name if any rewrite was applied, otherwise None.
 fn rewrite_column_name(
     col_name: &str,
-    known_rewrites: &HashMap<TableReference, TableReference>,
+    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
 ) -> Option<String> {
-    let (new_col_name, was_rewritten) = known_rewrites.iter().fold(
-        (col_name.to_string(), false),
-        |(col_name, was_rewritten), (table_ref, rewrite)| match rewrite_column_name_in_expr(
-            &col_name,
-            &table_ref.to_string(),
-            &rewrite.to_string(),
-            0,
-        ) {
-            Some(new_name) => (new_name, true),
-            None => (col_name, was_rewritten),
-        },
-    );
+    let (new_col_name, was_rewritten) = known_rewrites
+        .iter()
+        .filter_map(|(table_ref, rewrite)| match rewrite {
+            MultiPartTableReference::TableReference(rewrite) => Some((table_ref, rewrite)),
+            _ => None,
+        })
+        .fold(
+            (col_name.to_string(), false),
+            |(col_name, was_rewritten), (table_ref, rewrite)| match rewrite_column_name_in_expr(
+                &col_name,
+                &table_ref.to_string(),
+                &rewrite.to_string(),
+                0,
+            ) {
+                Some(new_name) => (new_name, true),
+                None => (col_name, was_rewritten),
+            },
+        );
 
     if was_rewritten {
         Some(new_col_name)
@@ -361,7 +375,7 @@ fn rewrite_column_name_in_expr(
 
 fn rewrite_table_scans_in_expr(
     expr: Expr,
-    known_rewrites: &mut HashMap<TableReference, TableReference>,
+    known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
 ) -> Result<Expr> {
     match expr {
         Expr::ScalarSubquery(subquery) => {
@@ -386,7 +400,15 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::Column(mut col) => {
-            if let Some(rewrite) = col.relation.as_ref().and_then(|r| known_rewrites.get(r)) {
+            if let Some(rewrite) = col
+                .relation
+                .as_ref()
+                .and_then(|r| known_rewrites.get(r))
+                .and_then(|rewrite| match rewrite {
+                    MultiPartTableReference::TableReference(rewrite) => Some(rewrite),
+                    _ => None,
+                })
+            {
                 Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
             } else {
                 // This prevent over-eager rewrite and only pass the column into below rewritten
@@ -407,7 +429,14 @@ fn rewrite_table_scans_in_expr(
         Expr::Alias(alias) => {
             let expr = rewrite_table_scans_in_expr(*alias.expr, known_rewrites)?;
             if let Some(relation) = &alias.relation {
-                if let Some(rewrite) = known_rewrites.get(relation) {
+                if let Some(rewrite) =
+                    known_rewrites
+                        .get(relation)
+                        .and_then(|rewrite| match rewrite {
+                            MultiPartTableReference::TableReference(rewrite) => Some(rewrite),
+                            _ => None,
+                        })
+                {
                     return Ok(Expr::Alias(Alias::new(
                         expr,
                         Some(rewrite.clone()),
@@ -640,7 +669,14 @@ fn rewrite_table_scans_in_expr(
             )))
         }
         Expr::Wildcard { qualifier, options } => {
-            if let Some(rewrite) = qualifier.as_ref().and_then(|q| known_rewrites.get(q)) {
+            if let Some(rewrite) = qualifier
+                .as_ref()
+                .and_then(|q| known_rewrites.get(q))
+                .and_then(|rewrite| match rewrite {
+                    MultiPartTableReference::TableReference(rewrite) => Some(rewrite),
+                    _ => None,
+                })
+            {
                 Ok(Expr::Wildcard {
                     qualifier: Some(rewrite.clone()),
                     options,
@@ -678,7 +714,15 @@ fn rewrite_table_scans_in_expr(
             }
         },
         Expr::OuterReferenceColumn(dt, col) => {
-            if let Some(rewrite) = col.relation.as_ref().and_then(|r| known_rewrites.get(r)) {
+            if let Some(rewrite) = col
+                .relation
+                .as_ref()
+                .and_then(|r| known_rewrites.get(r))
+                .and_then(|rewrite| match rewrite {
+                    MultiPartTableReference::TableReference(rewrite) => Some(rewrite),
+                    _ => None,
+                })
+            {
                 Ok(Expr::OuterReferenceColumn(
                     dt,
                     Column::new(Some(rewrite.clone()), &col.name),
