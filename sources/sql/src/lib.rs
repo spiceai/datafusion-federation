@@ -158,7 +158,7 @@ impl VirtualExecutionPlan {
             &rewrite::plan::rewrite_table_scans(&self.plan, &mut known_rewrites)?,
         )?;
 
-        // Rewrite the MultiPartTableReference in the AST
+        // If there are any MultiPartTableReference, rewrite the AST to use the original table names.
         let multi_table_reference_rewrites = known_rewrites
             .into_iter()
             .filter_map(|(table_ref, rewrite)| match rewrite {
