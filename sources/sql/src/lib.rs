@@ -209,7 +209,7 @@ fn rewrite_table_scans(
                 })
                 .transpose()?;
 
-            // explisitly set fetch and skip
+            // explicitly set fetch and skip
             let new_plan = LogicalPlan::Limit(Limit {
                 skip: rewritten_skip,
                 fetch: rewritten_fetch,
