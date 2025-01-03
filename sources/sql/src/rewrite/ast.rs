@@ -157,11 +157,32 @@ fn rewrite_multi_part_table_reference_in_expr(
         ast::Expr::UnaryOp { expr, .. } => {
             rewrite_multi_part_table_reference_in_expr(expr, known_rewrites);
         }
-        ast::Expr::Function(_func) => {
-            // TODO: Implement this
-            // for arg in &mut func.args {
-            //     rewrite_multi_part_table_reference_in_expr(arg, known_rewrites);
-            // }
+        ast::Expr::Function(func) => {
+            if let Some(filter) = &mut func.filter {
+                rewrite_multi_part_table_reference_in_expr(filter, known_rewrites);
+            }
+            match &mut func.args {
+                ast::FunctionArguments::None => (),
+                ast::FunctionArguments::Subquery(query) => {
+                    rewrite_multi_part_table_reference_in_query(query, known_rewrites);
+                }
+                ast::FunctionArguments::List(function_argument_list) => {
+                    for arg in function_argument_list.args.iter_mut() {
+                        match arg {
+                            ast::FunctionArg::Named {
+                                arg: ast::FunctionArgExpr::Expr(arg),
+                                ..
+                            } => {
+                                rewrite_multi_part_table_reference_in_expr(arg, known_rewrites);
+                            }
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) => {
+                                rewrite_multi_part_table_reference_in_expr(arg, known_rewrites);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
         ast::Expr::Case {
             operand,
@@ -258,6 +279,19 @@ mod tests {
         rewrite_multi_part_statement(&mut stmt, &rewrites);
 
         assert_eq!(stmt.to_string(), "SELECT * FROM catalog.schema.real_table");
+    }
+
+    #[test]
+    fn test_rewrite_max_query() {
+        let mut stmt = parse_sql("SELECT MAX(test_table.a) FROM test_table");
+        let rewrites = create_test_rewrites();
+
+        rewrite_multi_part_statement(&mut stmt, &rewrites);
+
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT MAX(catalog.schema.real_table.a) FROM catalog.schema.real_table"
+        );
     }
 
     #[test]
