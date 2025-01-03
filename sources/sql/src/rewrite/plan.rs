@@ -60,6 +60,20 @@ pub(crate) fn rewrite_table_scans(
                         .replace_qualifier(remote_table_name.clone());
                     new_table_scan.projected_schema = Arc::new(new_schema);
                     new_table_scan.table_name = remote_table_name.clone();
+
+                    // Rewrite the filter expression in table scan
+                    let mut new_filter_expressions = vec![];
+                    for expression in &table_scan.filters {
+                        let new_expr = rewrite_table_scans_in_expr(
+                            expression.clone(),
+                            known_rewrites,
+                            subquery_uses_partial_path,
+                            subquery_table_scans,
+                        )?;
+                        new_filter_expressions.push(new_expr);
+                    }
+
+                    new_table_scan.filters = new_filter_expressions;
                 }
                 None => {
                     // Not a SQLTableSource (is this possible?)
