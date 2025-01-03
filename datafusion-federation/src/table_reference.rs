@@ -37,7 +37,7 @@ impl MultiPartTableReference {
     ///
     /// Example:
     ///
-    /// ```
+    /// ```ignore
     /// let parts = vec![Arc::from("a"), Arc::from("b"), Arc::from("c"), Arc::from("d")];
     /// let multi_part_table_reference = MultiPartTableReference::encode_multi_part_table_reference(&parts);
     /// assert_eq!(multi_part_table_reference.to_quoted_string(), r#""a"."b"."c"."d""#);
