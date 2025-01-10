@@ -21,53 +21,10 @@ use datafusion_federation::{get_table_source, table_reference::MultiPartTableRef
 
 use crate::SQLTableSource;
 
-fn collect_known_rewrites(
-    plan: &LogicalPlan,
-    known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
-) -> Result<()> {
-    if let LogicalPlan::TableScan(table_scan) = plan {
-        let original_table_name = table_scan.table_name.clone();
-
-        if let Some(federated_source) = get_table_source(&table_scan.source)? {
-            if let Some(sql_table_source) =
-                federated_source.as_any().downcast_ref::<SQLTableSource>()
-            {
-                let remote_table_name = sql_table_source.table_name();
-                known_rewrites.insert(original_table_name, remote_table_name.clone());
-            }
-        }
-    }
-
-    // Recursively collect from all inputs
-    for input in plan.inputs() {
-        collect_known_rewrites(input, known_rewrites)?;
-    }
-
-    Ok(())
-}
-
 /// Rewrite table scans to use the original federated table name.
 pub(crate) fn rewrite_table_scans(
     plan: &LogicalPlan,
     known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
-    subquery_uses_partial_path: bool,
-    subquery_table_scans: &mut Option<HashSet<TableReference>>,
-) -> Result<LogicalPlan> {
-    // First pass: collect all known rewrites
-    collect_known_rewrites(plan, known_rewrites)?;
-
-    // Second pass: do the actual rewriting with complete known_rewrites
-    rewrite_plan_with_known_rewrites(
-        plan,
-        known_rewrites,
-        subquery_uses_partial_path,
-        subquery_table_scans,
-    )
-}
-
-fn rewrite_plan_with_known_rewrites(
-    plan: &LogicalPlan,
-    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
     subquery_uses_partial_path: bool,
     subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<LogicalPlan> {
@@ -84,6 +41,7 @@ fn rewrite_plan_with_known_rewrites(
             match federated_source.as_any().downcast_ref::<SQLTableSource>() {
                 Some(sql_table_source) => {
                     let remote_table_name = sql_table_source.table_name();
+                    known_rewrites.insert(original_table_name.clone(), remote_table_name.clone());
 
                     // If the remote table name is a MultiPartTableReference, we will not rewrite it here, but rewrite it after the final unparsing on the AST directly.
                     let MultiPartTableReference::TableReference(remote_table_name) =
@@ -133,7 +91,7 @@ fn rewrite_plan_with_known_rewrites(
         .inputs()
         .into_iter()
         .map(|i| {
-            rewrite_plan_with_known_rewrites(
+            rewrite_table_scans(
                 i,
                 known_rewrites,
                 subquery_uses_partial_path,
@@ -214,7 +172,7 @@ fn rewrite_plan_with_known_rewrites(
 fn rewrite_unnest_plan(
     unnest: &logical_expr::Unnest,
     mut rewritten_inputs: Vec<LogicalPlan>,
-    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
+    known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
     subquery_uses_partial_path: bool,
     subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<LogicalPlan> {
@@ -433,14 +391,14 @@ fn rewrite_column_name_in_expr(
 
 fn rewrite_table_scans_in_expr(
     expr: Expr,
-    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
+    known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
     subquery_uses_partial_path: bool,
     subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<Expr> {
     match expr {
         Expr::ScalarSubquery(subquery) => {
             let new_subquery = if subquery_table_scans.is_some() || !subquery_uses_partial_path {
-                rewrite_plan_with_known_rewrites(
+                rewrite_table_scans(
                     &subquery.subquery,
                     known_rewrites,
                     subquery_uses_partial_path,
@@ -448,7 +406,7 @@ fn rewrite_table_scans_in_expr(
                 )?
             } else {
                 let mut scans = Some(HashSet::new());
-                rewrite_plan_with_known_rewrites(
+                rewrite_table_scans(
                     &subquery.subquery,
                     known_rewrites,
                     subquery_uses_partial_path,
@@ -930,7 +888,7 @@ fn rewrite_table_scans_in_expr(
         }
         Expr::Exists(exists) => {
             let subquery_plan = if subquery_table_scans.is_some() || !subquery_uses_partial_path {
-                rewrite_plan_with_known_rewrites(
+                rewrite_table_scans(
                     &exists.subquery.subquery,
                     known_rewrites,
                     subquery_uses_partial_path,
@@ -938,7 +896,7 @@ fn rewrite_table_scans_in_expr(
                 )?
             } else {
                 let mut scans = Some(HashSet::new());
-                rewrite_plan_with_known_rewrites(
+                rewrite_table_scans(
                     &exists.subquery.subquery,
                     known_rewrites,
                     subquery_uses_partial_path,
@@ -972,7 +930,7 @@ fn rewrite_table_scans_in_expr(
                 subquery_table_scans,
             )?;
             let subquery_plan = if subquery_table_scans.is_some() || !subquery_uses_partial_path {
-                rewrite_plan_with_known_rewrites(
+                rewrite_table_scans(
                     &is.subquery.subquery,
                     known_rewrites,
                     subquery_uses_partial_path,
@@ -980,7 +938,7 @@ fn rewrite_table_scans_in_expr(
                 )?
             } else {
                 let mut scans = Some(HashSet::new());
-                rewrite_plan_with_known_rewrites(
+                rewrite_table_scans(
                     &is.subquery.subquery,
                     known_rewrites,
                     subquery_uses_partial_path,
@@ -1415,22 +1373,6 @@ mod tests {
                 false,
             ),
         ];
-        for test in tests {
-            test_sql(&ctx, test.0, test.1, test.2).await?;
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_rewrite_outer_ref_columns() -> Result<()> {
-        init_tracing();
-        let ctx = get_test_df_context();
-        let tests = vec![(
-            "SELECT foo.df_table.a FROM bar JOIN foo.df_table ON foo.df_table.a = (SELECT bar.a FROM bar WHERE bar.a > foo.df_table.a)",
-            r#"SELECT remote_table.a FROM remote_db.remote_schema.remote_table JOIN remote_table ON (remote_table.a = (SELECT a FROM remote_db.remote_schema.remote_table WHERE (remote_table.a > remote_table.a)))"#,
-            true,
-        )];
         for test in tests {
             test_sql(&ctx, test.0, test.1, test.2).await?;
         }
