@@ -65,7 +65,6 @@ pub(crate) fn rewrite_table_scans(
     )
 }
 
-// Move the main rewriting logic to this function
 fn rewrite_plan_with_known_rewrites(
     plan: &LogicalPlan,
     known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
