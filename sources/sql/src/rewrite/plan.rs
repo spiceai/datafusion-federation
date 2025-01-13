@@ -21,7 +21,7 @@ use datafusion_federation::{get_table_source, table_reference::MultiPartTableRef
 
 use crate::SQLTableSource;
 
-fn collect_known_rewrites(
+fn collect_known_rewrites_from_plan(
     plan: &LogicalPlan,
     known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
 ) -> Result<()> {
@@ -40,10 +40,147 @@ fn collect_known_rewrites(
 
     // Recursively collect from all inputs
     for input in plan.inputs() {
-        collect_known_rewrites(input, known_rewrites)?;
+        collect_known_rewrites_from_plan(input, known_rewrites)?;
+    }
+
+    for expr in plan.expressions() {
+        collect_known_rewrites_from_expr(expr, known_rewrites)?;
     }
 
     Ok(())
+}
+
+fn collect_known_rewrites_from_expr(
+    expr: Expr,
+    known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
+) -> Result<()> {
+    match expr {
+        Expr::Column(_) => Ok(()), // No rewrites needed for column references
+        Expr::ScalarSubquery(subquery) => {
+            collect_known_rewrites_from_plan(&subquery.subquery, known_rewrites)
+        }
+        Expr::BinaryExpr(binary_expr) => {
+            collect_known_rewrites_from_expr(*binary_expr.left, known_rewrites)?;
+            collect_known_rewrites_from_expr(*binary_expr.right, known_rewrites)?;
+            Ok(())
+        }
+        Expr::Alias(alias) => collect_known_rewrites_from_expr(*alias.expr, known_rewrites),
+        Expr::Like(like) => {
+            collect_known_rewrites_from_expr(*like.expr, known_rewrites)?;
+            collect_known_rewrites_from_expr(*like.pattern, known_rewrites)?;
+            Ok(())
+        }
+        Expr::SimilarTo(similar_to) => {
+            collect_known_rewrites_from_expr(*similar_to.expr, known_rewrites)?;
+            collect_known_rewrites_from_expr(*similar_to.pattern, known_rewrites)?;
+            Ok(())
+        }
+        Expr::Not(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsNotNull(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsNull(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsTrue(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsFalse(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsUnknown(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsNotTrue(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsNotFalse(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::IsNotUnknown(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::Negative(e) => collect_known_rewrites_from_expr(*e, known_rewrites),
+        Expr::Between(between) => {
+            collect_known_rewrites_from_expr(*between.expr, known_rewrites)?;
+            collect_known_rewrites_from_expr(*between.low, known_rewrites)?;
+            collect_known_rewrites_from_expr(*between.high, known_rewrites)?;
+            Ok(())
+        }
+        Expr::Case(case) => {
+            if let Some(expr) = case.expr {
+                collect_known_rewrites_from_expr(*expr, known_rewrites)?;
+            }
+            if let Some(else_expr) = case.else_expr {
+                collect_known_rewrites_from_expr(*else_expr, known_rewrites)?;
+            }
+            for (when, then) in case.when_then_expr {
+                collect_known_rewrites_from_expr(*when, known_rewrites)?;
+                collect_known_rewrites_from_expr(*then, known_rewrites)?;
+            }
+            Ok(())
+        }
+        Expr::Cast(cast) => collect_known_rewrites_from_expr(*cast.expr, known_rewrites),
+        Expr::TryCast(try_cast) => collect_known_rewrites_from_expr(*try_cast.expr, known_rewrites),
+        Expr::ScalarFunction(sf) => {
+            for arg in sf.args {
+                collect_known_rewrites_from_expr(arg, known_rewrites)?;
+            }
+            Ok(())
+        }
+        Expr::AggregateFunction(af) => {
+            for arg in af.args {
+                collect_known_rewrites_from_expr(arg, known_rewrites)?;
+            }
+            if let Some(filter) = af.filter {
+                collect_known_rewrites_from_expr(*filter, known_rewrites)?;
+            }
+            if let Some(order_by) = af.order_by {
+                for sort in order_by {
+                    collect_known_rewrites_from_expr(sort.expr, known_rewrites)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::WindowFunction(wf) => {
+            for arg in wf.args {
+                collect_known_rewrites_from_expr(arg, known_rewrites)?;
+            }
+            for expr in wf.partition_by {
+                collect_known_rewrites_from_expr(expr, known_rewrites)?;
+            }
+            for sort in wf.order_by {
+                collect_known_rewrites_from_expr(sort.expr, known_rewrites)?;
+            }
+            Ok(())
+        }
+        Expr::InList(il) => {
+            collect_known_rewrites_from_expr(*il.expr, known_rewrites)?;
+            for expr in il.list {
+                collect_known_rewrites_from_expr(expr, known_rewrites)?;
+            }
+            Ok(())
+        }
+        Expr::Exists(exists) => {
+            collect_known_rewrites_from_plan(&exists.subquery.subquery, known_rewrites)?;
+            for expr in exists.subquery.outer_ref_columns {
+                collect_known_rewrites_from_expr(expr, known_rewrites)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery(is) => {
+            collect_known_rewrites_from_expr(*is.expr, known_rewrites)?;
+            collect_known_rewrites_from_plan(&is.subquery.subquery, known_rewrites)?;
+            for expr in is.subquery.outer_ref_columns {
+                collect_known_rewrites_from_expr(expr, known_rewrites)?;
+            }
+            Ok(())
+        }
+        Expr::Wildcard { .. } => Ok(()), // No rewrites needed for wildcards
+        Expr::GroupingSet(gs) => match gs {
+            GroupingSet::Rollup(exprs) | GroupingSet::Cube(exprs) => {
+                for expr in exprs {
+                    collect_known_rewrites_from_expr(expr, known_rewrites)?;
+                }
+                Ok(())
+            }
+            GroupingSet::GroupingSets(vec_exprs) => {
+                for exprs in vec_exprs {
+                    for expr in exprs {
+                        collect_known_rewrites_from_expr(expr, known_rewrites)?;
+                    }
+                }
+                Ok(())
+            }
+        },
+        Expr::OuterReferenceColumn(_, _) => Ok(()), // No rewrites needed for outer references
+        Expr::Unnest(unnest) => collect_known_rewrites_from_expr(*unnest.expr, known_rewrites),
+        Expr::ScalarVariable(_, _) | Expr::Literal(_) | Expr::Placeholder(_) => Ok(()),
+    }
 }
 
 /// Rewrite table scans to use the original federated table name.
@@ -54,7 +191,9 @@ pub(crate) fn rewrite_table_scans(
     subquery_table_scans: &mut Option<HashSet<TableReference>>,
 ) -> Result<LogicalPlan> {
     // First pass: collect all known rewrites
-    collect_known_rewrites(plan, known_rewrites)?;
+    collect_known_rewrites_from_plan(plan, known_rewrites)?;
+
+    println!("known_rewrites: {known_rewrites:?}");
 
     // Second pass: do the actual rewriting with complete known_rewrites
     rewrite_plan_with_known_rewrites(
