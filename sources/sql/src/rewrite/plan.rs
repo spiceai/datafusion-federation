@@ -55,7 +55,7 @@ fn collect_known_rewrites_from_expr(
     known_rewrites: &mut HashMap<TableReference, MultiPartTableReference>,
 ) -> Result<()> {
     match expr {
-        Expr::Column(_) => Ok(()), // No rewrites needed for column references
+        Expr::Column(_) => Ok(()), // Column references don't have any table scans
         Expr::ScalarSubquery(subquery) => {
             collect_known_rewrites_from_plan(&subquery.subquery, known_rewrites)
         }
@@ -160,7 +160,7 @@ fn collect_known_rewrites_from_expr(
             }
             Ok(())
         }
-        Expr::Wildcard { .. } => Ok(()), // No rewrites needed for wildcards
+        Expr::Wildcard { .. } => Ok(()), // Wildcard expressions don't have any table scans
         Expr::GroupingSet(gs) => match gs {
             GroupingSet::Rollup(exprs) | GroupingSet::Cube(exprs) => {
                 for expr in exprs {
@@ -177,7 +177,7 @@ fn collect_known_rewrites_from_expr(
                 Ok(())
             }
         },
-        Expr::OuterReferenceColumn(_, _) => Ok(()), // No rewrites needed for outer references
+        Expr::OuterReferenceColumn(_, _) => Ok(()), // Outer reference columns don't have any table scans
         Expr::Unnest(unnest) => collect_known_rewrites_from_expr(*unnest.expr, known_rewrites),
         Expr::ScalarVariable(_, _) | Expr::Literal(_) | Expr::Placeholder(_) => Ok(()),
     }
@@ -192,8 +192,6 @@ pub(crate) fn rewrite_table_scans(
 ) -> Result<LogicalPlan> {
     // First pass: collect all known rewrites
     collect_known_rewrites_from_plan(plan, known_rewrites)?;
-
-    println!("known_rewrites: {known_rewrites:?}");
 
     // Second pass: do the actual rewriting with complete known_rewrites
     rewrite_plan_with_known_rewrites(
