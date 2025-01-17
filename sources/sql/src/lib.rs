@@ -172,6 +172,7 @@ impl VirtualExecutionPlan {
                 _ => None,
             })
             .collect::<HashMap<TableReference, MultiTableReference>>();
+        tracing::trace!("multi_table_reference_rewrites: {multi_table_reference_rewrites:?}");
         if !multi_table_reference_rewrites.is_empty() {
             rewrite::ast::rewrite_multi_part_statement(&mut ast, &multi_table_reference_rewrites);
         }
