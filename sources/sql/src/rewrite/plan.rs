@@ -29,10 +29,7 @@ fn collect_known_rewrites_from_plan(
         let original_table_name = table_scan.table_name.clone();
 
         if let Some(federated_source) = get_table_source(&table_scan.source)? {
-            if let Some(sql_table_source) =
-                federated_source.as_any().downcast_ref::<SQLTableSource>()
-            {
-                let remote_table_name = sql_table_source.table_name();
+            if let Some(remote_table_name) = federated_source.remote_table_name() {
                 known_rewrites.insert(original_table_name, remote_table_name.clone());
             }
         }
