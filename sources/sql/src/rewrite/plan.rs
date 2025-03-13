@@ -29,10 +29,7 @@ fn collect_known_rewrites_from_plan(
         let original_table_name = table_scan.table_name.clone();
 
         if let Some(federated_source) = get_table_source(&table_scan.source)? {
-            if let Some(sql_table_source) =
-                federated_source.as_any().downcast_ref::<SQLTableSource>()
-            {
-                let remote_table_name = sql_table_source.table_name();
+            if let Some(remote_table_name) = federated_source.remote_table_name() {
                 known_rewrites.insert(original_table_name, remote_table_name.clone());
             }
         }
@@ -218,10 +215,8 @@ fn rewrite_plan_with_known_rewrites(
                 return Ok(plan.clone());
             };
 
-            match federated_source.as_any().downcast_ref::<SQLTableSource>() {
-                Some(sql_table_source) => {
-                    let remote_table_name = sql_table_source.table_name();
-
+            match federated_source.remote_table_name() {
+                Some(remote_table_name) => {
                     // If the remote table name is a MultiPartTableReference, we will not rewrite it here, but rewrite it after the final unparsing on the AST directly.
                     let MultiPartTableReference::TableReference(remote_table_name) =
                         remote_table_name
@@ -255,7 +250,6 @@ fn rewrite_plan_with_known_rewrites(
                     new_table_scan.filters = new_filter_expressions;
                 }
                 None => {
-                    // Not a SQLTableSource (is this possible?)
                     return Ok(plan.clone());
                 }
             }

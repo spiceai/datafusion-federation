@@ -345,7 +345,7 @@ mod tests {
             Arc::from(r#"part"4"#),
         ];
         let multi = MultiPartTableReference::Multi(MultiTableReference {
-            parts: parts.into_iter().map(Arc::from).collect(),
+            parts: parts.into_iter().collect(),
         });
         assert_eq!(
             multi.to_quoted_string(),

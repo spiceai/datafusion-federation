@@ -13,7 +13,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
-use crate::FederationProvider;
+use crate::{table_reference::MultiPartTableReference, FederationProvider};
 
 // FederatedTableSourceWrapper helps to recover the FederatedTableSource
 // from a TableScan. This wrapper may be avoidable.
@@ -150,6 +150,15 @@ impl TableProvider for FederatedTableProviderAdaptor {
 // to allow grouping of TableScans of the same FederationProvider.
 #[async_trait]
 pub trait FederatedTableSource: TableSource {
-    // Return the FederationProvider associated with this Table
+    /// Returns the remote table name for this table, if different from the
+    /// local table name registered in DataFusion.
+    ///
+    /// The remote table name is a `MultiPartTableReference` because some systems
+    /// allow arbitrarily nested table names (i.e. `catalog.namespace1.namespace2.table`).
+    fn remote_table_name(&self) -> Option<MultiPartTableReference> {
+        None
+    }
+
+    /// Return the FederationProvider associated with this Table
     fn federation_provider(&self) -> Arc<dyn FederationProvider>;
 }

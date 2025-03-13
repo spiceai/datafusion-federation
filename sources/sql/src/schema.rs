@@ -161,6 +161,10 @@ impl SQLTableSource {
 }
 
 impl FederatedTableSource for SQLTableSource {
+    fn remote_table_name(&self) -> Option<MultiPartTableReference> {
+        Some(self.table_name.clone())
+    }
+
     fn federation_provider(&self) -> Arc<dyn FederationProvider> {
         Arc::clone(&self.provider) as Arc<dyn FederationProvider>
     }
