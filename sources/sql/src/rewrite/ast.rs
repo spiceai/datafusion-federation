@@ -1,10 +1,13 @@
-use std::{collections::HashMap, vec};
+use std::vec;
 
-use datafusion::sql::{
-    sqlparser::ast::{
-        self, Ident, ObjectName, Query, SelectItem, SetExpr, TableFactor, TableWithJoins,
+use datafusion::{
+    common::HashMap,
+    sql::{
+        sqlparser::ast::{
+            self, Ident, ObjectName, Query, SelectItem, SetExpr, TableFactor, TableWithJoins,
+        },
+        TableReference,
     },
-    TableReference,
 };
 use datafusion_federation::table_reference::MultiTableReference;
 
@@ -44,7 +47,9 @@ fn rewrite_multi_part_table_with_joins(
                 | ast::JoinOperator::FullOuter(join_constraint)
                 | ast::JoinOperator::RightOuter(join_constraint)
                 | ast::JoinOperator::Inner(join_constraint)
-                | ast::JoinOperator::LeftOuter(join_constraint) => {
+                | ast::JoinOperator::LeftOuter(join_constraint)
+                | ast::JoinOperator::Semi(join_constraint)
+                | ast::JoinOperator::Anti(join_constraint) => {
                     if let ast::JoinConstraint::On(expr) = join_constraint {
                         rewrite_multi_part_table_reference_in_expr(expr, known_rewrites);
                     }
@@ -106,7 +111,8 @@ fn rewrite_multi_part_table_factor(
         | TableFactor::JsonTable { .. }
         | TableFactor::Pivot { .. }
         | TableFactor::Unpivot { .. }
-        | TableFactor::MatchRecognize { .. } => {
+        | TableFactor::MatchRecognize { .. }
+        | TableFactor::OpenJsonTable { .. } => {
             // TODO: Handle these table factors if needed
         }
     }
@@ -508,8 +514,8 @@ fn rewrite_multi_part_table_reference_in_expr(
             rewrite_multi_part_table_reference_in_expr(&mut interval.value, known_rewrites);
         }
         ast::Expr::MatchAgainst { .. } => {}
-        ast::Expr::Wildcard => {}
-        ast::Expr::QualifiedWildcard(object_name) => {
+        ast::Expr::Wildcard(_) => {}
+        ast::Expr::QualifiedWildcard(object_name, _) => {
             rewrite_object_name(object_name, known_rewrites);
         }
         ast::Expr::OuterJoin(expr) => {
@@ -520,6 +526,9 @@ fn rewrite_multi_part_table_reference_in_expr(
         }
         ast::Expr::Lambda(lambda_function) => {
             rewrite_multi_part_table_reference_in_expr(&mut lambda_function.body, known_rewrites);
+        }
+        ast::Expr::Method(method) => {
+            rewrite_multi_part_table_reference_in_expr(&mut method.expr, known_rewrites);
         }
     }
 }
@@ -546,9 +555,9 @@ fn table_reference_to_object_name(table_reference: &TableReference) -> ObjectNam
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::HashMap;
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
-    use std::collections::HashMap;
 
     fn parse_sql(sql: &str) -> ast::Statement {
         let dialect = GenericDialect {};

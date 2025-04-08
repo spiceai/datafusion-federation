@@ -1,10 +1,7 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use datafusion::{
-    common::{Column, RecursionUnnestOption, UnnestOptions},
+    common::{Column, HashMap, RecursionUnnestOption, UnnestOptions},
     error::{DataFusionError, Result},
     logical_expr::{
         self,
@@ -18,8 +15,6 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_federation::{get_table_source, table_reference::MultiPartTableReference};
-
-use crate::SQLTableSource;
 
 fn collect_known_rewrites_from_plan(
     plan: &LogicalPlan,
@@ -1243,8 +1238,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema, SchemaRef},
-        catalog::SchemaProvider,
-        catalog_common::MemorySchemaProvider,
+        catalog::{MemorySchemaProvider, SchemaProvider},
         common::Column,
         datasource::{DefaultTableSource, TableProvider},
         error::DataFusionError,
@@ -1671,7 +1665,7 @@ mod tests {
 
 #[cfg(test)]
 mod collect_rewrites_tests {
-    use crate::{SQLExecutor, SQLFederationProvider};
+    use crate::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 
     use super::*;
     use async_trait::async_trait;

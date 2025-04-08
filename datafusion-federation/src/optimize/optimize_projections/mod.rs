@@ -15,17 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    collections::{HashMap, HashSet},
-    result,
-    sync::Arc,
-};
+use std::{collections::HashSet, result, sync::Arc};
 
 use datafusion::{
     common::{
         get_required_group_by_exprs_indices, internal_datafusion_err, internal_err,
         tree_node::{Transformed, TreeNode, TreeNodeIterator, TreeNodeRecursion},
-        Column, JoinType,
+        Column, HashMap, JoinType,
     },
     error::DataFusionError,
     logical_expr::{
@@ -276,7 +272,7 @@ fn optimize_projections(
                 })
                 .collect::<Result<_>>()?
         }
-        LogicalPlan::Limit(_) | LogicalPlan::Prepare(_) => {
+        LogicalPlan::Limit(_) => {
             // Pass index requirements from the parent as well as column indices
             // that appear in this plan's expressions to its child. These operators
             // do not benefit from "small" inputs, so the projection_beneficial
@@ -329,8 +325,7 @@ fn optimize_projections(
         | LogicalPlan::RecursiveQuery(_)
         | LogicalPlan::Statement(_)
         | LogicalPlan::Values(_)
-        | LogicalPlan::DescribeTable(_)
-        | LogicalPlan::Execute(_) => {
+        | LogicalPlan::DescribeTable(_) => {
             // These operators have no inputs, so stop the optimization process.
             return Ok(Transformed::no(plan));
         }

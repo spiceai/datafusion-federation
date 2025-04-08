@@ -1,9 +1,10 @@
 use core::fmt;
-use std::{any::Any, collections::HashMap, sync::Arc, vec};
+use std::{any::Any, sync::Arc, vec};
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
+    common::HashMap,
     config::ConfigOptions,
     error::Result,
     execution::{context::SessionState, TaskContext},
@@ -11,7 +12,8 @@ use datafusion::{
     optimizer::analyzer::{Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
     },
     sql::{
@@ -137,7 +139,8 @@ impl VirtualExecutionPlan {
         let props = PlanProperties::new(
             EquivalenceProperties::new(Arc::new(schema)),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             plan,
