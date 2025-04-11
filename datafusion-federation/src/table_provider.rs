@@ -17,17 +17,10 @@ use crate::{table_reference::MultiPartTableReference, FederationProvider};
 
 // FederatedTableSourceWrapper helps to recover the FederatedTableSource
 // from a TableScan. This wrapper may be avoidable.
+#[derive(Debug)]
 pub struct FederatedTableProviderAdaptor {
     pub source: Arc<dyn FederatedTableSource>,
     pub table_provider: Option<Arc<dyn TableProvider>>,
-}
-
-impl std::fmt::Debug for FederatedTableProviderAdaptor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FederatedTableProviderAdaptor")
-            .field("table_provider", &self.table_provider)
-            .finish()
-    }
 }
 
 impl FederatedTableProviderAdaptor {
@@ -80,7 +73,7 @@ impl TableProvider for FederatedTableProviderAdaptor {
 
         self.source.table_type()
     }
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
         if let Some(table_provider) = &self.table_provider {
             return table_provider
                 .get_logical_plan()
@@ -134,10 +127,10 @@ impl TableProvider for FederatedTableProviderAdaptor {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(table_provider) = &self.table_provider {
-            return table_provider.insert_into(_state, input, overwrite).await;
+            return table_provider.insert_into(_state, input, insert_op).await;
         }
 
         Err(DataFusionError::NotImplemented(
@@ -161,4 +154,14 @@ pub trait FederatedTableSource: TableSource {
 
     /// Return the FederationProvider associated with this Table
     fn federation_provider(&self) -> Arc<dyn FederationProvider>;
+}
+
+impl std::fmt::Debug for dyn FederatedTableSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "FederatedTableSource: {:?}",
+            self.federation_provider().name()
+        )
+    }
 }

@@ -114,6 +114,7 @@ impl SchemaProvider for MultiSchemaProvider {
     }
 }
 
+#[derive(Debug)]
 pub struct SQLTableSource {
     provider: Arc<SQLFederationProvider>,
     table_name: MultiPartTableReference,
