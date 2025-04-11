@@ -20,19 +20,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-#[derive(Debug)]
+/// An analyzer rule to identifying sub-plans to federate
+///
+/// The analyzer logic walks over the plan, look for the largest subtrees that only have
+/// TableScans from the same [`FederationProvider`]. The 'largest sub-trees' are passed to their
+/// respective [`FederationProvider::analyzer`].
+#[derive(Default, Debug)]
 pub struct FederationAnalyzerRule {
+    // Optimization rules to run before the federated plan is created
     optimizer: Optimizer,
     provider_map: Arc<RwLock<HashMap<TableReference, ScanResult>>>,
-}
-
-impl Default for FederationAnalyzerRule {
-    fn default() -> Self {
-        Self {
-            optimizer: Optimizer::default(),
-            provider_map: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
 }
 
 impl AnalyzerRule for FederationAnalyzerRule {
@@ -43,18 +40,19 @@ impl AnalyzerRule for FederationAnalyzerRule {
         if !contains_federated_table(&plan)? {
             return Ok(plan);
         }
+
         // Run selected optimizer rules before federation
         let plan = self.optimizer.optimize_plan(plan)?;
 
-        // Find all federation providers for TableReference appeared in the plan
+        // Find all federation providers for TableReferences that appeared in the plan
         let providers = get_plan_provider_recursively(&plan)?;
-        let mut write_map = self.provider_map.write().map_err(|_| {
+        let mut write_map_guard = self.provider_map.write().map_err(|_| {
             DataFusionError::External(
                 "Failed to create federated plan: failed to find all federated providers.".into(),
             )
         })?;
-        write_map.extend(providers);
-        drop(write_map);
+        write_map_guard.extend(providers);
+        drop(write_map_guard);
 
         match self.optimize_plan_recursively(&plan, true, config)? {
             (Some(optimized_plan), _) => Ok(optimized_plan),
@@ -142,9 +140,7 @@ impl FederationAnalyzerRule {
                             return Ok(sole_provider.check_recursion());
                         }
                     }
-                    // Subqueries that reference outer columns are not supported
-                    // for now. We handle this here as ambiguity to force
-                    // federation lower in the plan tree.
+                    // If we don't know about this table, we can't federate
                     sole_provider = ScanResult::Ambiguous;
                     Ok(TreeNodeRecursion::Stop)
                 }
@@ -225,13 +221,13 @@ impl FederationAnalyzerRule {
                 return Ok((None, ScanResult::Distinct(provider)));
             }
 
-            let Some(optimizer) = provider.analyzer() else {
-                // No optimizer provided
+            let Some(analyzer) = provider.analyzer() else {
+                // No analyzer provided
                 return Ok((None, ScanResult::None));
             };
 
             // If this is the root plan node; federate the entire plan
-            let optimized = optimizer.execute_and_check(plan.clone(), _config, |_, _| {})?;
+            let optimized = analyzer.execute_and_check(plan.clone(), _config, |_, _| {})?;
             return Ok((Some(optimized), ScanResult::None));
         }
 
@@ -262,14 +258,14 @@ impl FederationAnalyzerRule {
                     return Ok(original_input);
                 };
 
-                let Some(optimizer) = provider.analyzer() else {
-                    // No optimizer for this input; use the original input.
+                let Some(analyzer) = provider.analyzer() else {
+                    // No analyzer for this input; use the original input.
                     return Ok(original_input);
                 };
 
                 // Replace the input with the federated counterpart
                 let wrapped = wrap_projection(original_input)?;
-                let optimized = optimizer.execute_and_check(wrapped, _config, |_, _| {})?;
+                let optimized = analyzer.execute_and_check(wrapped, _config, |_, _| {})?;
 
                 Ok(optimized)
             })
