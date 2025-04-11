@@ -7,16 +7,15 @@ use datafusion::{
 use futures::future::join_all;
 use std::{any::Any, sync::Arc};
 
-use datafusion_federation::{
+use crate::{
     table_reference::MultiPartTableReference, FederatedTableProviderAdaptor, FederatedTableSource,
     FederationProvider,
 };
 
-use crate::SQLFederationProvider;
+use crate::sql::SQLFederationProvider;
 
 #[derive(Debug)]
 pub struct SQLSchemaProvider {
-    // provider: Arc<SQLFederationProvider>,
     tables: Vec<Arc<SQLTableSource>>,
 }
 
@@ -119,15 +118,6 @@ pub struct SQLTableSource {
     provider: Arc<SQLFederationProvider>,
     table_name: MultiPartTableReference,
     schema: SchemaRef,
-}
-
-impl std::fmt::Debug for SQLTableSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SQLTableSource")
-            .field("table_name", &self.table_name)
-            .field("schema", &self.schema)
-            .finish()
-    }
 }
 
 impl SQLTableSource {

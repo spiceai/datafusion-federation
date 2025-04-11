@@ -1,5 +1,6 @@
 use std::vec;
 
+use crate::table_reference::MultiTableReference;
 use datafusion::{
     common::HashMap,
     sql::{
@@ -9,7 +10,6 @@ use datafusion::{
         TableReference,
     },
 };
-use datafusion_federation::table_reference::MultiTableReference;
 
 /// Rewrites table references in a SQL AST to use the original federated table names.
 /// This is similar to rewrite_table_scans but operates on the sqlparser AST instead
@@ -22,11 +22,9 @@ pub(crate) fn rewrite_multi_part_statement(
         .iter()
         .map(|(k, v)| (table_reference_to_object_name(k), v.clone()))
         .collect();
-    tracing::trace!("rewrite_multi_part_statement (before):\n{:?}", statement);
     if let ast::Statement::Query(query) = statement {
         rewrite_multi_part_table_reference_in_query(&mut *query, &known_rewrites);
     }
-    tracing::trace!("rewrite_multi_part_statement (after):\n{:?}", statement);
 }
 
 fn rewrite_multi_part_table_with_joins(
@@ -433,13 +431,6 @@ fn rewrite_multi_part_table_reference_in_expr(
         ast::Expr::Value(..) => {}
         ast::Expr::IntroducedString { .. } => {}
         ast::Expr::TypedString { .. } => {}
-        ast::Expr::MapAccess { column, keys } => {
-            rewrite_multi_part_table_reference_in_expr(&mut *column, known_rewrites);
-
-            for key in keys {
-                rewrite_multi_part_table_reference_in_expr(&mut key.key, known_rewrites);
-            }
-        }
         ast::Expr::Exists { subquery, .. } => {
             rewrite_multi_part_table_reference_in_query(&mut *subquery, known_rewrites);
         }
@@ -482,29 +473,6 @@ fn rewrite_multi_part_table_reference_in_expr(
                 rewrite_multi_part_table_reference_in_expr(&mut entry.value, known_rewrites);
             }
         }
-        ast::Expr::Subscript { expr, subscript } => {
-            rewrite_multi_part_table_reference_in_expr(&mut *expr, known_rewrites);
-            match &mut **subscript {
-                ast::Subscript::Index { index } => {
-                    rewrite_multi_part_table_reference_in_expr(index, known_rewrites);
-                }
-                ast::Subscript::Slice {
-                    lower_bound,
-                    upper_bound,
-                    stride,
-                } => {
-                    if let Some(lower_bound) = lower_bound {
-                        rewrite_multi_part_table_reference_in_expr(lower_bound, known_rewrites);
-                    }
-                    if let Some(upper_bound) = upper_bound {
-                        rewrite_multi_part_table_reference_in_expr(upper_bound, known_rewrites);
-                    }
-                    if let Some(stride) = stride {
-                        rewrite_multi_part_table_reference_in_expr(stride, known_rewrites);
-                    }
-                }
-            }
-        }
         ast::Expr::Array(array) => {
             for expr in array.elem.iter_mut() {
                 rewrite_multi_part_table_reference_in_expr(expr, known_rewrites);
@@ -529,6 +497,45 @@ fn rewrite_multi_part_table_reference_in_expr(
         }
         ast::Expr::Method(method) => {
             rewrite_multi_part_table_reference_in_expr(&mut method.expr, known_rewrites);
+        }
+        ast::Expr::CompoundFieldAccess { root, access_chain } => {
+            rewrite_multi_part_table_reference_in_expr(root, known_rewrites);
+            for access in access_chain {
+                match access {
+                    ast::AccessExpr::Dot(expr) => {
+                        rewrite_multi_part_table_reference_in_expr(expr, known_rewrites);
+                    }
+                    ast::AccessExpr::Subscript(subscript) => match subscript {
+                        ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        } => {
+                            if let Some(lower_bound) = lower_bound {
+                                rewrite_multi_part_table_reference_in_expr(
+                                    lower_bound,
+                                    known_rewrites,
+                                );
+                            }
+                            if let Some(upper_bound) = upper_bound {
+                                rewrite_multi_part_table_reference_in_expr(
+                                    upper_bound,
+                                    known_rewrites,
+                                );
+                            }
+                            if let Some(stride) = stride {
+                                rewrite_multi_part_table_reference_in_expr(stride, known_rewrites);
+                            }
+                        }
+                        ast::Subscript::Index { index } => {
+                            rewrite_multi_part_table_reference_in_expr(index, known_rewrites);
+                        }
+                    },
+                }
+            }
+        }
+        ast::Expr::IsNormalized { expr, .. } => {
+            rewrite_multi_part_table_reference_in_expr(expr, known_rewrites);
         }
     }
 }

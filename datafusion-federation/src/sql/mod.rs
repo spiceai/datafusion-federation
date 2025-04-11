@@ -2,24 +2,17 @@ mod executor;
 mod rewrite;
 mod schema;
 
-use std::{any::Any, collections::HashMap, fmt, sync::Arc, vec};
+use std::{any::Any, fmt, sync::Arc, vec};
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
-    common::{tree_node::Transformed, Column},
+    common::HashMap,
+    config::ConfigOptions,
     error::Result,
     execution::{context::SessionState, TaskContext},
-    logical_expr::{
-        expr::{
-            AggregateFunction, AggregateFunctionParams, Alias, Exists, InList, InSubquery,
-            PlannedReplaceSelectItem, ScalarFunction, Sort, Unnest, WildcardOptions,
-            WindowFunction, WindowFunctionParams,
-        },
-        Between, BinaryExpr, Case, Cast, Expr, Extension, GroupingSet, Like, Limit, LogicalPlan,
-        Subquery, TryCast,
-    },
-    optimizer::{optimizer::Optimizer, OptimizerConfig, OptimizerRule},
+    logical_expr::{Extension, LogicalPlan},
+    optimizer::{Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
@@ -37,21 +30,23 @@ pub use executor::{AstAnalyzer, SQLExecutor, SQLExecutorRef};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider, SQLTableSource};
 
 use crate::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
+    schema_cast,
+    table_reference::{MultiPartTableReference, MultiTableReference},
+    FederatedPlanNode, FederationPlanner, FederationProvider,
 };
 
 // SQLFederationProvider provides federation to SQL DMBSs.
 #[derive(Debug)]
 pub struct SQLFederationProvider {
-    optimizer: Arc<Optimizer>,
+    analyzer: Arc<Analyzer>,
     executor: Arc<dyn SQLExecutor>,
 }
 
 impl SQLFederationProvider {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
-            optimizer: Arc::new(Optimizer::with_rules(vec![Arc::new(
-                SQLFederationOptimizerRule::new(executor.clone()),
+            analyzer: Arc::new(Analyzer::with_rules(vec![Arc::new(
+                SQLFederationAnalyzerRule::new(Arc::clone(&executor)),
             )])),
             executor,
         }
@@ -67,17 +62,17 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn optimizer(&self) -> Option<Arc<Optimizer>> {
-        Some(self.optimizer.clone())
+    fn analyzer(&self) -> Option<Arc<Analyzer>> {
+        Some(Arc::clone(&self.analyzer))
     }
 }
 
 #[derive(Debug)]
-struct SQLFederationOptimizerRule {
+struct SQLFederationAnalyzerRule {
     planner: Arc<dyn FederationPlanner>,
 }
 
-impl SQLFederationOptimizerRule {
+impl SQLFederationAnalyzerRule {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
             planner: Arc::new(SQLFederationPlanner::new(Arc::clone(&executor))),
@@ -85,9 +80,9 @@ impl SQLFederationOptimizerRule {
     }
 }
 
-impl AnalyzerRule for SQLFederationOptimizerRule {
+impl AnalyzerRule for SQLFederationAnalyzerRule {
     /// Try to rewrite `plan` to an optimized form.
-    fn analyze(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<LogicalPlan> {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         if let LogicalPlan::Extension(Extension { ref node }) = plan {
             if node.name() == "Federated" {
                 // Avoid attempting double federation
@@ -183,7 +178,6 @@ impl VirtualExecutionPlan {
                 _ => None,
             })
             .collect::<HashMap<TableReference, MultiTableReference>>();
-        tracing::trace!("multi_table_reference_rewrites: {multi_table_reference_rewrites:?}");
         if !multi_table_reference_rewrites.is_empty() {
             rewrite::ast::rewrite_multi_part_statement(&mut ast, &multi_table_reference_rewrites);
         }
