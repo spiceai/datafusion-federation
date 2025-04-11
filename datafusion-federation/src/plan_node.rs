@@ -30,12 +30,6 @@ impl FederatedPlanNode {
     }
 }
 
-impl PartialOrd for FederatedPlanNode {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.plan.partial_cmp(&other.plan)
-    }
-}
-
 impl Debug for FederatedPlanNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         UserDefinedLogicalNodeCore::fmt_for_explain(self, f)
