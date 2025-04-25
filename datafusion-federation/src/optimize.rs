@@ -11,6 +11,7 @@ use optimize_projections::OptimizeProjections;
 
 mod optimize_projections;
 
+// TODO: Make this a trait that can be implemented by consumers.
 #[derive(Debug)]
 pub(crate) struct Optimizer {
     config: OptimizerContext,
