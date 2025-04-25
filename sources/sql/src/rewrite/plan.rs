@@ -6,8 +6,8 @@ use datafusion::{
     logical_expr::{
         self,
         expr::{
-            AggregateFunction, Alias, Exists, InList, InSubquery, ScalarFunction, Sort, Unnest,
-            WindowFunction,
+            AggregateFunction, AggregateFunctionParams, Alias, Exists, InList, InSubquery,
+            ScalarFunction, Sort, Unnest, WindowFunction, WindowFunctionParams,
         },
         Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Limit, LogicalPlan,
         LogicalPlanBuilder, Projection, Subquery, TryCast,
@@ -105,13 +105,13 @@ fn collect_known_rewrites_from_expr(
             Ok(())
         }
         Expr::AggregateFunction(af) => {
-            for arg in af.args {
+            for arg in af.params.args {
                 collect_known_rewrites_from_expr(arg, known_rewrites)?;
             }
-            if let Some(filter) = af.filter {
+            if let Some(filter) = af.params.filter {
                 collect_known_rewrites_from_expr(*filter, known_rewrites)?;
             }
-            if let Some(order_by) = af.order_by {
+            if let Some(order_by) = af.params.order_by {
                 for sort in order_by {
                     collect_known_rewrites_from_expr(sort.expr, known_rewrites)?;
                 }
@@ -119,13 +119,13 @@ fn collect_known_rewrites_from_expr(
             Ok(())
         }
         Expr::WindowFunction(wf) => {
-            for arg in wf.args {
+            for arg in wf.params.args {
                 collect_known_rewrites_from_expr(arg, known_rewrites)?;
             }
-            for expr in wf.partition_by {
+            for expr in wf.params.partition_by {
                 collect_known_rewrites_from_expr(expr, known_rewrites)?;
             }
-            for sort in wf.order_by {
+            for sort in wf.params.order_by {
                 collect_known_rewrites_from_expr(sort.expr, known_rewrites)?;
             }
             Ok(())
@@ -152,6 +152,7 @@ fn collect_known_rewrites_from_expr(
             }
             Ok(())
         }
+        #[allow(deprecated, reason = "Needed to exhaustively match all variants")]
         Expr::Wildcard { .. } => Ok(()), // Wildcard expressions don't have any table scans
         Expr::GroupingSet(gs) => match gs {
             GroupingSet::Rollup(exprs) | GroupingSet::Cube(exprs) => {
@@ -938,6 +939,7 @@ fn rewrite_table_scans_in_expr(
         }
         Expr::AggregateFunction(af) => {
             let args = af
+                .params
                 .args
                 .into_iter()
                 .map(|e| {
@@ -950,6 +952,7 @@ fn rewrite_table_scans_in_expr(
                 })
                 .collect::<Result<Vec<Expr>>>()?;
             let filter = af
+                .params
                 .filter
                 .map(|e| {
                     rewrite_table_scans_in_expr(
@@ -962,6 +965,7 @@ fn rewrite_table_scans_in_expr(
                 .transpose()?
                 .map(Box::new);
             let order_by = af
+                .params
                 .order_by
                 .map(|e| {
                     e.into_iter()
@@ -979,15 +983,18 @@ fn rewrite_table_scans_in_expr(
                 .transpose()?;
             Ok(Expr::AggregateFunction(AggregateFunction {
                 func: af.func,
-                args,
-                distinct: af.distinct,
-                filter,
-                order_by,
-                null_treatment: af.null_treatment,
+                params: AggregateFunctionParams {
+                    args,
+                    distinct: af.params.distinct,
+                    filter,
+                    order_by,
+                    null_treatment: af.params.null_treatment,
+                },
             }))
         }
         Expr::WindowFunction(wf) => {
             let args = wf
+                .params
                 .args
                 .into_iter()
                 .map(|e| {
@@ -1000,6 +1007,7 @@ fn rewrite_table_scans_in_expr(
                 })
                 .collect::<Result<Vec<Expr>>>()?;
             let partition_by = wf
+                .params
                 .partition_by
                 .into_iter()
                 .map(|e| {
@@ -1012,6 +1020,7 @@ fn rewrite_table_scans_in_expr(
                 })
                 .collect::<Result<Vec<Expr>>>()?;
             let order_by = wf
+                .params
                 .order_by
                 .into_iter()
                 .map(|s| {
@@ -1026,11 +1035,13 @@ fn rewrite_table_scans_in_expr(
                 .collect::<Result<Vec<Sort>>>()?;
             Ok(Expr::WindowFunction(WindowFunction {
                 fun: wf.fun,
-                args,
-                partition_by,
-                order_by,
-                window_frame: wf.window_frame,
-                null_treatment: wf.null_treatment,
+                params: WindowFunctionParams {
+                    args,
+                    partition_by,
+                    order_by,
+                    window_frame: wf.params.window_frame,
+                    null_treatment: wf.params.null_treatment,
+                },
             }))
         }
         Expr::InList(il) => {
@@ -1136,6 +1147,7 @@ fn rewrite_table_scans_in_expr(
                 is.negated,
             )))
         }
+        #[allow(deprecated, reason = "Needed to exhaustively match all variants")]
         Expr::Wildcard { qualifier, options } => {
             if let Some(rewrite) = qualifier
                 .as_ref()
