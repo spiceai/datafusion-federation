@@ -1,0 +1,18 @@
+---
+source: test/src/main.rs
+description: Federated Query Explain
+expression: display_string
+---
+Federated
+ Projection: sum(lineitem.l_extendedprice) / Float64(7) AS avg_yearly
+  Aggregate: groupBy=[[]], aggr=[[sum(lineitem.l_extendedprice)]]
+    Inner Join:  Filter: part.p_partkey = lineitem.l_partkey
+      Filter: lineitem.l_quantity < (<subquery>)
+        Subquery:
+          Projection: Float64(0.2) * avg(lineitem.l_quantity)
+            Aggregate: groupBy=[[]], aggr=[[avg(lineitem.l_quantity)]]
+              Filter: lineitem.l_partkey = outer_ref(part.p_partkey)
+                TableScan: lineitem
+        TableScan: lineitem projection=[l_partkey, l_quantity, l_extendedprice]
+      Filter: part.p_brand = Utf8("Brand#23") AND part.p_container = Utf8("MED BOX")
+        TableScan: part projection=[p_partkey, p_brand, p_container]

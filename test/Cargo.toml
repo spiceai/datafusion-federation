@@ -1,0 +1,18 @@
+[package]
+name = "federation-integration-tests"
+description = "Integration tests for datafusion-federation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+
+[dependencies]
+tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros"] }
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-federation.path = "../datafusion-federation"
+datafusion-federation-sql = { path = "../sources/sql" }
+tonic = "0.12.2"
+futures.workspace = true
+insta = { version = "1.42.0" }

@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "datafusion-federation",
     "sources/sql",
+    "test",
 ]
 
 [workspace.package]

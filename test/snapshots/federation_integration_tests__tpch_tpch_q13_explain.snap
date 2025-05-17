@@ -1,0 +1,16 @@
+---
+source: test/src/main.rs
+description: Federated Query Explain
+expression: display_string
+---
+Federated
+ Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST
+  Projection: c_orders.c_count, count(Int64(1)) AS count(*) AS custdist
+    Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]
+      SubqueryAlias: c_orders
+        Projection: count(orders.o_orderkey) AS c_count
+          Aggregate: groupBy=[[customer.c_custkey]], aggr=[[count(orders.o_orderkey)]]
+            Left Join:  Filter: customer.c_custkey = orders.o_custkey
+              TableScan: customer projection=[c_custkey]
+              Filter: orders.o_comment NOT LIKE Utf8("%special%requests%")
+                TableScan: orders projection=[o_orderkey, o_custkey, o_comment]

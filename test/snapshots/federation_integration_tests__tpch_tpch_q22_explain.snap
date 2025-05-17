@@ -1,0 +1,22 @@
+---
+source: test/src/main.rs
+description: Federated Query Explain
+expression: display_string
+---
+Federated
+ Sort: custsale.cntrycode ASC NULLS LAST
+  Projection: custsale.cntrycode, count(Int64(1)) AS count(*) AS numcust, sum(custsale.c_acctbal) AS totacctbal
+    Aggregate: groupBy=[[custsale.cntrycode]], aggr=[[count(Int64(1)), sum(custsale.c_acctbal)]]
+      SubqueryAlias: custsale
+        Projection: substr(customer.c_phone, Int64(1), Int64(2)) AS cntrycode, customer.c_acctbal
+          Filter: substr(customer.c_phone, Int64(1), Int64(2)) IN ([Utf8("13"), Utf8("31"), Utf8("23"), Utf8("29"), Utf8("30"), Utf8("18"), Utf8("17")]) AND customer.c_acctbal > (<subquery>) AND NOT EXISTS (<subquery>)
+            Subquery:
+              Projection: avg(customer.c_acctbal)
+                Aggregate: groupBy=[[]], aggr=[[avg(customer.c_acctbal)]]
+                  Filter: customer.c_acctbal > Float64(0) AND substr(customer.c_phone, Int64(1), Int64(2)) IN ([Utf8("13"), Utf8("31"), Utf8("23"), Utf8("29"), Utf8("30"), Utf8("18"), Utf8("17")])
+                    TableScan: customer
+            Subquery:
+              Projection: orders.o_orderkey, orders.o_custkey, orders.o_orderstatus, orders.o_totalprice, orders.o_orderdate, orders.o_orderpriority, orders.o_clerk, orders.o_shippriority, orders.o_comment
+                Filter: orders.o_custkey = outer_ref(customer.c_custkey)
+                  TableScan: orders
+            TableScan: customer projection=[c_custkey, c_phone, c_acctbal]

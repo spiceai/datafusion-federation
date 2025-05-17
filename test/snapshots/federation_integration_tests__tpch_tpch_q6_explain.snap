@@ -1,0 +1,10 @@
+---
+source: test/src/main.rs
+description: Federated Query Explain
+expression: display_string
+---
+Federated
+ Projection: sum(lineitem.l_extendedprice * lineitem.l_discount) AS revenue
+  Aggregate: groupBy=[[]], aggr=[[sum(lineitem.l_extendedprice * lineitem.l_discount)]]
+    Filter: lineitem.l_shipdate >= CAST(Utf8("1994-01-01") AS Date32) AND lineitem.l_shipdate < CAST(Utf8("1995-01-01") AS Date32) AND lineitem.l_discount BETWEEN Float64(0.06) - Float64(0.01) AND Float64(0.06) + Float64(0.01) AND lineitem.l_quantity < Int64(24)
+      TableScan: lineitem projection=[l_quantity, l_extendedprice, l_discount, l_shipdate]
