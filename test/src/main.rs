@@ -1,4 +1,5 @@
 mod bench;
+mod validation;
 
 use anyhow::{anyhow, Result};
 use bench::{Benchmark, Query};
@@ -55,7 +56,7 @@ fn get_duckdb_table_factory(db_name: String) -> Result<DuckDBTableFactory> {
 
 #[tokio::main]
 async fn main() {
-    let benchmark: Box<dyn Benchmark> = Box::new(bench::TpchBenchmark);
+    let benchmark: Arc<dyn Benchmark> = Arc::new(bench::TpchBenchmark);
 
     let duckdb_table_factory = get_duckdb_table_factory(benchmark.db_file_name())
         .expect("unable to create DuckDB connection pool");
@@ -73,13 +74,17 @@ async fn main() {
     let test_queries = benchmark.queries();
 
     for query in test_queries {
-        run_test_query(&ctx, benchmark.name(), query)
+        run_test_query(&ctx, Arc::clone(&benchmark), query)
             .await
             .expect("query failed");
     }
 }
 
-async fn run_test_query(ctx: &SessionContext, bench_name: &str, query: Query) -> Result<()> {
+async fn run_test_query(
+    ctx: &SessionContext,
+    benchmark: Arc<dyn Benchmark>,
+    query: Query,
+) -> Result<()> {
     let df = ctx.sql(&query.sql).await?;
 
     let plan = df.clone().explain(false, false)?.collect().await?;
@@ -89,10 +94,11 @@ async fn run_test_query(ctx: &SessionContext, bench_name: &str, query: Query) ->
         description => format!("Federated Query Explain"),
         snapshot_path => "../snapshots/explain"
     }, {
-        insta::assert_snapshot!(format!("{bench_name}_{}_explain", query.name), plan_display);
+        insta::assert_snapshot!(format!("{}_{}_explain", benchmark.name(), query.name), plan_display);
     });
 
-    df.show().await?;
+    let result = df.collect().await?;
+    benchmark.validate(&query, &result)?;
 
     Ok(())
 }

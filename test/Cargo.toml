@@ -17,4 +17,5 @@ async-trait.workspace = true
 tonic = "0.12.2"
 futures.workspace = true
 insta = { version = "1.42.0" }
+chrono = "0.4.31"
 datafusion-federation.path = "../datafusion-federation"

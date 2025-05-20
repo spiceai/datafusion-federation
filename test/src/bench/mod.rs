@@ -1,3 +1,6 @@
+use crate::validation::validate_tpch_query;
+use anyhow::Result;
+use datafusion::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
 pub trait Benchmark {
@@ -12,6 +15,8 @@ pub trait Benchmark {
 
     /// Get all queries for this benchmark
     fn queries(&self) -> Vec<Query>;
+
+    fn validate(&self, query: &Query, batches: &[RecordBatch]) -> Result<()>;
 }
 
 pub struct Query {
@@ -61,5 +66,9 @@ impl Benchmark for TpchBenchmark {
             q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q16, q17, q18, q19, q20,
             q21, q22
         )
+    }
+
+    fn validate(&self, query: &Query, batches: &[RecordBatch]) -> Result<()> {
+        validate_tpch_query(query, batches)
     }
 }
