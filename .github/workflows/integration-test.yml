@@ -2,8 +2,7 @@ name: Integration Tests
 
 on:
   pull_request:
-  push:
-    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   integration-test:
@@ -41,4 +40,4 @@ jobs:
           ls -la tpch_sf1.db
 
       - name: Run integration tests
-        run: cargo test -p federation-integration-tests -- --nocapture
+        run: cargo run -p federation-integration-tests -- --nocapture
