@@ -76,7 +76,14 @@ async fn main() {
     for query in test_queries {
         run_test_query(&ctx, Arc::clone(&benchmark), &query)
             .await
-            .expect(format!("Failed to run {} query {}", benchmark.name(), query.name).as_str());
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to run {} query {}: {}",
+                    benchmark.name(),
+                    query.name,
+                    err
+                )
+            });
     }
 }
 
@@ -98,7 +105,7 @@ async fn run_test_query(
     });
 
     let result = df.collect().await?;
-    benchmark.validate(&query, &result)?;
+    benchmark.validate(query, &result)?;
 
     Ok(())
 }
