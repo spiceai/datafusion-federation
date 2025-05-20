@@ -74,16 +74,16 @@ async fn main() {
     let test_queries = benchmark.queries();
 
     for query in test_queries {
-        run_test_query(&ctx, Arc::clone(&benchmark), query)
+        run_test_query(&ctx, Arc::clone(&benchmark), &query)
             .await
-            .expect("query failed");
+            .expect(format!("Failed to run {} query {}", benchmark.name(), query.name).as_str());
     }
 }
 
 async fn run_test_query(
     ctx: &SessionContext,
     benchmark: Arc<dyn Benchmark>,
-    query: Query,
+    query: &Query,
 ) -> Result<()> {
     let df = ctx.sql(&query.sql).await?;
 
