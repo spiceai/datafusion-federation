@@ -99,7 +99,10 @@ async fn run_test_query(
 
     insta::with_settings!({
         description => format!("Federated Query Explain"),
-        snapshot_path => "../snapshots/explain"
+        snapshot_path => "../snapshots/explain",
+        filters => vec![
+            (r"compute_context=.*/([^/]+\.db)", "compute_context=$1")
+        ],
     }, {
         insta::assert_snapshot!(format!("{}_{}_explain", benchmark.name(), query.name), plan_display);
     });

@@ -16,6 +16,6 @@ tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros"] }
 async-trait.workspace = true
 tonic = "0.12.2"
 futures.workspace = true
-insta = { version = "1.42.0" }
+insta = { version = "1.42.0", features = ["filters"]}
 chrono = "0.4.31"
 datafusion-federation.path = "../datafusion-federation"
