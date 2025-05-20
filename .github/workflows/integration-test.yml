@@ -3,6 +3,12 @@ name: Integration Tests
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      update_snapshots:
+        description: 'Update snapshots?'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   integration-test:
@@ -40,4 +46,49 @@ jobs:
           ls -la tpch_sf1.db
 
       - name: Run integration tests
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots == 'true' && 'always' || '' }}
         run: cargo run -p federation-integration-tests -- --nocapture
+
+      - name: Install GH CLI
+        if: github.event.inputs.update_snapshots == 'true'
+        run: |
+          (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
+          && sudo mkdir -p -m 755 /etc/apt/keyrings \
+          && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+          && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && sudo apt update \
+          && sudo apt install gh -y
+
+      - name: Upload benchmark snapshots to branch
+        if: github.event.inputs.update_snapshots == 'true'
+        run: |
+          BRANCH_ID=${{ github.run_id }}
+
+          BRANCH_NAME="integration-test-snapshot-update/${BRANCH_ID}"
+
+          git config --global user.name 'Datafusion Federation Snapshot Update Bot'
+          git config --global user.email 'integration-test@datafusion.federation'
+          git checkout -b ${BRANCH_NAME}
+          git add '*.snap'
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "fix: Update datafusion federation integration tests snapshots"
+            if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
+              git pull --rebase origin ${BRANCH_NAME}
+            fi
+            git push origin ${BRANCH_NAME}
+
+            PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
+            if [[ -n "${PR_URL}" ]]; then
+              echo "PR already exists -> ${PR_URL}"
+              exit 0
+            else
+              gh pr create --title "fix: Update integration tests snapshots" --body "Updates some integration tests snapshots" --base trunk --head ${BRANCH_NAME}
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
