@@ -47,11 +47,10 @@ jobs:
 
       - name: Run integration tests
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots == 'true' && 'always' || '' }}
+          INSTA_UPDATE: always
         run: cargo run -p federation-integration-tests -- --nocapture
 
       - name: Install GH CLI
-        if: github.event.inputs.update_snapshots == 'true'
         run: |
           (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
           && sudo mkdir -p -m 755 /etc/apt/keyrings \
@@ -63,7 +62,6 @@ jobs:
           && sudo apt install gh -y
 
       - name: Upload benchmark snapshots to branch
-        if: github.event.inputs.update_snapshots == 'true'
         run: |
           BRANCH_ID=${{ github.run_id }}
 
