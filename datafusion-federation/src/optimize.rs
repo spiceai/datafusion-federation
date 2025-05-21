@@ -120,5 +120,5 @@ fn optimize_plan_node(
         return Ok(Transformed::no(plan));
     }
 
-    return rule.rewrite(plan, config);
+    rule.rewrite(plan, config)
 }

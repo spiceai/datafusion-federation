@@ -5,7 +5,6 @@ pub mod schema_cast;
 #[cfg(feature = "sql")]
 pub mod sql;
 mod table_provider;
-pub mod table_reference;
 
 use std::{
     fmt,

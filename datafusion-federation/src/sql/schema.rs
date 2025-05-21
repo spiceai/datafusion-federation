@@ -2,14 +2,7 @@ use async_trait::async_trait;
 
 use super::{table::SQLTable, RemoteTableRef, SQLTableSource};
 use crate::{sql::SQLFederationProvider, FederatedTableProviderAdaptor};
-use crate::{
-    table_reference::MultiPartTableReference, FederatedTableProviderAdaptor, FederatedTableSource,
-    FederationProvider,
-};
-use datafusion::logical_expr::{TableSource, TableType};
-use datafusion::{
-    arrow::datatypes::SchemaRef, catalog::SchemaProvider, datasource::TableProvider, error::Result,
-};
+use datafusion::{catalog::SchemaProvider, datasource::TableProvider, error::Result};
 use futures::future::join_all;
 use std::{any::Any, sync::Arc};
 
@@ -149,62 +142,62 @@ impl SchemaProvider for MultiSchemaProvider {
 }
 
 // TODO merge/rework
-#[derive(Debug)]
-pub struct SQLTableSource {
-    provider: Arc<SQLFederationProvider>,
-    table_name: MultiPartTableReference,
-    schema: SchemaRef,
-}
+// #[derive(Debug)]
+// pub struct SQLTableSource {
+//     provider: Arc<SQLFederationProvider>,
+//     table_name: MultiPartTableReference,
+//     schema: SchemaRef,
+// }
 
-impl SQLTableSource {
-    // creates a SQLTableSource and infers the table schema
-    pub async fn new(
-        provider: Arc<SQLFederationProvider>,
-        table_name: impl Into<MultiPartTableReference>,
-    ) -> Result<Self> {
-        let table_name = table_name.into();
-        let schema = Arc::clone(&provider)
-            .executor
-            .get_table_schema(table_name.to_string().as_str())
-            .await?;
-        Self::new_with_schema(provider, table_name, schema)
-    }
+// impl SQLTableSource {
+//     // creates a SQLTableSource and infers the table schema
+//     pub async fn new(
+//         provider: Arc<SQLFederationProvider>,
+//         table_name: impl Into<MultiPartTableReference>,
+//     ) -> Result<Self> {
+//         let table_name = table_name.into();
+//         let schema = Arc::clone(&provider)
+//             .executor
+//             .get_table_schema(table_name.to_string().as_str())
+//             .await?;
+//         Self::new_with_schema(provider, table_name, schema)
+//     }
 
-    pub fn new_with_schema(
-        provider: Arc<SQLFederationProvider>,
-        table_name: impl Into<MultiPartTableReference>,
-        schema: SchemaRef,
-    ) -> Result<Self> {
-        Ok(Self {
-            provider,
-            table_name: table_name.into(),
-            schema,
-        })
-    }
+//     pub fn new_with_schema(
+//         provider: Arc<SQLFederationProvider>,
+//         table_name: impl Into<MultiPartTableReference>,
+//         schema: SchemaRef,
+//     ) -> Result<Self> {
+//         Ok(Self {
+//             provider,
+//             table_name: table_name.into(),
+//             schema,
+//         })
+//     }
 
-    pub fn table_name(&self) -> &MultiPartTableReference {
-        &self.table_name
-    }
-}
+//     pub fn table_name(&self) -> &MultiPartTableReference {
+//         &self.table_name
+//     }
+// }
 
-impl FederatedTableSource for SQLTableSource {
-    fn remote_table_name(&self) -> Option<MultiPartTableReference> {
-        Some(self.table_name.clone())
-    }
+// impl FederatedTableSource for SQLTableSource {
+//     fn remote_table_name(&self) -> Option<MultiPartTableReference> {
+//         Some(self.table_name.clone())
+//     }
 
-    fn federation_provider(&self) -> Arc<dyn FederationProvider> {
-        Arc::clone(&self.provider) as Arc<dyn FederationProvider>
-    }
-}
+//     fn federation_provider(&self) -> Arc<dyn FederationProvider> {
+//         Arc::clone(&self.provider) as Arc<dyn FederationProvider>
+//     }
+// }
 
-impl TableSource for SQLTableSource {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-    fn table_type(&self) -> TableType {
-        TableType::Temporary
-    }
-}
+// impl TableSource for SQLTableSource {
+//     fn as_any(&self) -> &dyn Any {
+//         self
+//     }
+//     fn schema(&self) -> SchemaRef {
+//         Arc::clone(&self.schema)
+//     }
+//     fn table_type(&self) -> TableType {
+//         TableType::Temporary
+//     }
+// }

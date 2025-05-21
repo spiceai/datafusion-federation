@@ -14,6 +14,7 @@ use datafusion::{
 /// Rewrites table references in a SQL AST to use the original federated table names.
 /// This is similar to rewrite_table_scans but operates on the sqlparser AST instead
 /// of DataFusion logical plans.
+#[allow(dead_code)]
 pub(crate) fn rewrite_multi_part_statement(
     statement: &mut ast::Statement,
     known_rewrites: &HashMap<TableReference, MultiTableReference>,
@@ -27,6 +28,7 @@ pub(crate) fn rewrite_multi_part_statement(
     }
 }
 
+#[allow(dead_code)]
 fn rewrite_multi_part_table_with_joins(
     table_with_joins: &mut Vec<TableWithJoins>,
     known_rewrites: &HashMap<ObjectName, MultiTableReference>,

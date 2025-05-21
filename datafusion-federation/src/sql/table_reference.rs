@@ -5,13 +5,157 @@ use datafusion::{
     sql::{
         sqlparser::{
             self,
-            ast::{FunctionArg, ObjectNamePart},
+            ast::{FunctionArg, ObjectName},
             dialect::{Dialect, GenericDialect},
             tokenizer::Token,
         },
         TableReference,
     },
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MultiTableReference {
+    pub parts: Vec<Arc<str>>,
+}
+
+impl MultiTableReference {
+    pub fn new(parts: Vec<Arc<str>>) -> Self {
+        Self { parts }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MultiPartTableReference {
+    TableReference(TableReference),
+    Multi(MultiTableReference),
+}
+
+impl MultiPartTableReference {
+    /// Convert a `MultiPartTableReference` to a quoted string.
+    ///
+    /// Example:
+    ///
+    /// ```ignore
+    /// let parts = vec![Arc::from("a"), Arc::from("b"), Arc::from("c"), Arc::from("d")];
+    /// let multi_part_table_reference = MultiPartTableReference::encode_multi_part_table_reference(&parts);
+    /// assert_eq!(multi_part_table_reference.to_quoted_string(), r#""a"."b"."c"."d""#);
+    /// ```
+    #[must_use]
+    pub fn to_quoted_string(&self) -> String {
+        match self {
+            MultiPartTableReference::TableReference(table_reference) => match table_reference {
+                // The `TableReference` will sometimes not quote the table name, even if we ask it to because it detects that it would be safe (within DataFusion).
+                // Unfortunately, some systems have reserved keywords that will error if we don't quote them.
+                // Err on the safe side and always quote the table name.
+                TableReference::Bare { table } => quote_identifier(table),
+                TableReference::Partial { schema, table } => {
+                    format!("{}.{}", quote_identifier(schema), quote_identifier(table))
+                }
+                TableReference::Full {
+                    catalog,
+                    schema,
+                    table,
+                } => format!(
+                    "{}.{}.{}",
+                    quote_identifier(catalog),
+                    quote_identifier(schema),
+                    quote_identifier(table)
+                ),
+            },
+            MultiPartTableReference::Multi(parts) => parts
+                .iter()
+                .map(|p| quote_identifier(p))
+                .collect::<Vec<_>>()
+                .join("."),
+        }
+    }
+
+    /// Compare with another [`MultiPartTableReference`] as if both are resolved.
+    /// This allows comparing across variants. If a field is not present
+    /// in both variants being compared then it is ignored in the comparison.
+    ///
+    /// e.g. this allows a [`TableReference::Bare`] to be considered equal to a
+    /// fully qualified [`TableReference::Full`] if the table names match.
+    pub fn resolved_eq(&self, other: &Self) -> bool {
+        match self {
+            MultiPartTableReference::TableReference(table_reference) => match other {
+                MultiPartTableReference::TableReference(other_table_reference) => {
+                    table_reference.resolved_eq(other_table_reference)
+                }
+                MultiPartTableReference::Multi(_) => false,
+            },
+            MultiPartTableReference::Multi(parts) => match other {
+                MultiPartTableReference::Multi(other_parts) => {
+                    parts.iter().zip(other_parts.iter()).all(|(a, b)| a == b)
+                }
+                MultiPartTableReference::TableReference(_) => false,
+            },
+        }
+    }
+
+    pub fn table(&self) -> &str {
+        match self {
+            MultiPartTableReference::TableReference(table_reference) => table_reference.table(),
+            MultiPartTableReference::Multi(parts) => parts.last().unwrap(),
+        }
+    }
+}
+
+impl std::fmt::Display for MultiPartTableReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultiPartTableReference::TableReference(table_reference) => {
+                write!(f, "{table_reference}")
+            }
+            MultiPartTableReference::Multi(parts) => {
+                write!(f, "{}", parts.join("."))
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for MultiTableReference {
+    type Target = Vec<Arc<str>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.parts
+    }
+}
+
+impl From<ObjectName> for MultiPartTableReference {
+    fn from(name: ObjectName) -> Self {
+        let mut parts = name.0;
+        match parts.len() {
+            1 => MultiPartTableReference::TableReference(TableReference::Bare {
+                table: parts.remove(0).value.into(),
+            }),
+            2 => MultiPartTableReference::TableReference(TableReference::Partial {
+                schema: parts.remove(0).value.into(),
+                table: parts.remove(0).value.into(),
+            }),
+            3 => MultiPartTableReference::TableReference(TableReference::Full {
+                catalog: parts.remove(0).value.into(),
+                schema: parts.remove(0).value.into(),
+                table: parts.remove(0).value.into(),
+            }),
+            _ => MultiPartTableReference::Multi(MultiTableReference {
+                parts: parts.into_iter().map(|p| p.value.into()).collect(),
+            }),
+        }
+    }
+}
+
+impl From<&ObjectName> for MultiPartTableReference {
+    fn from(name: &ObjectName) -> Self {
+        name.clone().into()
+    }
+}
+
+impl From<&RemoteTableRef> for MultiPartTableReference {
+    fn from(table_ref: &RemoteTableRef) -> Self {
+        table_ref.table_ref().clone()
+    }
+}
 
 /// A multipart identifier to a remote table, view or parameterized view.
 ///
@@ -28,7 +172,7 @@ use datafusion::{
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteTableRef {
-    pub table_ref: TableReference,
+    pub table_ref: MultiPartTableReference,
     pub args: Option<Arc<[FunctionArg]>>,
 }
 
@@ -53,29 +197,23 @@ impl RemoteTableRef {
             vec![]
         };
 
-        let table_ref = match (name.0.first(), name.0.get(1), name.0.get(2)) {
-            (
-                Some(ObjectNamePart::Identifier(catalog)),
-                Some(ObjectNamePart::Identifier(schema)),
-                Some(ObjectNamePart::Identifier(table)),
-            ) => TableReference::full(
-                catalog.value.clone(),
-                schema.value.clone(),
-                table.value.clone(),
-            ),
-            (
-                Some(ObjectNamePart::Identifier(schema)),
-                Some(ObjectNamePart::Identifier(table)),
-                None,
-            ) => TableReference::partial(schema.value.clone(), table.value.clone()),
-            (Some(ObjectNamePart::Identifier(table)), None, None) => {
-                TableReference::bare(table.value.clone())
-            }
-            _ => {
-                return Err(DataFusionError::NotImplemented(
-                    "Unable to parse string into TableReference".to_string(),
-                ))
-            }
+        let mut parts = name.0;
+        let table_ref = match parts.len() {
+            1 => MultiPartTableReference::TableReference(TableReference::Bare {
+                table: parts.remove(0).value.into(),
+            }),
+            2 => MultiPartTableReference::TableReference(TableReference::Partial {
+                schema: parts.remove(0).value.into(),
+                table: parts.remove(0).value.into(),
+            }),
+            3 => MultiPartTableReference::TableReference(TableReference::Full {
+                catalog: parts.remove(0).value.into(),
+                schema: parts.remove(0).value.into(),
+                table: parts.remove(0).value.into(),
+            }),
+            _ => MultiPartTableReference::Multi(MultiTableReference {
+                parts: parts.into_iter().map(|p| p.value.into()).collect(),
+            }),
         };
 
         if !args.is_empty() {
@@ -91,7 +229,7 @@ impl RemoteTableRef {
         }
     }
 
-    pub fn table_ref(&self) -> &TableReference {
+    pub fn table_ref(&self) -> &MultiPartTableReference {
         &self.table_ref
     }
 
@@ -103,28 +241,42 @@ impl RemoteTableRef {
 impl From<TableReference> for RemoteTableRef {
     fn from(table_ref: TableReference) -> Self {
         RemoteTableRef {
-            table_ref,
+            table_ref: MultiPartTableReference::TableReference(table_ref),
             args: None,
         }
     }
 }
 
-impl From<RemoteTableRef> for TableReference {
-    fn from(remote_table_ref: RemoteTableRef) -> Self {
-        remote_table_ref.table_ref
+impl TryFrom<MultiPartTableReference> for TableReference {
+    type Error = DataFusionError;
+
+    fn try_from(value: MultiPartTableReference) -> Result<Self, Self::Error> {
+        match value {
+            MultiPartTableReference::TableReference(table_reference) => Ok(table_reference),
+            MultiPartTableReference::Multi(_) => Err(DataFusionError::External(
+                "MultiPartTableReference cannot be converted to TableReference".into(),
+            )),
+        }
     }
 }
 
-impl From<&RemoteTableRef> for TableReference {
-    fn from(remote_table_ref: &RemoteTableRef) -> Self {
-        remote_table_ref.table_ref.clone()
+impl TryFrom<&MultiPartTableReference> for TableReference {
+    type Error = DataFusionError;
+
+    fn try_from(value: &MultiPartTableReference) -> Result<Self, Self::Error> {
+        match value {
+            MultiPartTableReference::TableReference(table_reference) => Ok(table_reference.clone()),
+            MultiPartTableReference::Multi(_) => Err(DataFusionError::External(
+                "MultiPartTableReference cannot be converted to TableReference".into(),
+            )),
+        }
     }
 }
 
 impl From<(TableReference, Vec<FunctionArg>)> for RemoteTableRef {
     fn from((table_ref, args): (TableReference, Vec<FunctionArg>)) -> Self {
         RemoteTableRef {
-            table_ref,
+            table_ref: MultiPartTableReference::TableReference(table_ref),
             args: Some(args.into()),
         }
     }
@@ -149,6 +301,15 @@ impl TryFrom<&String> for RemoteTableRef {
     fn try_from(s: &String) -> Result<Self, Self::Error> {
         Self::parse_with_default_dialect(s)
     }
+}
+
+/// Wraps identifier string in double quotes, escaping any double quotes in
+/// the identifier by replacing it with two double quotes
+///
+/// e.g. identifier `tab.le"name` becomes `"tab.le""name"`
+#[must_use]
+pub fn quote_identifier(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -176,8 +337,8 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("table"),
             vec![
-                FunctionArg::Unnamed(Expr::value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -186,8 +347,8 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("Table"),
             vec![
-                FunctionArg::Unnamed(Expr::value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -199,8 +360,8 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("table"),
             vec![
-                FunctionArg::Unnamed(Expr::value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -209,8 +370,8 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("Table"),
             vec![
-                FunctionArg::Unnamed(Expr::value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -233,8 +394,8 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::partial("schema", "table"),
             vec![
-                FunctionArg::Unnamed(Expr::value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -243,8 +404,8 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::partial("schema", "Table"),
             vec![
-                FunctionArg::Unnamed(Expr::value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -256,8 +417,8 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::partial("schema", "table"),
             vec![
-                FunctionArg::Unnamed(Expr::value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
+                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -275,12 +436,12 @@ mod tests {
             vec![
                 FunctionArg::ExprNamed {
                     name: ast::Expr::Identifier(Ident::new("user_id")),
-                    arg: Expr::value(Value::Number("1".to_string(), false)).into(),
+                    arg: Expr::Value(Value::Number("1".to_string(), false)).into(),
                     operator: FunctionArgOperator::RightArrow,
                 },
                 FunctionArg::ExprNamed {
                     name: ast::Expr::Identifier(Ident::new("age")),
-                    arg: Expr::value(Value::Number("2".to_string(), false)).into(),
+                    arg: Expr::Value(Value::Number("2".to_string(), false)).into(),
                     operator: FunctionArgOperator::RightArrow,
                 },
             ],

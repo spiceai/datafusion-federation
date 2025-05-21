@@ -1,3 +1,4 @@
+use crate::sql::table_reference::MultiPartTableReference;
 use crate::sql::SQLFederationProvider;
 use crate::FederatedTableSource;
 use crate::FederationProvider;
@@ -5,7 +6,6 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::Result;
 use datafusion::logical_expr::TableSource;
 use datafusion::logical_expr::TableType;
-use datafusion::sql::TableReference;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -21,12 +21,12 @@ use super::RemoteTableRef;
 pub trait SQLTable: std::fmt::Debug + Send + Sync {
     /// Returns a reference as a trait object.
     fn as_any(&self) -> &dyn Any;
-    /// Provides the [`TableReference`](`datafusion::sql::TableReference`) used to identify the table in SQL queries.
+    /// Provides the [`MultiPartTableReference`](`crate::sql::table_reference::MultiPartTableReference`) used to identify the table in SQL queries.
     /// This TableReference is used for registering the table with the [`SQLSchemaProvider`](`super::SQLSchemaProvider`).
     /// If the table provider is registered in the Datafusion context under a different name,
     /// the logical plan will be rewritten to use this table reference during execution.
     /// Therefore, any AST analyzer should match against this table reference.
-    fn table_reference(&self) -> TableReference;
+    fn table_reference(&self) -> MultiPartTableReference;
     /// Schema of the remote table
     fn schema(&self) -> SchemaRef;
     /// Returns a logical optimizer specific to this table, will be used to modify the logical plan before execution
@@ -69,7 +69,7 @@ impl RemoteTable {
 
     /// Return table reference of this remote table.
     /// Only returns the object name, ignoring functional params if any
-    pub fn table_reference(&self) -> &TableReference {
+    pub fn table_reference(&self) -> &MultiPartTableReference {
         self.remote_table_ref.table_ref()
     }
 
@@ -83,7 +83,7 @@ impl SQLTable for RemoteTable {
         self
     }
 
-    fn table_reference(&self) -> TableReference {
+    fn table_reference(&self) -> MultiPartTableReference {
         Self::table_reference(self).clone()
     }
 
@@ -144,7 +144,7 @@ impl SQLTableSource {
     }
 
     /// Return associated table reference of stored remote table
-    pub fn table_reference(&self) -> TableReference {
+    pub fn table_reference(&self) -> MultiPartTableReference {
         self.table.table_reference()
     }
 }

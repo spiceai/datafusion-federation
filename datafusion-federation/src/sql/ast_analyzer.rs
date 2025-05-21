@@ -1,14 +1,10 @@
 use std::ops::ControlFlow;
 
-use datafusion::sql::{
-    sqlparser::ast::{
-        FunctionArg, Ident, ObjectName, Statement, TableAlias, TableFactor, TableFunctionArgs,
-        VisitMut, VisitorMut,
-    },
-    TableReference,
+use datafusion::sql::sqlparser::ast::{
+    FunctionArg, Ident, Statement, TableAlias, TableFactor, TableFunctionArgs, VisitMut, VisitorMut,
 };
 
-use super::AstAnalyzer;
+use super::{table_reference::MultiPartTableReference, AstAnalyzer};
 
 pub fn replace_table_args_analyzer(mut visitor: TableArgReplace) -> AstAnalyzer {
     let x = move |mut statement: Statement| {
@@ -38,12 +34,12 @@ pub fn replace_table_args_analyzer(mut visitor: TableArgReplace) -> AstAnalyzer 
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableArgReplace {
-    pub tables: Vec<(TableReference, TableFunctionArgs)>,
+    pub tables: Vec<(MultiPartTableReference, TableFunctionArgs)>,
 }
 
 impl TableArgReplace {
     /// Constructs a new `TableArgReplace` instance.
-    pub fn new(tables: Vec<(TableReference, Vec<FunctionArg>)>) -> Self {
+    pub fn new(tables: Vec<(MultiPartTableReference, Vec<FunctionArg>)>) -> Self {
         Self {
             tables: tables
                 .into_iter()
@@ -61,7 +57,7 @@ impl TableArgReplace {
     }
 
     /// Adds a new table argument replacement.
-    pub fn with(mut self, table: TableReference, args: Vec<FunctionArg>) -> Self {
+    pub fn with(mut self, table: MultiPartTableReference, args: Vec<FunctionArg>) -> Self {
         self.tables.push((
             table,
             TableFunctionArgs {
@@ -88,7 +84,8 @@ impl VisitorMut for TableArgReplace {
             name, args, alias, ..
         } = table_factor
         {
-            let name_as_tableref = name_to_table_reference(name);
+            let name = &*name;
+            let name_as_tableref = name.into();
             if let Some((table, arg)) = self
                 .tables
                 .iter()
@@ -104,27 +101,5 @@ impl VisitorMut for TableArgReplace {
             }
         }
         ControlFlow::Continue(())
-    }
-}
-
-fn name_to_table_reference(name: &ObjectName) -> TableReference {
-    let first = name
-        .0
-        .first()
-        .map(|n| n.as_ident().expect("expected Ident").value.to_string());
-    let second = name
-        .0
-        .get(1)
-        .map(|n| n.as_ident().expect("expected Ident").value.to_string());
-    let third = name
-        .0
-        .get(2)
-        .map(|n| n.as_ident().expect("expected Ident").value.to_string());
-
-    match (first, second, third) {
-        (Some(first), Some(second), Some(third)) => TableReference::full(first, second, third),
-        (Some(first), Some(second), None) => TableReference::partial(first, second),
-        (Some(first), None, None) => TableReference::bare(first),
-        _ => panic!("Invalid table name"),
     }
 }

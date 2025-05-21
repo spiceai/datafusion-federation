@@ -12,10 +12,7 @@ use analyzer::RewriteTableScanAnalyzer;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
-    common::{
-        tree_node::{Transformed, TreeNode},
-        HashMap,
-    },
+    common::tree_node::TreeNode,
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
@@ -36,9 +33,7 @@ pub use table::{RemoteTable, SQLTableSource};
 pub use table_reference::RemoteTableRef;
 
 use crate::{
-    schema_cast,
-    table_reference::{MultiPartTableReference, MultiTableReference},
-    FederatedPlanNode, FederationPlanner, FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
 };
 
 // SQLFederationProvider provides federation to SQL DMBSs.
@@ -106,7 +101,7 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
             plan = rewriter(plan)?;
         }
 
-        Ok(Transformed::yes(plan))
+        Ok(plan)
     }
 
     /// A human readable name for this analyzer rule
@@ -172,36 +167,32 @@ impl VirtualExecutionPlan {
     }
 
     // TODO merge
-    fn sql(&self) -> Result<String> {
-        // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
-        let mut known_rewrites = HashMap::new();
-        let subquery_uses_partial_path = self.executor.subquery_use_partial_path();
-        let rewritten_plan = rewrite::plan::rewrite_table_scans(
-            &self.plan,
-            &mut known_rewrites,
-            subquery_uses_partial_path,
-            &mut None,
-        )?;
-        let mut ast = self.plan_to_sql(&rewritten_plan)?;
+    // fn sql(&self) -> Result<String> {
+    //     // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
+    //     let mut known_rewrites = HashMap::new();
+    //     let subquery_uses_partial_path = self.executor.subquery_use_partial_path();
+    //     let rewritten_plan = rewrite::plan::rewrite_table_scans(
+    //         &self.plan,
+    //         &mut known_rewrites,
+    //         subquery_uses_partial_path,
+    //         &mut None,
+    //     )?;
+    //     let mut ast = self.plan_to_statement(&rewritten_plan)?;
 
-        // If there are any MultiPartTableReference, rewrite the AST to use the original table names.
-        let multi_table_reference_rewrites = known_rewrites
-            .into_iter()
-            .filter_map(|(table_ref, rewrite)| match rewrite {
-                MultiPartTableReference::Multi(rewrite) => Some((table_ref, rewrite)),
-                _ => None,
-            })
-            .collect::<HashMap<TableReference, MultiTableReference>>();
-        if !multi_table_reference_rewrites.is_empty() {
-            rewrite::ast::rewrite_multi_part_statement(&mut ast, &multi_table_reference_rewrites);
-        }
+    //     // If there are any MultiPartTableReference, rewrite the AST to use the original table names.
+    //     let multi_table_reference_rewrites = known_rewrites
+    //         .into_iter()
+    //         .filter_map(|(table_ref, rewrite)| match rewrite {
+    //             MultiPartTableReference::Multi(rewrite) => Some((table_ref, rewrite)),
+    //             _ => None,
+    //         })
+    //         .collect::<HashMap<TableReference, MultiTableReference>>();
+    //     if !multi_table_reference_rewrites.is_empty() {
+    //         rewrite::ast::rewrite_multi_part_statement(&mut ast, &multi_table_reference_rewrites);
+    //     }
 
-        if let Some(analyzer) = self.executor.ast_analyzer() {
-            ast = analyzer(ast)?;
-        }
-
-        Ok(format!("{ast}"))
-    }
+    //     Ok(format!("{ast}"))
+    // }
 
     fn final_sql(&self) -> Result<String> {
         let plan = self.plan.clone();

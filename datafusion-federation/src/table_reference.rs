@@ -15,7 +15,7 @@ use datafusion::{
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultiTableReference {
     pub parts: Vec<Arc<str>>,
 }
@@ -26,7 +26,7 @@ impl MultiTableReference {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MultiPartTableReference {
     TableReference(TableReference),
     Multi(MultiTableReference),

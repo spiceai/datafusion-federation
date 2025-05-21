@@ -176,6 +176,7 @@ fn collect_known_rewrites_from_expr(
     }
 }
 
+#[allow(dead_code)]
 /// Rewrite table scans to use the original federated table name.
 pub(crate) fn rewrite_table_scans(
     plan: &LogicalPlan,
@@ -558,6 +559,7 @@ fn rewrite_column_name_in_expr(
     }
 }
 
+#[allow(dead_code)]
 fn rewrite_table_scans_in_expr(
     expr: Expr,
     known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
@@ -1249,7 +1251,7 @@ fn rewrite_table_scans_in_expr(
 
 #[cfg(test)]
 mod tests {
-    use crate::FederatedTableProviderAdaptor;
+    use crate::{sql::RemoteTableRef, FederatedTableProviderAdaptor};
     use async_trait::async_trait;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema, SchemaRef},
@@ -1318,14 +1320,11 @@ mod tests {
                 false,
             ),
         ]));
-        let table_source = Arc::new(
-            SQLTableSource::new_with_schema(
-                sql_federation_provider,
-                "remote_table".to_string(),
-                schema,
-            )
-            .expect("to have a valid SQLTableSource"),
-        );
+        let table_source = Arc::new(SQLTableSource::new_with_schema(
+            sql_federation_provider,
+            RemoteTableRef::try_from("remote_table").expect("valid table ref"),
+            schema,
+        ));
         Arc::new(FederatedTableProviderAdaptor::new(table_source))
     }
 
@@ -1342,14 +1341,12 @@ mod tests {
                 false,
             ),
         ]));
-        let table_source = Arc::new(
-            SQLTableSource::new_with_schema(
-                sql_federation_provider,
-                "remote_db.remote_schema.remote_table".to_string(),
-                schema,
-            )
-            .expect("to have a valid SQLTableSource"),
-        );
+        let table_source = Arc::new(SQLTableSource::new_with_schema(
+            sql_federation_provider,
+            RemoteTableRef::try_from("remote_db.remote_schema.remote_table")
+                .expect("valid table ref"),
+            schema,
+        ));
         Arc::new(FederatedTableProviderAdaptor::new(table_source))
     }
 
@@ -1679,7 +1676,7 @@ mod tests {
 
 #[cfg(test)]
 mod collect_rewrites_tests {
-    use crate::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
+    use crate::sql::{RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource};
 
     use super::*;
     use crate::FederatedTableProviderAdaptor;
@@ -1735,14 +1732,11 @@ mod collect_rewrites_tests {
 
         let sql_federation_provider =
             Arc::new(SQLFederationProvider::new(Arc::new(TestSQLExecutor {})));
-        let table_source = Arc::new(
-            SQLTableSource::new_with_schema(
-                sql_federation_provider,
-                "remote_table".to_string(),
-                schema.clone(),
-            )
-            .expect("to have a valid SQLTableSource"),
-        );
+        let table_source = Arc::new(SQLTableSource::new_with_schema(
+            sql_federation_provider,
+            RemoteTableRef::try_from("remote_table").expect("valid table ref"),
+            schema.clone(),
+        ));
         let source = Arc::new(DefaultTableSource::new(Arc::new(
             FederatedTableProviderAdaptor::new(table_source),
         )));

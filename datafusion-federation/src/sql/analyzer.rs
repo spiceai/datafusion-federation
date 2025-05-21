@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
-    common::{Column, Spans},
+    common::Column,
     logical_expr::{
         expr::{
             AggregateFunction, AggregateFunctionParams, Alias, Exists, InList, InSubquery,
@@ -16,7 +16,7 @@ use datafusion::{
 
 use crate::get_table_source;
 
-use super::SQLTableSource;
+use super::{table_reference::MultiPartTableReference, SQLTableSource};
 
 type Result<T> = std::result::Result<T, datafusion::error::DataFusionError>;
 
@@ -34,7 +34,7 @@ impl RewriteTableScanAnalyzer {
 /// Rewrite table scans to use the original federated table name.
 fn rewrite_table_scans(
     plan: &LogicalPlan,
-    known_rewrites: &mut HashMap<TableReference, TableReference>,
+    known_rewrites: &mut HashMap<MultiPartTableReference, TableReference>,
 ) -> Result<LogicalPlan> {
     if plan.inputs().is_empty() {
         if let LogicalPlan::TableScan(table_scan) = plan {
@@ -192,7 +192,6 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::ScalarSubquery(Subquery {
                 subquery: Arc::new(new_subquery),
                 outer_ref_columns,
-                spans: Spans::new(),
             }))
         }
         Expr::BinaryExpr(binary_expr) => {
@@ -466,7 +465,6 @@ fn rewrite_table_scans_in_expr(
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
                 outer_ref_columns,
-                spans: Spans::new(),
             };
             Ok(Expr::Exists(Exists::new(subquery, exists.negated)))
         }
@@ -482,7 +480,6 @@ fn rewrite_table_scans_in_expr(
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
                 outer_ref_columns,
-                spans: Spans::new(),
             };
             Ok(Expr::InSubquery(InSubquery::new(
                 Box::new(expr),
@@ -570,6 +567,7 @@ fn rewrite_table_scans_in_expr(
 #[cfg(test)]
 mod tests {
     use crate::sql::table::SQLTable;
+    use crate::sql::table_reference::MultiPartTableReference;
     use crate::sql::{RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource};
     use crate::FederatedTableProviderAdaptor;
     use async_trait::async_trait;
@@ -634,8 +632,8 @@ mod tests {
     }
 
     impl SQLTable for TestTable {
-        fn table_reference(&self) -> TableReference {
-            TableReference::from(&self.name)
+        fn table_reference(&self) -> MultiPartTableReference {
+            MultiPartTableReference::from(&self.name)
         }
 
         fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
