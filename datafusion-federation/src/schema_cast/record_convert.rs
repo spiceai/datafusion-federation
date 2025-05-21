@@ -176,7 +176,7 @@ mod test {
         let result = try_cast_to(batch_input(), to_schema()).expect("converted");
         let expected = [
             "+---+-----+---------------------+",
-            "| a | b | c |",
+            "| a | b   | c                   |",
             "+---+-----+---------------------+",
             "| 1 | foo | 2024-01-13T03:18:09 |",
             "| 2 | bar | 2024-01-13T03:18:09 |",
