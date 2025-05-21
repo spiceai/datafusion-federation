@@ -17,6 +17,7 @@ use datafusion::{
     execution::session_state::{SessionState, SessionStateBuilder},
     optimizer::{
         analyzer::{
+            expand_wildcard_rule::ExpandWildcardRule, inline_table_scan::InlineTableScan,
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
         Analyzer, AnalyzerRule,
@@ -44,6 +45,8 @@ pub fn default_session_state() -> SessionState {
 /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added.
 pub fn default_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
+        Arc::new(ExpandWildcardRule::new()),
+        Arc::new(InlineTableScan::new()),
         Arc::new(FederationAnalyzerRule::new()),
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
@@ -100,10 +103,15 @@ mod tests {
         let default_rules = Analyzer::new().rules;
         assert_eq!(
             default_rules.len(),
-            2,
+            4,
             "Default analyzer rules have changed"
         );
-        let expected_rule_names = vec!["resolve_grouping_function", "type_coercion"];
+        let expected_rule_names = vec![
+            "inline_table_scan",
+            "expand_wildcard_rule",
+            "resolve_grouping_function",
+            "type_coercion",
+        ];
         for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
             assert_eq!(
                 expected_name,

@@ -464,11 +464,8 @@ fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Project
                 expr,
                 relation,
                 name,
-                metadata,
             }) => rewrite_expr(*expr, &prev_projection).map(|result| {
-                result.update_data(|expr| {
-                    Expr::Alias(Alias::new(expr, relation, name).with_metadata(metadata))
-                })
+                result.update_data(|expr| Expr::Alias(Alias::new(expr, relation, name)))
             }),
             e => rewrite_expr(e, &prev_projection),
         }
