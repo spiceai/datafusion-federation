@@ -2,8 +2,7 @@
 resolver = "2"
 
 members = [
-    "datafusion-federation",
-    "integration-test",
+    "datafusion-federation"
 ]
 
 [workspace.package]
