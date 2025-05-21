@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
 
-members = ["datafusion-federation"]
+members = [
+    "datafusion-federation",
+    "integration-test",
+]
 
 [workspace.package]
 version = "0.3.7"
@@ -18,3 +21,7 @@ datafusion = "46.0.1"
 datafusion-federation = { path = "./datafusion-federation", version = "0.3.7" }
 futures = "0.3.31"
 tokio = { version = "1.41", features = ["full"] }
+
+[patch.crates-io]
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "2e24b958e44ec7419290249e27a15f1a19703fff" }
+
