@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "datafusion-federation",
     "sources/sql",
+    "integration-test",
 ]
 
 [workspace.package]
@@ -20,3 +21,10 @@ futures = "0.3.30"
 datafusion = "46"
 datafusion-substrait = "46"
 arrow-json = "54"
+
+[patch.crates-io]
+datafusion-federation = { path = "./datafusion-federation" }
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "2e24b958e44ec7419290249e27a15f1a19703fff" }
+
+[patch."https://github.com/spiceai/datafusion-federation.git"]
+datafusion-federation-sql = { path = "./sources/sql" }
