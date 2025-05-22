@@ -316,6 +316,43 @@ fn rewrite_plan_with_known_rewrites(
             });
             Ok(new_plan)
         }
+        LogicalPlan::Join(datafusion::logical_expr::Join { on, filter, .. }) => {
+            let mut new_expressions = vec![];
+            if on.len() > 0 {
+                for (left, right) in on {
+                    let left = rewrite_table_scans_in_expr(
+                        left.clone(),
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )?;
+                    let right = rewrite_table_scans_in_expr(
+                        right.clone(),
+                        known_rewrites,
+                        subquery_uses_partial_path,
+                        subquery_table_scans,
+                    )?;
+                    let equal_expr = Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(left),
+                        logical_expr::Operator::Eq,
+                        Box::new(right),
+                    ));
+                    new_expressions.push(equal_expr);
+                }
+            }
+            if let Some(filter) = filter {
+                let new_filter = rewrite_table_scans_in_expr(
+                    filter.clone(),
+                    known_rewrites,
+                    subquery_uses_partial_path,
+                    subquery_table_scans,
+                )?;
+                new_expressions.push(new_filter);
+            }
+
+            let new_plan = plan.with_new_exprs(new_expressions, rewritten_inputs)?;
+            Ok(new_plan)
+        }
         _ => {
             let mut new_expressions = vec![];
             for expression in plan.expressions() {
