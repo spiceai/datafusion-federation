@@ -1636,6 +1636,49 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_rewrite_join_with_on_and_filter() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let tests = vec![
+            // Basic join
+            (
+                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a",
+                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON (t1.a = t2.a)"#,
+            ),
+            (
+                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a AND t1.b = t2.b",
+                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON ((t1.a = t2.a) AND (t1.b = t2.b))"#,
+            ),
+            (
+                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a WHERE t1.b > t2.b",
+                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON (t1.a = t2.a) WHERE (t1.b > t2.b)"#,
+            ),
+            (
+                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a WHERE t1.b > t2.b AND t1.c IN ('2023-01-01', '2023-01-02')",
+                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON (t1.a = t2.a) WHERE ((t1.b > t2.b) AND t1.c IN ('2023-01-01', '2023-01-02'))"#,
+            ),
+            // Intersect
+            (
+                "SELECT a FROM foo.df_table INTERSECT SELECT a FROM app_table",
+                r#"SELECT DISTINCT remote_table.a FROM remote_table LEFT SEMI JOIN (SELECT remote_table.a FROM remote_table) ON remote_table.a = remote_table.a"#,
+            ),
+            // Except
+            (
+                "SELECT a FROM foo.df_table EXCEPT SELECT a FROM app_table",
+                r#"SELECT DISTINCT remote_table.a FROM remote_table LEFT ANTI JOIN (SELECT remote_table.a FROM remote_table) ON remote_table.a = remote_table.a"#,
+            ),
+        ];
+
+        for (idx, (sql_query, expected_sql)) in tests.iter().enumerate() {
+            println!("Testing join case {}: {}", idx + 1, sql_query);
+            test_sql(&ctx, sql_query, expected_sql, false).await?;
+        }
+
+        Ok(())
+    }
+
     async fn test_sql(
         ctx: &SessionContext,
         sql_query: &str,
