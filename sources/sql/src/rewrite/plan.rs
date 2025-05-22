@@ -597,6 +597,7 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::ScalarSubquery(Subquery {
                 subquery: Arc::new(new_subquery),
                 outer_ref_columns,
+                spans: subquery.spans,
             }))
         }
         Expr::BinaryExpr(binary_expr) => {
@@ -1098,6 +1099,7 @@ fn rewrite_table_scans_in_expr(
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
                 outer_ref_columns,
+                spans: exists.subquery.spans,
             };
             Ok(Expr::Exists(Exists::new(subquery, exists.negated)))
         }
@@ -1140,6 +1142,7 @@ fn rewrite_table_scans_in_expr(
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
                 outer_ref_columns,
+                spans: is.subquery.spans,
             };
             Ok(Expr::InSubquery(InSubquery::new(
                 Box::new(expr),
@@ -1471,7 +1474,7 @@ mod tests {
             // different tables in single aggregation expression
             (
                 "SELECT COUNT(CASE WHEN appt.a > 0 THEN appt.a ELSE dft.a END) FROM app_table as appt, foo.df_table as dft",
-                "SELECT count(CASE WHEN (appt.a > 0) THEN appt.a ELSE dft.a END) FROM remote_table AS appt JOIN remote_table AS dft"
+                "SELECT count(CASE WHEN (appt.a > 0) THEN appt.a ELSE dft.a END) FROM remote_table AS appt CROSS JOIN remote_table AS dft"
             ),
         ];
 
@@ -1517,7 +1520,7 @@ mod tests {
         let tests = vec![
             (
                 "SELECT UNNEST([1, 2, 2, 5, NULL]), b, c from app_table where a > 10 order by b limit 10;",
-                r#"SELECT UNNEST(make_array(1, 2, 2, 5, NULL)) AS "UNNEST(make_array(Int64(1),Int64(2),Int64(2),Int64(5),NULL))", remote_table.b, remote_table.c FROM remote_table WHERE (remote_table.a > 10) ORDER BY remote_table.b ASC NULLS LAST LIMIT 10"#,
+                r#"SELECT UNNEST([1, 2, 2, 5, NULL]) AS "UNNEST(make_array(Int64(1),Int64(2),Int64(2),Int64(5),NULL))", remote_table.b, remote_table.c FROM remote_table WHERE (remote_table.a > 10) ORDER BY remote_table.b ASC NULLS LAST LIMIT 10"#,
             ),
             (
                 "SELECT UNNEST(app_table.d), b, c from app_table where a > 10 order by b limit 10;",
@@ -1543,12 +1546,12 @@ mod tests {
         let tests = vec![
             (
                 "SELECT a FROM bar where a IN (SELECT a FROM bar)",
-                r#"SELECT remote_db.remote_schema.remote_table.a FROM remote_db.remote_schema.remote_table WHERE remote_db.remote_schema.remote_table.a IN (SELECT a FROM remote_db.remote_schema.remote_table)"#,
+                r#"SELECT remote_table.a FROM remote_db.remote_schema.remote_table WHERE remote_table.a IN (SELECT remote_table.a FROM remote_db.remote_schema.remote_table)"#,
                 true,
             ),
             (
                 "SELECT a FROM bar where a IN (SELECT a FROM bar)",
-                r#"SELECT remote_db.remote_schema.remote_table.a FROM remote_db.remote_schema.remote_table WHERE remote_db.remote_schema.remote_table.a IN (SELECT remote_db.remote_schema.remote_table.a FROM remote_db.remote_schema.remote_table)"#,
+                r#"SELECT remote_table.a FROM remote_db.remote_schema.remote_table WHERE remote_table.a IN (SELECT remote_table.a FROM remote_db.remote_schema.remote_table)"#,
                 false,
             ),
         ];
@@ -1565,7 +1568,7 @@ mod tests {
         let ctx = get_test_df_context();
         let tests = vec![(
             "SELECT foo.df_table.a FROM bar JOIN foo.df_table ON foo.df_table.a = (SELECT bar.a FROM bar WHERE bar.a > foo.df_table.a)",
-            r#"SELECT remote_table.a FROM remote_db.remote_schema.remote_table JOIN remote_table ON (remote_table.a = (SELECT a FROM remote_db.remote_schema.remote_table WHERE (remote_table.a > remote_table.a)))"#,
+            r#"SELECT remote_table.a FROM remote_db.remote_schema.remote_table INNER JOIN remote_table ON (remote_table.a = (SELECT remote_table.a FROM remote_db.remote_schema.remote_table WHERE (remote_table.a > remote_table.a)))"#,
             true,
         )];
         for test in tests {
@@ -1588,7 +1591,7 @@ mod tests {
             ),
             (
                 "SELECT a - 1, COUNT(*) AS c FROM app_table GROUP BY a - 1;",
-                r#"SELECT (remote_table.a - 1), count(*) AS c FROM remote_table GROUP BY (remote_table.a - 1)"#,
+                r#"SELECT (remote_table.a - 1), count(1) AS c FROM remote_table GROUP BY (remote_table.a - 1)"#,
             ),
         ];
 
@@ -1683,7 +1686,7 @@ mod collect_rewrites_tests {
     use async_trait::async_trait;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema, SchemaRef},
-        common::DFSchema,
+        common::{DFSchema, Spans},
         datasource::DefaultTableSource,
         execution::SendableRecordBatchStream,
         sql::unparser::dialect::{DefaultDialect, Dialect},
@@ -1781,6 +1784,7 @@ mod collect_rewrites_tests {
         let subquery = Expr::ScalarSubquery(Subquery {
             subquery: Arc::new(table_scan),
             outer_ref_columns: vec![],
+            spans: Spans::default(),
         });
 
         let mut known_rewrites = HashMap::new();
@@ -1843,6 +1847,7 @@ mod collect_rewrites_tests {
             Subquery {
                 subquery: Arc::new(table_scan),
                 outer_ref_columns: vec![],
+                spans: Spans::default(),
             },
             false,
         ));

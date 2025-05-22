@@ -4,7 +4,8 @@ use datafusion::{
     common::HashMap,
     sql::{
         sqlparser::ast::{
-            self, Ident, ObjectName, Query, SelectItem, SetExpr, TableFactor, TableWithJoins,
+            self, Ident, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, TableFactor,
+            TableWithJoins,
         },
         TableReference,
     },
@@ -48,6 +49,9 @@ fn rewrite_multi_part_table_with_joins(
                 | ast::JoinOperator::RightOuter(join_constraint)
                 | ast::JoinOperator::Inner(join_constraint)
                 | ast::JoinOperator::LeftOuter(join_constraint)
+                | ast::JoinOperator::Join(join_constraint)
+                | ast::JoinOperator::Left(join_constraint)
+                | ast::JoinOperator::Right(join_constraint)
                 | ast::JoinOperator::Semi(join_constraint)
                 | ast::JoinOperator::Anti(join_constraint) => {
                     if let ast::JoinConstraint::On(expr) = join_constraint {
@@ -81,7 +85,7 @@ fn rewrite_object_name(
             rewrite
                 .parts
                 .iter()
-                .map(|p| Ident::new(p.to_string()))
+                .map(|p| ObjectNamePart::Identifier(Ident::new(p.to_string())))
                 .collect(),
         );
         *object_name = new_name;
@@ -182,7 +186,13 @@ fn rewrite_multi_part_table_reference_in_expr(
 
             // Get the column name (last identifier) and table name (all other identifiers)
             let column_name = idents.last().cloned();
-            let obj_name = ObjectName(idents[..idents.len() - 1].to_vec());
+            let obj_name = ObjectName(
+                idents[..idents.len() - 1]
+                    .iter()
+                    .cloned()
+                    .map(ObjectNamePart::Identifier)
+                    .collect(),
+            );
 
             if let Some(rewrite) = known_rewrites.get(&obj_name) {
                 // Rewrite the table parts
@@ -240,7 +250,6 @@ fn rewrite_multi_part_table_reference_in_expr(
         ast::Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
             ..
         } => {
@@ -248,10 +257,11 @@ fn rewrite_multi_part_table_reference_in_expr(
                 rewrite_multi_part_table_reference_in_expr(op, known_rewrites);
             }
             for condition in conditions {
-                rewrite_multi_part_table_reference_in_expr(condition, known_rewrites);
-            }
-            for result in results {
-                rewrite_multi_part_table_reference_in_expr(result, known_rewrites);
+                rewrite_multi_part_table_reference_in_expr(
+                    &mut condition.condition,
+                    known_rewrites,
+                );
+                rewrite_multi_part_table_reference_in_expr(&mut condition.result, known_rewrites);
             }
             if let Some(else_res) = else_result {
                 rewrite_multi_part_table_reference_in_expr(else_res, known_rewrites);
@@ -263,9 +273,6 @@ fn rewrite_multi_part_table_reference_in_expr(
         ast::Expr::Identifier(..) => {}
         ast::Expr::JsonAccess { value, .. } => {
             rewrite_multi_part_table_reference_in_expr(&mut *value, known_rewrites);
-        }
-        ast::Expr::CompositeAccess { expr, .. } => {
-            rewrite_multi_part_table_reference_in_expr(&mut *expr, known_rewrites);
         }
         ast::Expr::IsFalse(expr) => {
             rewrite_multi_part_table_reference_in_expr(&mut *expr, known_rewrites);
@@ -497,9 +504,6 @@ fn rewrite_multi_part_table_reference_in_expr(
         ast::Expr::Lambda(lambda_function) => {
             rewrite_multi_part_table_reference_in_expr(&mut lambda_function.body, known_rewrites);
         }
-        ast::Expr::Method(method) => {
-            rewrite_multi_part_table_reference_in_expr(&mut method.expr, known_rewrites);
-        }
         ast::Expr::CompoundFieldAccess { root, access_chain } => {
             rewrite_multi_part_table_reference_in_expr(&mut *root, known_rewrites);
             for access in access_chain {
@@ -543,20 +547,23 @@ fn rewrite_multi_part_table_reference_in_expr(
 }
 
 fn table_reference_to_object_name(table_reference: &TableReference) -> ObjectName {
+    use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart};
     match table_reference {
-        TableReference::Bare { table } => ObjectName(vec![Ident::new(table.to_string())]),
+        TableReference::Bare { table } => ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+            table.to_string(),
+        ))]),
         TableReference::Partial { schema, table } => ObjectName(vec![
-            Ident::new(schema.to_string()),
-            Ident::new(table.to_string()),
+            ObjectNamePart::Identifier(Ident::new(schema.to_string())),
+            ObjectNamePart::Identifier(Ident::new(table.to_string())),
         ]),
         TableReference::Full {
             catalog,
             schema,
             table,
         } => ObjectName(vec![
-            Ident::new(catalog.to_string()),
-            Ident::new(schema.to_string()),
-            Ident::new(table.to_string()),
+            ObjectNamePart::Identifier(Ident::new(catalog.to_string())),
+            ObjectNamePart::Identifier(Ident::new(schema.to_string())),
+            ObjectNamePart::Identifier(Ident::new(table.to_string())),
         ]),
     }
 }

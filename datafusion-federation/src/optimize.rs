@@ -119,18 +119,5 @@ fn optimize_plan_node(
         return Ok(Transformed::no(plan));
     }
 
-    if rule.supports_rewrite() {
-        return rule.rewrite(plan, config);
-    }
-
-    #[allow(deprecated)]
-    rule.try_optimize(&plan, config).map(|maybe_plan| {
-        match maybe_plan {
-            Some(new_plan) => {
-                // if the node was rewritten by the optimizer, replace the node
-                Transformed::yes(new_plan)
-            }
-            None => Transformed::no(plan),
-        }
-    })
+    rule.rewrite(plan, config)
 }
