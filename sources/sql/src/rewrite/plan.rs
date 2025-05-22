@@ -318,7 +318,7 @@ fn rewrite_plan_with_known_rewrites(
         }
         LogicalPlan::Join(datafusion::logical_expr::Join { on, filter, .. }) => {
             let mut new_expressions = vec![];
-            if on.len() > 0 {
+            if !on.is_empty() {
                 for (left, right) in on {
                     let left = rewrite_table_scans_in_expr(
                         left.clone(),
