@@ -28,6 +28,7 @@ impl OptimizerRule for PushDownFilterFederation {
         self.inner.apply_order()
     }
 
+    #[expect(deprecated)]
     fn supports_rewrite(&self) -> bool {
         self.inner.supports_rewrite()
     }

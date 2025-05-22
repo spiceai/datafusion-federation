@@ -5,7 +5,7 @@ use datafusion::{
     sql::{
         sqlparser::{
             self,
-            ast::{FunctionArg, ObjectName},
+            ast::{FunctionArg, ObjectName, ObjectNamePart},
             dialect::{Dialect, GenericDialect},
             tokenizer::Token,
         },
@@ -132,19 +132,36 @@ impl From<ObjectName> for MultiPartTableReference {
         let mut parts = name.0;
         match parts.len() {
             1 => MultiPartTableReference::TableReference(TableReference::Bare {
-                table: parts.remove(0).value.into(),
+                table: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
             }),
             2 => MultiPartTableReference::TableReference(TableReference::Partial {
-                schema: parts.remove(0).value.into(),
-                table: parts.remove(0).value.into(),
+                schema: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
+                table: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
             }),
             3 => MultiPartTableReference::TableReference(TableReference::Full {
-                catalog: parts.remove(0).value.into(),
-                schema: parts.remove(0).value.into(),
-                table: parts.remove(0).value.into(),
+                catalog: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
+                schema: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
+                table: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
             }),
             _ => MultiPartTableReference::Multi(MultiTableReference {
-                parts: parts.into_iter().map(|p| p.value.into()).collect(),
+                parts: parts
+                    .into_iter()
+                    .map(|p| match p {
+                        ObjectNamePart::Identifier(ident) => ident.value.into(),
+                    })
+                    .collect(),
             }),
         }
     }
@@ -217,19 +234,36 @@ impl RemoteTableRef {
         let mut parts = name.0;
         let table_ref = match parts.len() {
             1 => MultiPartTableReference::TableReference(TableReference::Bare {
-                table: parts.remove(0).value.into(),
+                table: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
             }),
             2 => MultiPartTableReference::TableReference(TableReference::Partial {
-                schema: parts.remove(0).value.into(),
-                table: parts.remove(0).value.into(),
+                schema: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
+                table: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
             }),
             3 => MultiPartTableReference::TableReference(TableReference::Full {
-                catalog: parts.remove(0).value.into(),
-                schema: parts.remove(0).value.into(),
-                table: parts.remove(0).value.into(),
+                catalog: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
+                schema: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
+                table: match parts.remove(0) {
+                    ObjectNamePart::Identifier(ident) => ident.value.into(),
+                },
             }),
             _ => MultiPartTableReference::Multi(MultiTableReference {
-                parts: parts.into_iter().map(|p| p.value.into()).collect(),
+                parts: parts
+                    .into_iter()
+                    .map(|p| match p {
+                        ObjectNamePart::Identifier(ident) => ident.value.into(),
+                    })
+                    .collect(),
             }),
         };
 
@@ -341,6 +375,7 @@ pub fn quote_identifier(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::sqlparser::{ast::ValueWithSpan, tokenizer::Span};
     use sqlparser::{
         ast::{self, Expr, FunctionArgOperator, Ident, Value},
         dialect,
@@ -363,8 +398,20 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("table"),
             vec![
-                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -373,8 +420,20 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("Table"),
             vec![
-                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -386,8 +445,20 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("table"),
             vec![
-                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -396,8 +467,20 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::bare("Table"),
             vec![
-                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -420,8 +503,20 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::partial("schema", "table"),
             vec![
-                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -430,8 +525,20 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::partial("schema", "Table"),
             vec![
-                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -443,8 +550,20 @@ mod tests {
         let expected = RemoteTableRef::from((
             TableReference::partial("schema", "table"),
             vec![
-                FunctionArg::Unnamed(Expr::Value(Value::Number("1".to_string(), false)).into()),
-                FunctionArg::Unnamed(Expr::Value(Value::Number("2".to_string(), false)).into()),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
+                FunctionArg::Unnamed(
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
+                ),
             ],
         ));
         assert_eq!(table_ref, expected);
@@ -462,12 +581,20 @@ mod tests {
             vec![
                 FunctionArg::ExprNamed {
                     name: ast::Expr::Identifier(Ident::new("user_id")),
-                    arg: Expr::Value(Value::Number("1".to_string(), false)).into(),
+                    arg: Expr::Value(ValueWithSpan {
+                        value: Value::Number("1".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
                     operator: FunctionArgOperator::RightArrow,
                 },
                 FunctionArg::ExprNamed {
                     name: ast::Expr::Identifier(Ident::new("age")),
-                    arg: Expr::Value(Value::Number("2".to_string(), false)).into(),
+                    arg: Expr::Value(ValueWithSpan {
+                        value: Value::Number("2".to_string(), false),
+                        span: Span::empty(),
+                    })
+                    .into(),
                     operator: FunctionArgOperator::RightArrow,
                 },
             ],

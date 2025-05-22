@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use datafusion::{
     common::HashMap,
     sql::{
-        sqlparser::ast::{self, Ident, ObjectName, VisitMut, VisitorMut},
+        sqlparser::ast::{self, Ident, ObjectName, ObjectNamePart, VisitMut, VisitorMut},
         TableReference,
     },
 };
@@ -59,7 +59,7 @@ impl VisitorMut for RewriteMultiTableVisitor {
                 rewrite
                     .parts()
                     .iter()
-                    .map(|p| Ident::new(p.to_string()))
+                    .map(|p| ObjectNamePart::Identifier(Ident::new(p.to_string())))
                     .collect(),
             );
             *table_factor = new_name;
@@ -77,7 +77,12 @@ impl VisitorMut for RewriteMultiTableVisitor {
 
             // Get the column name (last identifier) and table name (all other identifiers)
             let column_name = idents.last().cloned();
-            let obj_name = ObjectName(idents[..idents.len() - 1].to_vec());
+            let obj_name = ObjectName(
+                idents[..idents.len() - 1]
+                    .iter()
+                    .map(|i| ObjectNamePart::Identifier(i.clone()))
+                    .collect(),
+            );
 
             if let Some(rewrite) = self.known_rewrites.get(&obj_name) {
                 // Rewrite the table parts
@@ -102,19 +107,21 @@ impl VisitorMut for RewriteMultiTableVisitor {
 
 fn table_reference_to_object_name(table_reference: &TableReference) -> ObjectName {
     match table_reference {
-        TableReference::Bare { table } => ObjectName(vec![Ident::new(table.to_string())]),
+        TableReference::Bare { table } => ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+            table.to_string(),
+        ))]),
         TableReference::Partial { schema, table } => ObjectName(vec![
-            Ident::new(schema.to_string()),
-            Ident::new(table.to_string()),
+            ObjectNamePart::Identifier(Ident::new(schema.to_string())),
+            ObjectNamePart::Identifier(Ident::new(table.to_string())),
         ]),
         TableReference::Full {
             catalog,
             schema,
             table,
         } => ObjectName(vec![
-            Ident::new(catalog.to_string()),
-            Ident::new(schema.to_string()),
-            Ident::new(table.to_string()),
+            ObjectNamePart::Identifier(Ident::new(catalog.to_string())),
+            ObjectNamePart::Identifier(Ident::new(schema.to_string())),
+            ObjectNamePart::Identifier(Ident::new(table.to_string())),
         ]),
     }
 }

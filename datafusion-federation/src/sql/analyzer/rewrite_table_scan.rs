@@ -125,6 +125,7 @@ impl RewriteTableScanAnalyzer {
                             Expr::ScalarSubquery(Subquery {
                                 outer_ref_columns,
                                 subquery,
+                                spans,
                             }) => {
                                 let outer_ref_columns = rewrite_outer_reference_columns(
                                     outer_ref_columns,
@@ -134,6 +135,7 @@ impl RewriteTableScanAnalyzer {
                                 Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
                                     outer_ref_columns,
                                     subquery,
+                                    spans,
                                 })))
                             }
                             Expr::Exists(Exists {
@@ -141,6 +143,7 @@ impl RewriteTableScanAnalyzer {
                                     Subquery {
                                         subquery,
                                         outer_ref_columns,
+                                        spans,
                                     },
                                 negated,
                             }) => {
@@ -153,6 +156,7 @@ impl RewriteTableScanAnalyzer {
                                     subquery: Subquery {
                                         outer_ref_columns,
                                         subquery,
+                                        spans,
                                     },
                                     negated,
                                 })))
@@ -162,6 +166,7 @@ impl RewriteTableScanAnalyzer {
                                     Subquery {
                                         outer_ref_columns,
                                         subquery,
+                                        spans,
                                     },
                                 expr,
                                 negated,
@@ -176,6 +181,7 @@ impl RewriteTableScanAnalyzer {
                                     subquery: Subquery {
                                         outer_ref_columns,
                                         subquery,
+                                        spans,
                                     },
                                     negated,
                                 })))
@@ -870,7 +876,7 @@ mod tests {
             ),
             (
                 "SELECT foo.df_table.a FROM foo.df_table",
-                r#"SELECT a FROM "default".remote_table"#,
+                r#"SELECT remote_table.a FROM "default".remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",
