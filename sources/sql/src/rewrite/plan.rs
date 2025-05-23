@@ -316,43 +316,6 @@ fn rewrite_plan_with_known_rewrites(
             });
             Ok(new_plan)
         }
-        LogicalPlan::Join(datafusion::logical_expr::Join { on, filter, .. }) => {
-            let mut new_expressions = vec![];
-            if !on.is_empty() {
-                for (left, right) in on {
-                    let left = rewrite_table_scans_in_expr(
-                        left.clone(),
-                        known_rewrites,
-                        subquery_uses_partial_path,
-                        subquery_table_scans,
-                    )?;
-                    let right = rewrite_table_scans_in_expr(
-                        right.clone(),
-                        known_rewrites,
-                        subquery_uses_partial_path,
-                        subquery_table_scans,
-                    )?;
-                    let equal_expr = Expr::BinaryExpr(BinaryExpr::new(
-                        Box::new(left),
-                        logical_expr::Operator::Eq,
-                        Box::new(right),
-                    ));
-                    new_expressions.push(equal_expr);
-                }
-            }
-            if let Some(filter) = filter {
-                let new_filter = rewrite_table_scans_in_expr(
-                    filter.clone(),
-                    known_rewrites,
-                    subquery_uses_partial_path,
-                    subquery_table_scans,
-                )?;
-                new_expressions.push(new_filter);
-            }
-
-            let new_plan = plan.with_new_exprs(new_expressions, rewritten_inputs)?;
-            Ok(new_plan)
-        }
         _ => {
             let mut new_expressions = vec![];
             for expression in plan.expressions() {
@@ -1631,49 +1594,6 @@ mod tests {
 
         for test in tests {
             test_sql(&ctx, test.0, test.1, false).await?;
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_rewrite_join_with_on_and_filter() -> Result<()> {
-        init_tracing();
-        let ctx = get_test_df_context();
-
-        let tests = vec![
-            // Basic join
-            (
-                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a",
-                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON (t1.a = t2.a)"#,
-            ),
-            (
-                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a AND t1.b = t2.b",
-                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON ((t1.a = t2.a) AND (t1.b = t2.b))"#,
-            ),
-            (
-                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a WHERE t1.b > t2.b",
-                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON (t1.a = t2.a) WHERE (t1.b > t2.b)"#,
-            ),
-            (
-                "SELECT t1.a, t2.b FROM foo.df_table t1 JOIN app_table t2 ON t1.a = t2.a WHERE t1.b > t2.b AND t1.c IN ('2023-01-01', '2023-01-02')",
-                r#"SELECT t1.a, t2.b FROM remote_table AS t1 JOIN remote_table AS t2 ON (t1.a = t2.a) WHERE ((t1.b > t2.b) AND t1.c IN ('2023-01-01', '2023-01-02'))"#,
-            ),
-            // Intersect
-            (
-                "SELECT a FROM foo.df_table INTERSECT SELECT a FROM app_table",
-                r#"SELECT DISTINCT remote_table.a FROM remote_table LEFT SEMI JOIN (SELECT remote_table.a FROM remote_table) ON remote_table.a = remote_table.a"#,
-            ),
-            // Except
-            (
-                "SELECT a FROM foo.df_table EXCEPT SELECT a FROM app_table",
-                r#"SELECT DISTINCT remote_table.a FROM remote_table LEFT ANTI JOIN (SELECT remote_table.a FROM remote_table) ON remote_table.a = remote_table.a"#,
-            ),
-        ];
-
-        for (idx, (sql_query, expected_sql)) in tests.iter().enumerate() {
-            println!("Testing join case {}: {}", idx + 1, sql_query);
-            test_sql(&ctx, sql_query, expected_sql, false).await?;
         }
 
         Ok(())
