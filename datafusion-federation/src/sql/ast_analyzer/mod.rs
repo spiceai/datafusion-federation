@@ -1,10 +1,17 @@
 use std::ops::ControlFlow;
 
-use datafusion::sql::sqlparser::ast::{
-    FunctionArg, Ident, Statement, TableAlias, TableFactor, TableFunctionArgs, VisitMut, VisitorMut,
+use datafusion::{
+    common::HashMap,
+    sql::sqlparser::ast::{
+        FunctionArg, Ident, ObjectName, Statement, TableAlias, TableFactor, TableFunctionArgs,
+        VisitMut, VisitorMut,
+    },
 };
 
-use super::{table_reference::MultiPartTableReference, AstAnalyzer};
+use super::{
+    table_reference::{MultiPartTableReference, MultiTableReference},
+    AstAnalyzer,
+};
 
 pub fn replace_table_args_analyzer(mut visitor: TableArgReplace) -> AstAnalyzer {
     let x = move |mut statement: Statement| {
@@ -101,5 +108,22 @@ impl VisitorMut for TableArgReplace {
             }
         }
         ControlFlow::Continue(())
+    }
+}
+
+fn rewrite_object_name(
+    object_name: &mut ObjectName,
+    known_rewrites: &HashMap<ObjectName, MultiTableReference>,
+) {
+    if let Some(rewrite) = known_rewrites.get(object_name) {
+        // Create new object name from the rewritten table reference
+        let new_name = ObjectName(
+            rewrite
+                .parts
+                .iter()
+                .map(|p| Ident::new(p.to_string()))
+                .collect(),
+        );
+        *object_name = new_name;
     }
 }
