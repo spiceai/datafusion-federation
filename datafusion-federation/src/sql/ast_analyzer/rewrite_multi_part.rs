@@ -172,7 +172,10 @@ mod tests {
 
         RewriteMultiTableReference::rewrite(&mut stmt, rewrites);
 
-        assert_eq!(stmt.to_string(), "SELECT * FROM catalog.schema.real_table");
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT * FROM catalog.schema1.schema2.real_table"
+        );
     }
 
     #[test]
@@ -184,7 +187,20 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT MAX(catalog.schema.real_table.a) FROM catalog.schema.real_table"
+            "SELECT MAX(catalog.schema1.schema2.real_table.a) FROM catalog.schema1.schema2.real_table"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_count_query() {
+        let mut stmt = parse_sql("SELECT count(*) FROM test_table");
+        let rewrites = create_test_rewrites();
+
+        RewriteMultiTableReference::rewrite(&mut stmt, rewrites);
+
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT count(*) FROM catalog.schema1.schema2.real_table"
         );
     }
 
@@ -198,7 +214,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT other_catalog.other_schema.real_table2.column FROM other_catalog.other_schema.real_table2"
+            "SELECT other_catalog.other_schema1.other_schema2.real_table2.column FROM other_catalog.other_schema1.other_schema2.real_table2"
         );
     }
 
@@ -265,7 +281,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema.real_table AS t1"
+            "SELECT * FROM catalog.schema1.schema2.real_table AS t1"
         );
     }
 
@@ -307,7 +323,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema.real_table WHERE a IN (SELECT b FROM other_catalog.other_schema.real_table2)"
+            "SELECT * FROM catalog.schema1.schema2.real_table WHERE a IN (SELECT b FROM other_catalog.other_schema1.other_schema2.real_table2)"
         );
     }
 
@@ -322,7 +338,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT CASE WHEN catalog.schema.real_table.a > 0 THEN other_catalog.other_schema.real_table2.b ELSE catalog.schema.real_table.c END FROM catalog.schema.real_table"
+            "SELECT CASE WHEN catalog.schema1.schema2.real_table.a > 0 THEN other_catalog.other_schema1.other_schema2.real_table2.b ELSE catalog.schema1.schema2.real_table.c END FROM catalog.schema1.schema2.real_table"
         );
     }
 
@@ -339,9 +355,9 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema.real_table JOIN other_catalog.other_schema.real_table2 \
-             ON catalog.schema.real_table.id = other_catalog.other_schema.real_table2.id \
-             AND catalog.schema.real_table.a > other_catalog.other_schema.real_table2.b"
+            "SELECT * FROM catalog.schema1.schema2.real_table JOIN other_catalog.other_schema1.other_schema2.real_table2 \
+             ON catalog.schema1.schema2.real_table.id = other_catalog.other_schema1.other_schema2.real_table2.id \
+             AND catalog.schema1.schema2.real_table.a > other_catalog.other_schema1.other_schema2.real_table2.b"
         );
     }
 
@@ -358,10 +374,10 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema.real_table WHERE \
-             EXISTS (SELECT 1 FROM other_catalog.other_schema.real_table2 \
-             WHERE other_catalog.other_schema.real_table2.id = catalog.schema.real_table.id) \
-             AND catalog.schema.real_table.a IN (SELECT b FROM other_catalog.other_schema.real_table2)"
+            "SELECT * FROM catalog.schema1.schema2.real_table WHERE \
+             EXISTS (SELECT 1 FROM other_catalog.other_schema1.other_schema2.real_table2 \
+             WHERE other_catalog.other_schema1.other_schema2.real_table2.id = catalog.schema1.schema2.real_table.id) \
+             AND catalog.schema1.schema2.real_table.a IN (SELECT b FROM other_catalog.other_schema1.other_schema2.real_table2)"
         );
     }
 
@@ -377,8 +393,8 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "WITH cte AS (SELECT a FROM catalog.schema.real_table) \
-             SELECT * FROM cte JOIN other_catalog.other_schema.real_table2 ON cte.a = other_catalog.other_schema.real_table2.b"
+            "WITH cte AS (SELECT a FROM catalog.schema1.schema2.real_table) \
+             SELECT * FROM cte JOIN other_catalog.other_schema1.other_schema2.real_table2 ON cte.a = other_catalog.other_schema1.other_schema2.real_table2.b"
         );
     }
 
@@ -392,7 +408,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT a FROM catalog.schema.real_table UNION SELECT b FROM other_catalog.other_schema.real_table2"
+            "SELECT a FROM catalog.schema1.schema2.real_table UNION SELECT b FROM other_catalog.other_schema1.other_schema2.real_table2"
         );
     }
 
@@ -407,7 +423,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM (SELECT a FROM catalog.schema.real_table) AS t1 JOIN other_catalog.other_schema.real_table2 ON t1.a = other_catalog.other_schema.real_table2.b"
+            "SELECT * FROM (SELECT a FROM catalog.schema1.schema2.real_table) AS t1 JOIN other_catalog.other_schema1.other_schema2.real_table2 ON t1.a = other_catalog.other_schema1.other_schema2.real_table2.b"
         );
     }
 
@@ -424,7 +440,9 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema.real_table AS t1 WHERE EXISTS (SELECT 1 FROM other_catalog.other_schema.real_table2 AS t2 WHERE t2.id = t1.id AND t2.b > (SELECT MAX(a) FROM catalog.schema.real_table WHERE catalog.schema.real_table.group = t2.group))"
+            "SELECT * FROM catalog.schema1.schema2.real_table AS t1 WHERE EXISTS \
+            (SELECT 1 FROM other_catalog.other_schema1.other_schema2.real_table2 AS t2 WHERE t2.id = t1.id \
+            AND t2.b > (SELECT MAX(a) FROM catalog.schema1.schema2.real_table WHERE catalog.schema1.schema2.real_table.group = t2.group))"
         );
     }
 
@@ -452,8 +470,8 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "WITH cte1 AS (SELECT a FROM catalog.schema.real_table), \
-             cte2 AS (SELECT b FROM other_catalog.other_schema.real_table2) \
+            "WITH cte1 AS (SELECT a FROM catalog.schema1.schema2.real_table), \
+             cte2 AS (SELECT b FROM other_catalog.other_schema1.other_schema2.real_table2) \
              SELECT * FROM cte1 JOIN cte2 ON cte1.a = cte2.b"
         );
     }
@@ -469,7 +487,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema.real_table WHERE catalog.schema.real_table.a BETWEEN other_catalog.other_schema.real_table2.b AND other_catalog.other_schema.real_table2.c"
+            "SELECT * FROM catalog.schema1.schema2.real_table WHERE catalog.schema1.schema2.real_table.a BETWEEN other_catalog.other_schema1.other_schema2.real_table2.b AND other_catalog.other_schema1.other_schema2.real_table2.c"
         );
     }
 
@@ -484,7 +502,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema.real_table WHERE EXISTS (SELECT 1 FROM other_catalog.other_schema.real_table2 WHERE MAX(catalog.schema.real_table.a) > MIN(other_catalog.other_schema.real_table2.b))"
+            "SELECT * FROM catalog.schema1.schema2.real_table WHERE EXISTS (SELECT 1 FROM other_catalog.other_schema1.other_schema2.real_table2 WHERE MAX(catalog.schema1.schema2.real_table.a) > MIN(other_catalog.other_schema1.other_schema2.real_table2.b))"
         );
     }
 
@@ -501,8 +519,8 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT catalog.schema.real_table.a, COUNT(*) FROM catalog.schema.real_table \
-            GROUP BY test_table.a HAVING COUNT(*) > (SELECT AVG(b) FROM test_schema.test_table2)"
+            "SELECT catalog.schema1.schema2.real_table.a, COUNT(*) FROM catalog.schema1.schema2.real_table \
+            GROUP BY catalog.schema1.schema2.real_table.a HAVING COUNT(*) > (SELECT AVG(b) FROM other_catalog.other_schema1.other_schema2.real_table2)"
         );
     }
 }

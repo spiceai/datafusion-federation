@@ -9,7 +9,7 @@ use datafusion::{
     logical_expr::{
         self,
         expr::{Alias, Exists, InSubquery},
-        Expr, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
+        Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
     },
     sql::TableReference,
 };
@@ -65,117 +65,137 @@ impl RewriteTableScanAnalyzer {
         };
 
         // In f_up, rewrite the column names in the expressions.
-        let rewrite_column_names_in_expressions = |plan: LogicalPlan| {
-            let plan = match plan {
-                LogicalPlan::Unnest(unnest) => rewrite_unnest_plan(unnest, known_rewrites)?,
-                _ => plan,
-            };
+        let rewrite_column_names_in_expressions =
+            |plan: LogicalPlan| -> Result<Transformed<LogicalPlan>> {
+                let plan = match plan {
+                    LogicalPlan::Unnest(unnest) => rewrite_unnest_plan(unnest, known_rewrites)?,
+                    _ => plan,
+                };
 
-            plan.map_expressions(|expr| {
-                expr.transform_up(|expr| {
-                    #[expect(deprecated)]
-                    match expr {
-                        Expr::Column(col) => {
-                            rewrite_column(col, known_rewrites).map(|t| t.update_data(Expr::Column))
-                        }
-                        Expr::Alias(alias) => match &alias.relation {
-                            Some(relation) => {
-                                let Some(rewrite) = known_rewrites.get(relation).and_then(
-                                    |rewrite| match rewrite {
+                let plan = plan.map_expressions(|expr| {
+                    expr.transform_up(|expr| {
+                        #[expect(deprecated)]
+                        match expr {
+                            Expr::Column(col) => rewrite_column(col, known_rewrites)
+                                .map(|t| t.update_data(Expr::Column)),
+                            Expr::Alias(alias) => match &alias.relation {
+                                Some(relation) => {
+                                    let Some(rewrite) =
+                                        known_rewrites.get(relation).and_then(|rewrite| {
+                                            match rewrite {
+                                                MultiPartTableReference::TableReference(
+                                                    rewrite,
+                                                ) => Some(rewrite),
+                                                _ => None,
+                                            }
+                                        })
+                                    else {
+                                        return Ok(Transformed::no(Expr::Alias(alias)));
+                                    };
+
+                                    Ok(Transformed::yes(Expr::Alias(Alias::new(
+                                        *alias.expr,
+                                        Some(rewrite.clone()),
+                                        alias.name,
+                                    ))))
+                                }
+                                None => Ok(Transformed::no(Expr::Alias(alias))),
+                            },
+                            Expr::Wildcard { qualifier, options } => {
+                                if let Some(rewrite) = qualifier
+                                    .as_ref()
+                                    .and_then(|q| known_rewrites.get(q))
+                                    .and_then(|rewrite| match rewrite {
                                         MultiPartTableReference::TableReference(rewrite) => {
                                             Some(rewrite)
                                         }
                                         _ => None,
-                                    },
-                                ) else {
-                                    return Ok(Transformed::no(Expr::Alias(alias)));
-                                };
-
-                                Ok(Transformed::yes(Expr::Alias(Alias::new(
-                                    *alias.expr,
-                                    Some(rewrite.clone()),
-                                    alias.name,
-                                ))))
+                                    })
+                                {
+                                    Ok(Transformed::yes(Expr::Wildcard {
+                                        qualifier: Some(rewrite.clone()),
+                                        options,
+                                    }))
+                                } else {
+                                    Ok(Transformed::no(Expr::Wildcard { qualifier, options }))
+                                }
                             }
-                            None => Ok(Transformed::no(Expr::Alias(alias))),
-                        },
-                        Expr::Wildcard { qualifier, options } => {
-                            if let Some(rewrite) = qualifier
-                                .as_ref()
-                                .and_then(|q| known_rewrites.get(q))
-                                .and_then(|rewrite| match rewrite {
-                                    MultiPartTableReference::TableReference(rewrite) => {
-                                        Some(rewrite)
-                                    }
-                                    _ => None,
-                                })
-                            {
-                                Ok(Transformed::yes(Expr::Wildcard {
-                                    qualifier: Some(rewrite.clone()),
-                                    options,
-                                }))
-                            } else {
-                                Ok(Transformed::no(Expr::Wildcard { qualifier, options }))
-                            }
-                        }
-                        // We can't match directly on the outer ref columns until https://github.com/apache/datafusion/issues/16147 is fixed.
-                        Expr::ScalarSubquery(Subquery {
-                            outer_ref_columns,
-                            subquery,
-                        }) => {
-                            let outer_ref_columns =
-                                rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
-
-                            Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
+                            // We can't match directly on the outer ref columns until https://github.com/apache/datafusion/issues/16147 is fixed.
+                            Expr::ScalarSubquery(Subquery {
                                 outer_ref_columns,
                                 subquery,
-                            })))
-                        }
-                        Expr::Exists(Exists {
-                            subquery:
-                                Subquery {
-                                    subquery,
+                            }) => {
+                                let outer_ref_columns = rewrite_outer_reference_columns(
                                     outer_ref_columns,
-                                },
-                            negated,
-                        }) => {
-                            let outer_ref_columns =
-                                rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
+                                    known_rewrites,
+                                )?;
 
-                            Ok(Transformed::yes(Expr::Exists(Exists {
-                                subquery: Subquery {
+                                Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
                                     outer_ref_columns,
                                     subquery,
-                                },
+                                })))
+                            }
+                            Expr::Exists(Exists {
+                                subquery:
+                                    Subquery {
+                                        subquery,
+                                        outer_ref_columns,
+                                    },
                                 negated,
-                            })))
-                        }
-                        Expr::InSubquery(InSubquery {
-                            subquery:
-                                Subquery {
+                            }) => {
+                                let outer_ref_columns = rewrite_outer_reference_columns(
                                     outer_ref_columns,
-                                    subquery,
-                                },
-                            expr,
-                            negated,
-                        }) => {
-                            let outer_ref_columns =
-                                rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
+                                    known_rewrites,
+                                )?;
 
-                            Ok(Transformed::yes(Expr::InSubquery(InSubquery {
+                                Ok(Transformed::yes(Expr::Exists(Exists {
+                                    subquery: Subquery {
+                                        outer_ref_columns,
+                                        subquery,
+                                    },
+                                    negated,
+                                })))
+                            }
+                            Expr::InSubquery(InSubquery {
+                                subquery:
+                                    Subquery {
+                                        outer_ref_columns,
+                                        subquery,
+                                    },
                                 expr,
-                                subquery: Subquery {
-                                    outer_ref_columns,
-                                    subquery,
-                                },
                                 negated,
-                            })))
+                            }) => {
+                                let outer_ref_columns = rewrite_outer_reference_columns(
+                                    outer_ref_columns,
+                                    known_rewrites,
+                                )?;
+
+                                Ok(Transformed::yes(Expr::InSubquery(InSubquery {
+                                    expr,
+                                    subquery: Subquery {
+                                        outer_ref_columns,
+                                        subquery,
+                                    },
+                                    negated,
+                                })))
+                            }
+                            _ => Ok(Transformed::no(expr)),
                         }
-                        _ => Ok(Transformed::no(expr)),
+                    })
+                })?;
+
+                plan.map_data(|plan| match plan {
+                    LogicalPlan::Aggregate(aggr) => {
+                        // Recalculate the aggregate schema now that all of the inner expressions have been rewritten.
+                        Ok(LogicalPlan::Aggregate(Aggregate::try_new(
+                            aggr.input,
+                            aggr.group_expr,
+                            aggr.aggr_expr,
+                        )?))
                     }
+                    plan => Ok(plan),
                 })
-            })
-        };
+            };
 
         plan.transform_down_up_with_subqueries(
             rewrite_table_scans,
