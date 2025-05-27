@@ -6,3 +6,4 @@ package.json
 .DS_Store
 .vscode/settings.json
 .cargo
+tpch_sf1.db

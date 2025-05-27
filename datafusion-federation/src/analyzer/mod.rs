@@ -3,13 +3,8 @@ mod scan_result;
 use crate::FederationProvider;
 use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
 use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
-use datafusion::optimizer::decorrelate_predicate_subquery::DecorrelatePredicateSubquery;
-use datafusion::optimizer::eliminate_join::EliminateJoin;
 use datafusion::optimizer::eliminate_nested_union::EliminateNestedUnion;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
-use datafusion::optimizer::replace_distinct_aggregate::ReplaceDistinctWithAggregate;
-use datafusion::optimizer::scalar_subquery_to_join::ScalarSubqueryToJoin;
-use datafusion::optimizer::simplify_expressions::SimplifyExpressions;
 use datafusion::optimizer::{Optimizer, OptimizerContext};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
@@ -24,7 +19,7 @@ use scan_result::ScanResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use optimize_projections::OptimizeProjections;
+pub use optimize_projections::OptimizeProjections;
 
 mod optimize_projections;
 
@@ -72,11 +67,6 @@ impl Default for FederationAnalyzerRule {
         Self {
             optimizer: Optimizer::with_rules(vec![
                 Arc::new(EliminateNestedUnion::new()),
-                Arc::new(SimplifyExpressions::new()),
-                Arc::new(ReplaceDistinctWithAggregate::new()),
-                Arc::new(EliminateJoin::new()),
-                Arc::new(DecorrelatePredicateSubquery::new()),
-                Arc::new(ScalarSubqueryToJoin::new()),
                 Arc::new(PushDownFilter::new()),
                 Arc::new(OptimizeProjections::new()),
             ]),

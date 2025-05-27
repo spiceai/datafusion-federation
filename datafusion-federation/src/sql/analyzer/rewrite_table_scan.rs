@@ -840,7 +840,7 @@ mod tests {
             ),
             (
                 "SELECT foo.df_table.a FROM foo.df_table",
-                r#"SELECT remote_table.a FROM "default".remote_table"#,
+                r#"SELECT a FROM "default".remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",
