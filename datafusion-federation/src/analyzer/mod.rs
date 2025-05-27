@@ -3,6 +3,7 @@ mod scan_result;
 use crate::FederationProvider;
 use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
 use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
+use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
@@ -17,15 +18,19 @@ use scan_result::ScanResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use optimize_projections::OptimizeProjections;
+
+mod optimize_projections;
+
 /// An analyzer rule to identifying sub-plans to federate
 ///
 /// The analyzer logic walks over the plan, look for the largest subtrees that only have
 /// TableScans from the same [`FederationProvider`]. The 'largest sub-trees' are passed to their
 /// respective [`FederationProvider::analyzer`].
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct FederationAnalyzerRule {
-    // Optional optimization rules to run before the federated plan is created
-    optimizer: Option<Optimizer>,
+    // Optimization rules to run before the federated plan is created
+    optimizer: Optimizer,
 }
 
 impl AnalyzerRule for FederationAnalyzerRule {
@@ -37,13 +42,9 @@ impl AnalyzerRule for FederationAnalyzerRule {
             return Ok(plan);
         }
 
-        // Run selected optimizer rules before federation
-        let plan = if let Some(optimizer) = &self.optimizer {
-            let opt_config = OptimizerContext::new();
-            optimizer.optimize(plan, &opt_config, |_, _| {})?
-        } else {
-            plan
-        };
+        // Run optimizer rules before federation
+        let opt_config = OptimizerContext::new();
+        let plan = self.optimizer.optimize(plan, &opt_config, |_, _| {})?;
 
         // Find all federation providers for TableReferences that appear in the plan, to resolve OuterRefColumns
         let providers = get_plan_provider_recursively(&plan)?;
@@ -60,13 +61,25 @@ impl AnalyzerRule for FederationAnalyzerRule {
     }
 }
 
+impl Default for FederationAnalyzerRule {
+    fn default() -> Self {
+        Self {
+            optimizer: Optimizer::with_rules(vec![
+                Arc::new(PushDownFilter::new()),
+                Arc::new(OptimizeProjections::new()),
+            ]),
+        }
+    }
+}
+
 impl FederationAnalyzerRule {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Override the default optimizer with custom rules
     pub fn with_optimizer(mut self, optimizer: Optimizer) -> Self {
-        self.optimizer = Some(optimizer);
+        self.optimizer = optimizer;
         self
     }
 
