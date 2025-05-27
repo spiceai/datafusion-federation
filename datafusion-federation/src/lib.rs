@@ -1,5 +1,4 @@
 mod analyzer;
-mod optimize;
 mod plan_node;
 pub mod schema_cast;
 #[cfg(feature = "sql")]

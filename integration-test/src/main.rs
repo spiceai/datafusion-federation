@@ -25,6 +25,8 @@ use datafusion::{
     },
 };
 
+mod optimize;
+
 pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
         Arc::new(InlineTableScan::new()),

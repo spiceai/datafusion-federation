@@ -1,11 +1,9 @@
 mod scan_result;
 
 use crate::FederationProvider;
-use crate::{
-    optimize::Optimizer, FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef,
-};
-use datafusion::error::DataFusionError;
+use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
 use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
+use datafusion::optimizer::{Optimizer, OptimizerContext};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
@@ -18,7 +16,6 @@ use datafusion::{
 use scan_result::ScanResult;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 /// An analyzer rule to identifying sub-plans to federate
 ///
@@ -27,9 +24,8 @@ use std::sync::RwLock;
 /// respective [`FederationProvider::analyzer`].
 #[derive(Default, Debug)]
 pub struct FederationAnalyzerRule {
-    // Optimization rules to run before the federated plan is created
-    optimizer: Optimizer,
-    provider_map: Arc<RwLock<HashMap<TableReference, ScanResult>>>,
+    // Optional optimization rules to run before the federated plan is created
+    optimizer: Option<Optimizer>,
 }
 
 impl AnalyzerRule for FederationAnalyzerRule {
@@ -42,19 +38,17 @@ impl AnalyzerRule for FederationAnalyzerRule {
         }
 
         // Run selected optimizer rules before federation
-        let plan = self.optimizer.optimize_plan(plan)?;
+        let plan = if let Some(optimizer) = &self.optimizer {
+            let opt_config = OptimizerContext::new();
+            optimizer.optimize(plan, &opt_config, |_, _| {})?
+        } else {
+            plan
+        };
 
-        // Find all federation providers for TableReferences that appeared in the plan
+        // Find all federation providers for TableReferences that appear in the plan, to resolve OuterRefColumns
         let providers = get_plan_provider_recursively(&plan)?;
-        let mut write_map_guard = self.provider_map.write().map_err(|_| {
-            DataFusionError::External(
-                "Failed to create federated plan: failed to find all federated providers.".into(),
-            )
-        })?;
-        write_map_guard.extend(providers);
-        drop(write_map_guard);
 
-        match self.optimize_plan_recursively(&plan, true, config)? {
+        match self.analyze_plan_recursively(&plan, true, config, &providers)? {
             (Some(optimized_plan), _) => Ok(optimized_plan),
             (None, _) => Ok(plan),
         }
@@ -71,12 +65,21 @@ impl FederationAnalyzerRule {
         Self::default()
     }
 
+    pub fn with_optimizer(mut self, optimizer: Optimizer) -> Self {
+        self.optimizer = Some(optimizer);
+        self
+    }
+
     /// Scans a plan to see if it belongs to a single [`FederationProvider`].
-    fn scan_plan_recursively(&self, plan: &LogicalPlan) -> Result<ScanResult> {
+    fn scan_plan_recursively(
+        &self,
+        plan: &LogicalPlan,
+        providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+    ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
         plan.apply(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
-            let exprs_provider = self.scan_plan_exprs(p)?;
+            let exprs_provider = self.scan_plan_exprs(p, providers)?;
             sole_provider.merge(exprs_provider);
 
             if sole_provider.is_ambiguous() {
@@ -93,12 +96,16 @@ impl FederationAnalyzerRule {
     }
 
     /// Scans a plan's expressions to see if it belongs to a single [`FederationProvider`].
-    fn scan_plan_exprs(&self, plan: &LogicalPlan) -> Result<ScanResult> {
+    fn scan_plan_exprs(
+        &self,
+        plan: &LogicalPlan,
+        providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+    ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
         let exprs = plan.expressions();
         for expr in &exprs {
-            let expr_result = self.scan_expr_recursively(expr)?;
+            let expr_result = self.scan_expr_recursively(expr, providers)?;
             sole_provider.merge(expr_result);
 
             if sole_provider.is_ambiguous() {
@@ -110,33 +117,32 @@ impl FederationAnalyzerRule {
     }
 
     /// scans an expression to see if it belongs to a single [`FederationProvider`]
-    fn scan_expr_recursively(&self, expr: &Expr) -> Result<ScanResult> {
+    fn scan_expr_recursively(
+        &self,
+        expr: &Expr,
+        providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+    ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
         expr.apply(&mut |e: &Expr| -> Result<TreeNodeRecursion> {
-            // TODO: Support other types of sub-queries
             match e {
                 Expr::ScalarSubquery(ref subquery) => {
-                    let plan_result = self.scan_plan_recursively(&subquery.subquery)?;
+                    let plan_result = self.scan_plan_recursively(&subquery.subquery, providers)?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
                 Expr::InSubquery(ref insubquery) => {
-                    let plan_result = self.scan_plan_recursively(&insubquery.subquery.subquery)?;
+                    let plan_result =
+                        self.scan_plan_recursively(&insubquery.subquery.subquery, providers)?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
                 Expr::OuterReferenceColumn(_, ref col) => {
                     if let Some(table) = &col.relation {
-                        let map = self.provider_map.read().map_err(|_| {
-                            DataFusionError::External(
-                                "Failed to create federated plan: failed to obtain a read lock on federated providers.".into(),
-                            )
-                        })?;
-                        if let Some(plan_result) = map.get(table) {
-                            sole_provider.merge(plan_result.clone());
+                        if let Some(plan_result) = providers.get(table) {
+                            sole_provider.merge(ScanResult::Distinct(Arc::clone(plan_result)));
                             return Ok(sole_provider.check_recursion());
                         }
                     }
@@ -157,11 +163,12 @@ impl FederationAnalyzerRule {
     /// Returns a plan if a sub-tree was federated, otherwise None.
     ///
     /// Returns a ScanResult of all FederationProviders in the subtree.
-    fn optimize_plan_recursively(
+    fn analyze_plan_recursively(
         &self,
         plan: &LogicalPlan,
         is_root: bool,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
+        providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
     ) -> Result<(Option<LogicalPlan>, ScanResult)> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
@@ -176,7 +183,7 @@ impl FederationAnalyzerRule {
         let (leaf_provider, _) = get_leaf_provider(plan)?;
 
         // Check if the expressions contain, a potentially different, FederationProvider
-        let exprs_result = self.scan_plan_exprs(plan)?;
+        let exprs_result = self.scan_plan_exprs(plan, providers)?;
 
         // Return early if this is a leaf and there is no ambiguity with the expressions.
         if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
@@ -192,10 +199,10 @@ impl FederationAnalyzerRule {
             return Ok((None, ScanResult::None));
         }
 
-        // Recursively optimize inputs
+        // Recursively analyze inputs
         let input_results = inputs
             .iter()
-            .map(|i| self.optimize_plan_recursively(i, false, _config))
+            .map(|i| self.analyze_plan_recursively(i, false, config, providers))
             .collect::<Result<Vec<_>>>()?;
 
         // Aggregate the input providers
@@ -227,7 +234,7 @@ impl FederationAnalyzerRule {
             };
 
             // If this is the root plan node; federate the entire plan
-            let optimized = analyzer.execute_and_check(plan.clone(), _config, |_, _| {})?;
+            let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
             return Ok((Some(optimized), ScanResult::None));
         }
 
@@ -265,7 +272,7 @@ impl FederationAnalyzerRule {
 
                 // Replace the input with the federated counterpart
                 let wrapped = wrap_projection(original_input)?;
-                let optimized = analyzer.execute_and_check(wrapped, _config, |_, _| {})?;
+                let optimized = analyzer.execute_and_check(wrapped, config, |_, _| {})?;
 
                 Ok(optimized)
             })
@@ -273,7 +280,7 @@ impl FederationAnalyzerRule {
 
         // Optimize expressions if needed
         let new_expressions = if optimize_expressions {
-            self.optimize_plan_exprs(plan, _config)?
+            self.analyze_plan_exprs(plan, config, providers)?
         } else {
             plan.expressions()
         };
@@ -285,35 +292,37 @@ impl FederationAnalyzerRule {
         Ok((Some(new_plan), ScanResult::Ambiguous))
     }
 
-    /// Optimizes all exprs of a plan
-    fn optimize_plan_exprs(
+    /// Analyzes all exprs of a plan
+    fn analyze_plan_exprs(
         &self,
         plan: &LogicalPlan,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
+        providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
     ) -> Result<Vec<Expr>> {
         plan.expressions()
             .iter()
             .map(|expr| {
                 let transformed = expr
                     .clone()
-                    .transform(&|e| self.optimize_expr_recursively(e, _config))?;
+                    .transform(&|e| self.analyze_expr_recursively(e, config, providers))?;
                 Ok(transformed.data)
             })
             .collect::<Result<Vec<_>>>()
     }
 
-    /// recursively optimize expressions
+    /// recursively analyze expressions
     /// Current logic: individually federate every sub-query.
-    fn optimize_expr_recursively(
+    fn analyze_expr_recursively(
         &self,
         expr: Expr,
         _config: &ConfigOptions,
+        providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
     ) -> Result<Transformed<Expr>> {
         match expr {
             Expr::ScalarSubquery(ref subquery) => {
-                // Optimize as root to force federating the sub-query
+                // Analyze as root to force federating the sub-query
                 let (new_subquery, _) =
-                    self.optimize_plan_recursively(&subquery.subquery, true, _config)?;
+                    self.analyze_plan_recursively(&subquery.subquery, true, _config, providers)?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
                 };
@@ -342,13 +351,17 @@ impl FederationAnalyzerRule {
                 )))
             }
             Expr::InSubquery(ref in_subquery) => {
-                let (new_subquery, _) =
-                    self.optimize_plan_recursively(&in_subquery.subquery.subquery, true, _config)?;
+                let (new_subquery, _) = self.analyze_plan_recursively(
+                    &in_subquery.subquery.subquery,
+                    true,
+                    _config,
+                    providers,
+                )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
                 };
 
-                // DecorrelatePredicateSubquery  optimizer rule doesn't support federated node (LogicalPlan::Extension(_)) as subquery
+                // DecorrelatePredicateSubquery optimizer rule doesn't support federated node (LogicalPlan::Extension(_)) as subquery
                 // Wrap a `non-op` Projection LogicalPlan outside the federated node to facilitate DecorrelatePredicateSubquery optimization
                 if matches!(new_subquery, LogicalPlan::Extension(_)) {
                     let all_columns = new_subquery
@@ -399,34 +412,19 @@ impl FederationProvider for NopFederationProvider {
 }
 
 /// Recursively find the [`FederationProvider`] for all [`TableReference`] instances in the plan.
-/// This information is used to resolve the federation provider for [`Expr::OuterReferenceColumn`].
+/// This is used to resolve the federation providers for [`Expr::OuterReferenceColumn`].
 fn get_plan_provider_recursively(
     plan: &LogicalPlan,
-) -> Result<HashMap<TableReference, ScanResult>> {
-    let mut providers: HashMap<TableReference, ScanResult> = HashMap::new();
+) -> Result<HashMap<TableReference, Arc<dyn FederationProvider>>> {
+    let mut providers: HashMap<TableReference, Arc<dyn FederationProvider>> = HashMap::new();
 
-    plan.apply(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
-        // LogicalPlan::SubqueryAlias can also be referred by OuterReferenceColumn
-        // Get the federation provider for TableReference representing LogicalPlan::SubqueryAlias
-        if let LogicalPlan::SubqueryAlias(a) = p {
-            let subquery_alias_providers = get_plan_provider_recursively(&Arc::clone(&a.input))?;
-            let mut provider: ScanResult = ScanResult::None;
-            for (_, i) in subquery_alias_providers {
-                provider.merge(i);
-            }
-            providers.insert(a.alias.clone(), provider);
-        }
-
+    plan.apply_with_subqueries(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
         let (federation_provider, table_reference) = get_leaf_provider(p)?;
-        if let Some(table_reference) = table_reference {
-            providers.insert(table_reference, federation_provider.into());
+        if let (Some(federation_provider), Some(table_reference)) =
+            (federation_provider, table_reference)
+        {
+            providers.insert(table_reference, federation_provider);
         }
-
-        let _ = p.apply_subqueries(|sub_query| {
-            let subquery_providers = get_plan_provider_recursively(sub_query)?;
-            providers.extend(subquery_providers);
-            Ok(TreeNodeRecursion::Continue)
-        });
 
         Ok(TreeNodeRecursion::Continue)
     })?;
