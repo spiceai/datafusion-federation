@@ -1,14 +1,14 @@
 mod analyzer;
 pub mod ast_analyzer;
 mod executor;
-mod rewrite;
 mod schema;
 mod table;
 mod table_reference;
 
 use std::{any::Any, fmt, sync::Arc, vec};
 
-use analyzer::RewriteTableScanAnalyzer;
+use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
+use ast_analyzer::{AstAnalyzer, RewriteMultiTableReference};
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
@@ -27,7 +27,7 @@ use datafusion::{
     sql::{sqlparser::ast::Statement, unparser::Unparser},
 };
 
-pub use executor::{AstAnalyzer, LogicalOptimizer, SQLExecutor, SQLExecutorRef};
+pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTableSource};
 pub use table_reference::RemoteTableRef;
@@ -166,42 +166,16 @@ impl VirtualExecutionPlan {
         Arc::new(Schema::from(df_schema))
     }
 
-    // TODO merge
-    // fn sql(&self) -> Result<String> {
-    //     // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
-    //     let mut known_rewrites = HashMap::new();
-    //     let subquery_uses_partial_path = self.executor.subquery_use_partial_path();
-    //     let rewritten_plan = rewrite::plan::rewrite_table_scans(
-    //         &self.plan,
-    //         &mut known_rewrites,
-    //         subquery_uses_partial_path,
-    //         &mut None,
-    //     )?;
-    //     let mut ast = self.plan_to_statement(&rewritten_plan)?;
-
-    //     // If there are any MultiPartTableReference, rewrite the AST to use the original table names.
-    //     let multi_table_reference_rewrites = known_rewrites
-    //         .into_iter()
-    //         .filter_map(|(table_ref, rewrite)| match rewrite {
-    //             MultiPartTableReference::Multi(rewrite) => Some((table_ref, rewrite)),
-    //             _ => None,
-    //         })
-    //         .collect::<HashMap<TableReference, MultiTableReference>>();
-    //     if !multi_table_reference_rewrites.is_empty() {
-    //         rewrite::ast::rewrite_multi_part_statement(&mut ast, &multi_table_reference_rewrites);
-    //     }
-
-    //     Ok(format!("{ast}"))
-    // }
-
     fn final_sql(&self) -> Result<String> {
         let plan = self.plan.clone();
-        let plan = RewriteTableScanAnalyzer::rewrite(plan)?;
+        let known_rewrites = collect_known_rewrites(&plan)?;
+        let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
         let (logical_optimizers, ast_analyzers) = gather_analyzers(&plan)?;
         let plan = apply_logical_optimizers(plan, logical_optimizers)?;
         let ast = self.plan_to_statement(&plan)?;
         let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
-        let ast = apply_ast_analyzers(ast, ast_analyzers)?;
+        let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
+        RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
         Ok(ast.to_string())
     }
 
@@ -210,7 +184,7 @@ impl VirtualExecutionPlan {
         ast: Statement,
     ) -> Result<Statement, datafusion::error::DataFusionError> {
         if let Some(mut analyzer) = self.executor.ast_analyzer() {
-            Ok(analyzer(ast)?)
+            Ok(analyzer.analyze(ast)?)
         } else {
             Ok(ast)
         }
@@ -265,7 +239,7 @@ fn apply_logical_optimizers(
 
 fn apply_ast_analyzers(mut statement: Statement, analyzers: Vec<AstAnalyzer>) -> Result<Statement> {
     for mut analyzer in analyzers {
-        statement = analyzer(statement)?;
+        statement = analyzer.analyze(statement)?;
     }
     Ok(statement)
 }

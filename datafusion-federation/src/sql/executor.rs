@@ -1,16 +1,15 @@
 use async_trait::async_trait;
 use core::fmt;
 use datafusion::{
-    arrow::datatypes::SchemaRef,
-    error::Result,
-    logical_expr::LogicalPlan,
-    physical_plan::SendableRecordBatchStream,
-    sql::{sqlparser::ast, unparser::dialect::Dialect},
+    arrow::datatypes::SchemaRef, error::Result, logical_expr::LogicalPlan,
+    physical_plan::SendableRecordBatchStream, sql::unparser::dialect::Dialect,
 };
 use std::sync::Arc;
 
+use super::ast_analyzer::AstAnalyzer;
+
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
-pub type AstAnalyzer = Box<dyn FnMut(ast::Statement) -> Result<ast::Statement>>;
+
 pub type LogicalOptimizer = Box<dyn FnMut(LogicalPlan) -> Result<LogicalPlan>>;
 
 #[async_trait]

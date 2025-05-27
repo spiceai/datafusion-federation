@@ -1,9 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::{
     common::{
-        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
-        Column, RecursionUnnestOption, UnnestOptions,
+        tree_node::{Transformed, TreeNode},
+        Column, HashMap, RecursionUnnestOption, UnnestOptions,
     },
     error::DataFusionError,
     logical_expr::{
@@ -16,7 +16,7 @@ use datafusion::{
 
 use crate::get_table_source;
 
-use super::{table_reference::MultiPartTableReference, SQLTableSource};
+use crate::sql::{table_reference::MultiPartTableReference, SQLTableSource};
 
 type Result<T> = std::result::Result<T, datafusion::error::DataFusionError>;
 
@@ -25,87 +25,62 @@ type Result<T> = std::result::Result<T, datafusion::error::DataFusionError>;
 pub struct RewriteTableScanAnalyzer;
 
 impl RewriteTableScanAnalyzer {
-    pub fn rewrite(plan: LogicalPlan) -> Result<LogicalPlan> {
-        let known_rewrites = &mut HashMap::new();
+    pub fn rewrite(
+        plan: LogicalPlan,
+        known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
+    ) -> Result<LogicalPlan> {
+        // In f_down, rewrite the table scans in all LogicalPlan nodes (including subqueries).
+        let rewrite_table_scans = |plan: LogicalPlan| {
+            match plan {
+                LogicalPlan::TableScan(mut table_scan) => {
+                    let Some(federated_source) = get_table_source(&table_scan.source)? else {
+                        // Not a federated source
+                        return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
+                    };
 
-        // Collect the known rewrites first - subqueries can reference tables before we discover them in the main rewrite pass.
-        plan.apply_with_subqueries(|plan| {
-            if let LogicalPlan::TableScan(table_scan) = plan {
-                let original_table_name = table_scan.table_name.clone();
-                if let Some(federated_source) = get_table_source(&table_scan.source)? {
-                    if let Some(sql_table_source) =
+                    let Some(sql_table_source) =
                         federated_source.as_any().downcast_ref::<SQLTableSource>()
-                    {
-                        known_rewrites
-                            .insert(original_table_name, sql_table_source.table_reference());
-                    }
+                    else {
+                        // Not a SQLTableSource (is this possible?)
+                        return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
+                    };
+
+                    let MultiPartTableReference::TableReference(remote_table_name) =
+                        sql_table_source.table_reference()
+                    else {
+                        // If the remote table name is a MultiPartTableReference we will not rewrite it here, but rewrite it after the final unparsing on the AST directly.
+                        return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
+                    };
+
+                    // Rewrite the schema of this node to have the remote table as the qualifier.
+                    let new_schema = Arc::unwrap_or_clone(table_scan.projected_schema)
+                        .replace_qualifier(remote_table_name.clone());
+                    table_scan.projected_schema = Arc::new(new_schema);
+                    table_scan.table_name = remote_table_name.clone();
+
+                    Ok(Transformed::yes(LogicalPlan::TableScan(table_scan)))
                 }
+                _ => Ok(Transformed::no(plan)),
             }
-
-            Ok(TreeNodeRecursion::Continue)
-        });
-
-        rewrite_table_scans(plan, known_rewrites)
-    }
-}
-
-fn rewrite_table_scans(
-    plan: LogicalPlan,
-    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
-) -> Result<LogicalPlan> {
-    // In f_down, rewrite the table scans in all LogicalPlan nodes (including subqueries).
-    let rewrite_table_scans = |plan: LogicalPlan| {
-        match plan {
-            LogicalPlan::TableScan(mut table_scan) => {
-                let Some(federated_source) = get_table_source(&table_scan.source)? else {
-                    // Not a federated source
-                    return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
-                };
-
-                let Some(sql_table_source) =
-                    federated_source.as_any().downcast_ref::<SQLTableSource>()
-                else {
-                    // Not a SQLTableSource (is this possible?)
-                    return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
-                };
-
-                let MultiPartTableReference::TableReference(remote_table_name) =
-                    sql_table_source.table_reference()
-                else {
-                    // If the remote table name is a MultiPartTableReference we will not rewrite it here, but rewrite it after the final unparsing on the AST directly.
-                    return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
-                };
-
-                // Rewrite the schema of this node to have the remote table as the qualifier.
-                let new_schema = Arc::unwrap_or_clone(table_scan.projected_schema)
-                    .replace_qualifier(remote_table_name.clone());
-                table_scan.projected_schema = Arc::new(new_schema);
-                table_scan.table_name = remote_table_name.clone();
-
-                Ok(Transformed::yes(LogicalPlan::TableScan(table_scan)))
-            }
-            _ => return Ok(Transformed::no(plan)),
-        }
-    };
-
-    // In f_up, rewrite the column names in the expressions.
-    let rewrite_column_names_in_expressions = |plan: LogicalPlan| {
-        let plan = match plan {
-            LogicalPlan::Unnest(unnest) => rewrite_unnest_plan(unnest, known_rewrites)?,
-            _ => plan,
         };
 
-        plan.map_expressions(|expr| {
-            expr.transform_up(|expr| {
-                #[expect(deprecated)]
-                match expr {
-                    Expr::Column(col) => {
-                        rewrite_column(col, known_rewrites).map(|t| t.update_data(Expr::Column))
-                    }
-                    Expr::Alias(alias) => {
-                        match &alias.relation {
+        // In f_up, rewrite the column names in the expressions.
+        let rewrite_column_names_in_expressions = |plan: LogicalPlan| {
+            let plan = match plan {
+                LogicalPlan::Unnest(unnest) => rewrite_unnest_plan(unnest, known_rewrites)?,
+                _ => plan,
+            };
+
+            plan.map_expressions(|expr| {
+                expr.transform_up(|expr| {
+                    #[expect(deprecated)]
+                    match expr {
+                        Expr::Column(col) => {
+                            rewrite_column(col, known_rewrites).map(|t| t.update_data(Expr::Column))
+                        }
+                        Expr::Alias(alias) => match &alias.relation {
                             Some(relation) => {
-                                let Some(rewrite) = known_rewrites.get(&relation).and_then(
+                                let Some(rewrite) = known_rewrites.get(relation).and_then(
                                     |rewrite| match rewrite {
                                         MultiPartTableReference::TableReference(rewrite) => {
                                             Some(rewrite)
@@ -123,86 +98,91 @@ fn rewrite_table_scans(
                                 ))))
                             }
                             None => Ok(Transformed::no(Expr::Alias(alias))),
+                        },
+                        Expr::Wildcard { qualifier, options } => {
+                            if let Some(rewrite) = qualifier
+                                .as_ref()
+                                .and_then(|q| known_rewrites.get(q))
+                                .and_then(|rewrite| match rewrite {
+                                    MultiPartTableReference::TableReference(rewrite) => {
+                                        Some(rewrite)
+                                    }
+                                    _ => None,
+                                })
+                            {
+                                Ok(Transformed::yes(Expr::Wildcard {
+                                    qualifier: Some(rewrite.clone()),
+                                    options,
+                                }))
+                            } else {
+                                Ok(Transformed::no(Expr::Wildcard { qualifier, options }))
+                            }
                         }
-                    }
-                    Expr::Wildcard { qualifier, options } => {
-                        if let Some(rewrite) = qualifier
-                            .as_ref()
-                            .and_then(|q| known_rewrites.get(q))
-                            .and_then(|rewrite| match rewrite {
-                                MultiPartTableReference::TableReference(rewrite) => Some(rewrite),
-                                _ => None,
-                            })
-                        {
-                            Ok(Transformed::yes(Expr::Wildcard {
-                                qualifier: Some(rewrite.clone()),
-                                options,
-                            }))
-                        } else {
-                            Ok(Transformed::no(Expr::Wildcard { qualifier, options }))
-                        }
-                    }
-                    // We can't match directly on the outer ref columns until https://github.com/apache/datafusion/issues/16147 is fixed.
-                    Expr::ScalarSubquery(Subquery {
-                        outer_ref_columns,
-                        subquery,
-                    }) => {
-                        let outer_ref_columns =
-                            rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
-
-                        Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
+                        // We can't match directly on the outer ref columns until https://github.com/apache/datafusion/issues/16147 is fixed.
+                        Expr::ScalarSubquery(Subquery {
                             outer_ref_columns,
                             subquery,
-                        })))
-                    }
-                    Expr::Exists(Exists {
-                        subquery:
-                            Subquery {
-                                subquery,
-                                outer_ref_columns,
-                            },
-                        negated,
-                    }) => {
-                        let outer_ref_columns =
-                            rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
+                        }) => {
+                            let outer_ref_columns =
+                                rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
 
-                        Ok(Transformed::yes(Expr::Exists(Exists {
-                            subquery: Subquery {
+                            Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
                                 outer_ref_columns,
                                 subquery,
-                            },
+                            })))
+                        }
+                        Expr::Exists(Exists {
+                            subquery:
+                                Subquery {
+                                    subquery,
+                                    outer_ref_columns,
+                                },
                             negated,
-                        })))
-                    }
-                    Expr::InSubquery(InSubquery {
-                        subquery:
-                            Subquery {
-                                outer_ref_columns,
-                                subquery,
-                            },
-                        expr,
-                        negated,
-                    }) => {
-                        let outer_ref_columns =
-                            rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
+                        }) => {
+                            let outer_ref_columns =
+                                rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
 
-                        Ok(Transformed::yes(Expr::InSubquery(InSubquery {
+                            Ok(Transformed::yes(Expr::Exists(Exists {
+                                subquery: Subquery {
+                                    outer_ref_columns,
+                                    subquery,
+                                },
+                                negated,
+                            })))
+                        }
+                        Expr::InSubquery(InSubquery {
+                            subquery:
+                                Subquery {
+                                    outer_ref_columns,
+                                    subquery,
+                                },
                             expr,
-                            subquery: Subquery {
-                                outer_ref_columns,
-                                subquery,
-                            },
                             negated,
-                        })))
-                    }
-                    _ => Ok(Transformed::no(expr)),
-                }
-            })
-        })
-    };
+                        }) => {
+                            let outer_ref_columns =
+                                rewrite_outer_reference_columns(outer_ref_columns, known_rewrites)?;
 
-    plan.transform_down_up_with_subqueries(rewrite_table_scans, rewrite_column_names_in_expressions)
+                            Ok(Transformed::yes(Expr::InSubquery(InSubquery {
+                                expr,
+                                subquery: Subquery {
+                                    outer_ref_columns,
+                                    subquery,
+                                },
+                                negated,
+                            })))
+                        }
+                        _ => Ok(Transformed::no(expr)),
+                    }
+                })
+            })
+        };
+
+        plan.transform_down_up_with_subqueries(
+            rewrite_table_scans,
+            rewrite_column_names_in_expressions,
+        )
         .map(|t| t.data)
+    }
 }
 
 fn rewrite_outer_reference_columns(
@@ -232,7 +212,7 @@ fn rewrite_column(
     if let Some(rewrite) = col
         .relation
         .as_ref()
-        .and_then(|r| known_rewrites.get(&r))
+        .and_then(|r| known_rewrites.get(r))
         .and_then(|rewrite| match rewrite {
             MultiPartTableReference::TableReference(rewrite) => Some(rewrite),
             _ => None,
@@ -446,6 +426,7 @@ pub fn rewrite_column_name_in_expr(
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::analyzer::collect_known_rewrites;
     use crate::sql::table::SQLTable;
     use crate::sql::table_reference::MultiPartTableReference;
     use crate::sql::{RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource};
@@ -574,7 +555,8 @@ mod tests {
             ])?
             .build()?;
 
-        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(plan)?;
+        let known_rewrites = collect_known_rewrites(&plan)?;
+        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
 
         println!("rewritten_plan: \n{:#?}", rewritten_plan);
         let unparsed_sql = plan_to_sql(&rewritten_plan)?;
@@ -721,7 +703,9 @@ mod tests {
 
         println!("before optimization: \n{:#?}", data_frame.logical_plan());
 
-        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(data_frame.logical_plan().clone())?;
+        let plan = data_frame.logical_plan().clone();
+        let known_rewrites = collect_known_rewrites(&plan)?;
+        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
 
         println!("rewritten_plan: \n{:#?}", rewritten_plan);
 

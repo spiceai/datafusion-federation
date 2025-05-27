@@ -15,12 +15,17 @@ use datafusion::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultiTableReference {
-    pub parts: Vec<Arc<str>>,
+    parts: Vec<Arc<str>>,
 }
 
 impl MultiTableReference {
     pub fn new(parts: Vec<Arc<str>>) -> Self {
+        assert!(parts.len() > 3, "Use TableReference, not MultiTableReference, for table references with less than 3 parts.");
         Self { parts }
+    }
+
+    pub fn parts(&self) -> &Vec<Arc<str>> {
+        &self.parts
     }
 }
 

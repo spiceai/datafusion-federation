@@ -95,14 +95,20 @@ impl SQLTable for RemoteTable {
         None
     }
 
-    /// Returns ast analyzer that modifies table that contains functional args after table ident
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
+        let mut rules = vec![];
+
+        // Returns ast analyzer that modifies table that contains functional args after table ident
         if let Some(args) = self.remote_table_ref.args() {
-            Some(
+            rules.push(
                 ast_analyzer::TableArgReplace::default()
                     .with(self.remote_table_ref.table_ref().clone(), args.to_vec())
-                    .into_analyzer(),
-            )
+                    .into_analyzer_rule(),
+            );
+        }
+
+        if !rules.is_empty() {
+            Some(AstAnalyzer::new(rules))
         } else {
             None
         }
