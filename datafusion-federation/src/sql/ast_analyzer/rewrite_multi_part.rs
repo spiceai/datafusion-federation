@@ -41,7 +41,7 @@ impl RewriteMultiTableReference {
             known_rewrites: known_rewrites_multi,
         };
 
-        VisitMut::visit(statement, &mut visitor);
+        let _ = VisitMut::visit(statement, &mut visitor);
     }
 }
 
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_alias_table() {
-        tracing_subscriber::fmt::init();
+        let _ = tracing_subscriber::fmt::try_init();
         let mut stmt = parse_sql("SELECT * FROM test_table as t1");
         let rewrites = create_test_rewrites();
 

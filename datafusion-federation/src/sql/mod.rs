@@ -295,6 +295,14 @@ impl DisplayAs for VirtualExecutionPlan {
             write!(f, " rewritten_ast_analyzer={statement}")?;
         }
 
+        let final_sql = match self.final_sql() {
+            Ok(sql) => sql,
+            _ => return Ok(()),
+        };
+        if old_statement.to_string() != final_sql {
+            write!(f, " rewritten_sql={final_sql}")?;
+        }
+
         Ok(())
     }
 }

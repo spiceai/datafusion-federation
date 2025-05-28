@@ -162,6 +162,18 @@ impl From<&RemoteTableRef> for MultiPartTableReference {
     }
 }
 
+impl From<TableReference> for MultiPartTableReference {
+    fn from(table_ref: TableReference) -> Self {
+        MultiPartTableReference::TableReference(table_ref)
+    }
+}
+
+impl From<&TableReference> for MultiPartTableReference {
+    fn from(table_ref: &TableReference) -> Self {
+        MultiPartTableReference::TableReference(table_ref.clone())
+    }
+}
+
 /// A multipart identifier to a remote table, view or parameterized view.
 ///
 /// RemoteTableRef can be created by parsing from a string representing a table object with optional

@@ -10,7 +10,7 @@ use super::AstAnalyzerRule;
 
 pub fn replace_table_args_analyzer_rule(mut visitor: TableArgReplace) -> AstAnalyzerRule {
     let x = move |mut statement: Statement| {
-        VisitMut::visit(&mut statement, &mut visitor);
+        let _ = VisitMut::visit(&mut statement, &mut visitor);
         Ok(statement)
     };
     Box::new(x)
@@ -24,9 +24,9 @@ pub fn replace_table_args_analyzer_rule(mut visitor: TableArgReplace) -> AstAnal
 /// use datafusion_federation::sql::ast_analyzer::TableArgReplace;
 ///
 /// let mut analyzer = TableArgReplace::default().with(
-///     TableReference::parse_str("table1"),
+///     TableReference::parse_str("table1").into(),
 ///     vec![FunctionArg::Unnamed(
-///         Expr::value(
+///         Expr::Value(
 ///             Value::Number("1".to_string(), false),
 ///         )
 ///         .into(),
