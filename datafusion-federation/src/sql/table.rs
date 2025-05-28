@@ -125,8 +125,9 @@ impl SQLTableSource {
     // creates a SQLTableSource and infers the table schema
     pub async fn new(
         provider: Arc<SQLFederationProvider>,
-        table_ref: RemoteTableRef,
+        table_ref: impl Into<RemoteTableRef>,
     ) -> Result<Self> {
+        let table_ref = table_ref.into();
         let table_name = table_ref.to_quoted_string();
         let schema = provider.executor.get_table_schema(&table_name).await?;
         Ok(Self::new_with_schema(provider, table_ref, schema))
@@ -135,12 +136,12 @@ impl SQLTableSource {
     /// Create a SQLTableSource with a table reference and schema
     pub fn new_with_schema(
         provider: Arc<SQLFederationProvider>,
-        table_ref: RemoteTableRef,
+        table_ref: impl Into<RemoteTableRef>,
         schema: SchemaRef,
     ) -> Self {
         Self {
             provider,
-            table: Arc::new(RemoteTable::new(table_ref, schema)),
+            table: Arc::new(RemoteTable::new(table_ref.into(), schema)),
         }
     }
 
