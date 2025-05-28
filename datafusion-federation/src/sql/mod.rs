@@ -31,7 +31,7 @@ use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
 pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
-pub use table::{RemoteTable, SQLTableSource};
+pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
 
 use crate::{
