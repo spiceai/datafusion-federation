@@ -290,6 +290,15 @@ impl TryFrom<&MultiPartTableReference> for TableReference {
     }
 }
 
+impl From<MultiPartTableReference> for RemoteTableRef {
+    fn from(value: MultiPartTableReference) -> Self {
+        RemoteTableRef {
+            table_ref: value,
+            args: None,
+        }
+    }
+}
+
 impl From<(TableReference, Vec<FunctionArg>)> for RemoteTableRef {
     fn from((table_ref, args): (TableReference, Vec<FunctionArg>)) -> Self {
         RemoteTableRef {
