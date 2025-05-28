@@ -32,7 +32,7 @@ use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTableSource};
-pub use table_reference::RemoteTableRef;
+pub use table_reference::{MultiPartTableReference, RemoteTableRef};
 
 use crate::{
     get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerRule, FederationPlanner,
