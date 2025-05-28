@@ -409,6 +409,7 @@ impl FederationAnalyzerRule {
 
 /// NopFederationProvider is used to represent tables that are not federated, but
 /// are resolved by DataFusion. This simplifies the logic of the optimizer rule.
+#[derive(Debug)]
 struct NopFederationProvider {}
 
 impl FederationProvider for NopFederationProvider {

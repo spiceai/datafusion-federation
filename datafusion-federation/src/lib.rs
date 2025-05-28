@@ -54,7 +54,7 @@ pub fn default_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
 
 pub type FederationProviderRef = Arc<dyn FederationProvider>;
 
-pub trait FederationProvider: Send + Sync {
+pub trait FederationProvider: Send + Sync + std::fmt::Debug {
     // Returns the name of the provider, used for comparison.
     fn name(&self) -> &str;
 

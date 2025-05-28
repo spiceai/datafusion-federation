@@ -117,7 +117,7 @@ impl SQLTable for RemoteTable {
 
 #[derive(Debug, Clone)]
 pub struct SQLTableSource {
-    pub provider: Arc<SQLFederationProvider>,
+    pub provider: Arc<dyn FederationProvider>,
     pub table: Arc<dyn SQLTable>,
 }
 
@@ -135,7 +135,7 @@ impl SQLTableSource {
 
     /// Create a SQLTableSource with a table reference and schema
     pub fn new_with_schema(
-        provider: Arc<SQLFederationProvider>,
+        provider: Arc<dyn FederationProvider>,
         table_ref: impl Into<RemoteTableRef>,
         schema: SchemaRef,
     ) -> Self {
@@ -146,7 +146,7 @@ impl SQLTableSource {
     }
 
     /// Create new with a custom SQLtable instance.
-    pub fn new_with_table(provider: Arc<SQLFederationProvider>, table: Arc<dyn SQLTable>) -> Self {
+    pub fn new_with_table(provider: Arc<dyn FederationProvider>, table: Arc<dyn SQLTable>) -> Self {
         Self { provider, table }
     }
 
@@ -172,6 +172,6 @@ impl TableSource for SQLTableSource {
 
 impl FederatedTableSource for SQLTableSource {
     fn federation_provider(&self) -> Arc<dyn FederationProvider> {
-        Arc::clone(&self.provider) as Arc<dyn FederationProvider>
+        Arc::clone(&self.provider)
     }
 }
