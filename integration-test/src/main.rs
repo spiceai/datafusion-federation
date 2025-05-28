@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::sql::TableReference;
-use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+use datafusion_federation::{sql::federation_analyzer_rule, FederatedQueryPlanner};
 use datafusion_table_providers::{
     duckdb::DuckDBTableFactory, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
@@ -29,7 +29,7 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
         Arc::new(InlineTableScan::new()),
         Arc::new(ExpandWildcardRule::new()),
-        Arc::new(FederationAnalyzerRule::new()),
+        Arc::new(federation_analyzer_rule()),
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
     ]

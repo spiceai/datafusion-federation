@@ -1,6 +1,7 @@
 mod analyzer;
 pub mod ast_analyzer;
 mod executor;
+pub mod optimizer;
 mod schema;
 mod table;
 mod table_reference;
@@ -17,7 +18,7 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
     logical_expr::{Extension, LogicalPlan},
-    optimizer::{Analyzer, AnalyzerRule},
+    optimizer::{eliminate_nested_union::EliminateNestedUnion, Analyzer, AnalyzerRule, Optimizer},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
@@ -26,6 +27,7 @@ use datafusion::{
     },
     sql::{sqlparser::ast::Statement, unparser::Unparser},
 };
+use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
 pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
@@ -33,8 +35,18 @@ pub use table::{RemoteTable, SQLTableSource};
 pub use table_reference::RemoteTableRef;
 
 use crate::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerRule, FederationPlanner,
+    FederationProvider,
 };
+
+/// Returns a federation analyzer rule that is optimized for SQL federation.
+pub fn federation_analyzer_rule() -> FederationAnalyzerRule {
+    FederationAnalyzerRule::new().with_optimizer(Optimizer::with_rules(vec![
+        Arc::new(EliminateNestedUnion::new()),
+        Arc::new(PushDownFilterFederation::new()),
+        Arc::new(OptimizeProjectionsFederation::new()),
+    ]))
+}
 
 // SQLFederationProvider provides federation to SQL DMBSs.
 #[derive(Debug)]

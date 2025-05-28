@@ -45,16 +45,16 @@ type Result<T, E = DataFusionError> = result::Result<T, E>;
 mod required_indices;
 
 #[derive(Default, Debug)]
-pub struct OptimizeProjections {}
+pub struct OptimizeProjectionsFederation {}
 
-impl OptimizeProjections {
+impl OptimizeProjectionsFederation {
     #[must_use]
     pub fn new() -> Self {
         Self {}
     }
 }
 
-impl OptimizerRule for OptimizeProjections {
+impl OptimizerRule for OptimizeProjectionsFederation {
     fn name(&self) -> &str {
         "federation_optimize_projections"
     }
@@ -947,7 +947,11 @@ mod tests {
     fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
 
     fn assert_optimized_plan_equal(plan: LogicalPlan, expected: &str) -> Result<()> {
-        assert_optimized_plan_eq(Arc::new(super::OptimizeProjections::new()), plan, expected)
+        assert_optimized_plan_eq(
+            Arc::new(super::OptimizeProjectionsFederation::new()),
+            plan,
+            expected,
+        )
     }
 
     pub fn assert_optimized_plan_eq(
@@ -967,7 +971,8 @@ mod tests {
     }
 
     fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
-        let optimizer = Optimizer::with_rules(vec![Arc::new(super::OptimizeProjections::new())]);
+        let optimizer =
+            Optimizer::with_rules(vec![Arc::new(super::OptimizeProjectionsFederation::new())]);
         let optimized_plan = optimizer.optimize(plan, &OptimizerContext::new(), observe)?;
         Ok(optimized_plan)
     }

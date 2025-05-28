@@ -5,7 +5,7 @@ use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProvi
 use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
 use datafusion::optimizer::eliminate_nested_union::EliminateNestedUnion;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
-use datafusion::optimizer::{Optimizer, OptimizerContext};
+use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
@@ -18,10 +18,6 @@ use datafusion::{
 use scan_result::ScanResult;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-pub use optimize_projections::OptimizeProjections;
-
-mod optimize_projections;
 
 /// An analyzer rule to identifying sub-plans to federate
 ///
@@ -65,11 +61,7 @@ impl AnalyzerRule for FederationAnalyzerRule {
 impl Default for FederationAnalyzerRule {
     fn default() -> Self {
         Self {
-            optimizer: Optimizer::with_rules(vec![
-                Arc::new(EliminateNestedUnion::new()),
-                Arc::new(PushDownFilter::new()),
-                Arc::new(OptimizeProjections::new()),
-            ]),
+            optimizer: Optimizer::with_rules(Self::default_optimizer_rules()),
         }
     }
 }
@@ -77,6 +69,13 @@ impl Default for FederationAnalyzerRule {
 impl FederationAnalyzerRule {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn default_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        vec![
+            Arc::new(EliminateNestedUnion::new()),
+            Arc::new(PushDownFilter::new()),
+        ]
     }
 
     /// Override the default optimizer with custom rules
