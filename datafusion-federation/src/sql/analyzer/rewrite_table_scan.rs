@@ -7,9 +7,10 @@ use datafusion::{
     },
     error::DataFusionError,
     logical_expr::{
-        self,
+        self, build_join_schema,
         expr::{Alias, Exists, InSubquery},
-        Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
+        Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
+        SubqueryAlias, Union, Window,
     },
     sql::TableReference,
 };
@@ -184,22 +185,44 @@ impl RewriteTableScanAnalyzer {
                     })
                 })?;
 
+                // Recalculate the schemas now that all of the inner expressions have been rewritten.
                 plan.map_data(|plan| match plan {
-                    LogicalPlan::Aggregate(aggr) => {
-                        // Recalculate the aggregate schema now that all of the inner expressions have been rewritten.
-                        Ok(LogicalPlan::Aggregate(Aggregate::try_new(
-                            aggr.input,
-                            aggr.group_expr,
-                            aggr.aggr_expr,
-                        )?))
+                    LogicalPlan::Aggregate(aggr) => Ok(LogicalPlan::Aggregate(Aggregate::try_new(
+                        aggr.input,
+                        aggr.group_expr,
+                        aggr.aggr_expr,
+                    )?)),
+                    LogicalPlan::Window(window) => Ok(LogicalPlan::Window(Window::try_new(
+                        window.window_expr,
+                        window.input,
+                    )?)),
+                    LogicalPlan::Projection(projection) => Ok(LogicalPlan::Projection(
+                        Projection::try_new(projection.expr, projection.input)?,
+                    )),
+                    LogicalPlan::Join(join) => {
+                        let join_schema = build_join_schema(
+                            join.left.schema(),
+                            join.right.schema(),
+                            &join.join_type,
+                        )?;
+
+                        Ok(LogicalPlan::Join(Join {
+                            left: join.left,
+                            right: join.right,
+                            on: join.on,
+                            filter: join.filter,
+                            join_type: join.join_type,
+                            join_constraint: join.join_constraint,
+                            schema: Arc::new(join_schema),
+                            null_equals_null: join.null_equals_null,
+                        }))
                     }
-                    LogicalPlan::Projection(projection) => {
-                        // Recalculate the projection schema now that all of the inner expressions have been rewritten.
-                        Ok(LogicalPlan::Projection(Projection::try_new(
-                            projection.expr,
-                            projection.input,
-                        )?))
-                    }
+                    LogicalPlan::SubqueryAlias(subquery_alias) => Ok(LogicalPlan::SubqueryAlias(
+                        SubqueryAlias::try_new(subquery_alias.input, subquery_alias.alias)?,
+                    )),
+                    LogicalPlan::Union(union) => Ok(LogicalPlan::Union(
+                        Union::try_new_with_loose_types(union.inputs)?,
+                    )),
                     plan => Ok(plan),
                 })
             };
