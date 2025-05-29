@@ -18,7 +18,6 @@ use datafusion::{
     execution::{context::SessionContext, session_state::SessionStateBuilder},
     optimizer::{
         analyzer::{
-            expand_wildcard_rule::ExpandWildcardRule, inline_table_scan::InlineTableScan,
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
         AnalyzerRule,
@@ -27,8 +26,6 @@ use datafusion::{
 
 pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
-        Arc::new(InlineTableScan::new()),
-        Arc::new(ExpandWildcardRule::new()),
         Arc::new(federation_analyzer_rule()),
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),

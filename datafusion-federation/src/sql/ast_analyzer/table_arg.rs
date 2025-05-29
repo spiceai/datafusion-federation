@@ -27,7 +27,7 @@ pub fn replace_table_args_analyzer_rule(mut visitor: TableArgReplace) -> AstAnal
 ///     TableReference::parse_str("table1").into(),
 ///     vec![FunctionArg::Unnamed(
 ///         Expr::Value(
-///             Value::Number("1".to_string(), false),
+///             Value::Number("1".to_string(), false).into(),
 ///         )
 ///         .into(),
 ///     )],
