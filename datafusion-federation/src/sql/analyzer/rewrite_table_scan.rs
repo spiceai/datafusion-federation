@@ -193,6 +193,13 @@ impl RewriteTableScanAnalyzer {
                             aggr.aggr_expr,
                         )?))
                     }
+                    LogicalPlan::Projection(projection) => {
+                        // Recalculate the projection schema now that all of the inner expressions have been rewritten.
+                        Ok(LogicalPlan::Projection(Projection::try_new(
+                            projection.expr,
+                            projection.input,
+                        )?))
+                    }
                     plan => Ok(plan),
                 })
             };
