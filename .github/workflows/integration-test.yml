@@ -1,7 +1,6 @@
 name: Integration Tests
 
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       update_snapshots:
@@ -25,25 +24,6 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install DuckDB CLI
-        run: |
-          wget https://github.com/duckdb/duckdb/releases/download/v0.10.0/duckdb_cli-linux-amd64.zip
-          unzip duckdb_cli-linux-amd64.zip
-          chmod +x duckdb
-          sudo mv duckdb /usr/local/bin/
-
-      - name: Generate TPC-H test database
-        run: |
-          duckdb tpch_sf1.db <<EOF
-          INSTALL tpch;
-          LOAD tpch;
-          CALL dbgen(sf=1);
-          .exit
-          EOF
-
-          # Verify the database was created properly
-          ls -la tpch_sf1.db
 
       - name: Run integration tests
         env:

@@ -1,45 +1,52 @@
 use async_trait::async_trait;
 use core::fmt;
 use datafusion::{
-    arrow::datatypes::SchemaRef, error::Result, physical_plan::SendableRecordBatchStream,
-    sql::sqlparser::ast, sql::unparser::dialect::Dialect,
+    arrow::datatypes::SchemaRef, error::Result, logical_expr::LogicalPlan,
+    physical_plan::SendableRecordBatchStream, sql::unparser::dialect::Dialect,
 };
 use std::sync::Arc;
 
+use super::ast_analyzer::AstAnalyzer;
+
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
-pub type AstAnalyzer = Box<dyn Fn(ast::Statement) -> Result<ast::Statement>>;
+
+pub type LogicalOptimizer = Box<dyn FnMut(LogicalPlan) -> Result<LogicalPlan>>;
 
 #[async_trait]
 pub trait SQLExecutor: Sync + Send {
-    // Context
     /// Executor name
     fn name(&self) -> &str;
+
     /// Executor compute context allows differentiating the remote compute context
     /// such as authorization or active database.
+    ///
+    /// Note: returning None here may cause incorrect federation with other providers of the
+    /// same name that also have a compute_context of None.
+    /// Instead try to return a unique string that will never match any other
+    /// provider's context.
     fn compute_context(&self) -> Option<String>;
 
-    // The specific SQL dialect (currently supports 'sqlite', 'postgres', 'flight')
+    /// The specific SQL dialect (currently supports 'sqlite', 'postgres', 'flight')
     fn dialect(&self) -> Arc<dyn Dialect>;
+
+    /// Returns the analyzer rule specific for this engine to modify the logical plan before execution
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        None
+    }
 
     /// Returns an AST analyzer specific for this engine to modify the AST before execution
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
         None
     }
 
-    // Execution
     /// Execute a SQL query
     fn execute(&self, query: &str, schema: SchemaRef) -> Result<SendableRecordBatchStream>;
 
-    // Schema inference
     /// Returns the tables provided by the remote
     async fn table_names(&self) -> Result<Vec<String>>;
-    /// Returns the schema of table_name within this SQLExecutor
-    async fn get_table_schema(&self, table_name: &str) -> Result<SchemaRef>;
 
-    /// Returns whether the executor requires partial table path in subquery
-    fn subquery_use_partial_path(&self) -> bool {
-        false
-    }
+    /// Returns the schema of table_name within this [`SQLExecutor`]
+    async fn get_table_schema(&self, table_name: &str) -> Result<SchemaRef>;
 }
 
 impl fmt::Debug for dyn SQLExecutor {

@@ -3,22 +3,21 @@ mod validation;
 
 use anyhow::{anyhow, Result};
 use bench::{Benchmark, Query};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::sql::TableReference;
-use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+use datafusion_federation::{sql::federation_analyzer_rule, FederatedQueryPlanner};
 use datafusion_table_providers::{
     duckdb::DuckDBTableFactory, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use duckdb::AccessMode;
+use duckdb::{AccessMode, Connection};
 
 use datafusion::{
     execution::{context::SessionContext, session_state::SessionStateBuilder},
     optimizer::{
         analyzer::{
-            expand_wildcard_rule::ExpandWildcardRule, inline_table_scan::InlineTableScan,
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
         AnalyzerRule,
@@ -27,12 +26,36 @@ use datafusion::{
 
 pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
-        Arc::new(InlineTableScan::new()),
-        Arc::new(ExpandWildcardRule::new()),
-        Arc::new(FederationAnalyzerRule::new()),
+        Arc::new(federation_analyzer_rule()),
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
     ]
+}
+
+fn generate_tpch_database(db_path: &Path) -> Result<()> {
+    println!("Generating TPC-H database at: {}", db_path.display());
+
+    let db_path_str = db_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Failed to convert db_path to string"))?;
+
+    let conn = Connection::open(db_path_str)
+        .map_err(|e| anyhow!("Failed to open DuckDB connection: {}", e))?;
+
+    // Install TPC-H extension
+    conn.execute("INSTALL tpch;", [])
+        .map_err(|e| anyhow!("Failed to install tpch extension: {}", e))?;
+
+    // Load TPC-H extension
+    conn.execute("LOAD tpch;", [])
+        .map_err(|e| anyhow!("Failed to load tpch extension: {}", e))?;
+
+    // Generate TPC-H data with scale factor 1
+    conn.execute("CALL dbgen(sf=1);", [])
+        .map_err(|e| anyhow!("Failed to generate tpch data: {}", e))?;
+
+    println!("TPC-H database generated successfully");
+    Ok(())
 }
 
 fn get_duckdb_table_factory(db_name: String) -> Result<DuckDBTableFactory> {
@@ -40,6 +63,11 @@ fn get_duckdb_table_factory(db_name: String) -> Result<DuckDBTableFactory> {
         .parent()
         .ok_or_else(|| anyhow!("Failed to get parent directory"))?
         .join(db_name);
+
+    // Check if database exists, if not generate it
+    if !db_path.exists() {
+        generate_tpch_database(&db_path)?;
+    }
 
     let duckdb_pool = Arc::new(
         DuckDbConnectionPool::new_file(
@@ -95,7 +123,7 @@ async fn run_test_query(
     let df = ctx.sql(&query.sql).await?;
 
     let plan = df.clone().explain(false, false)?.collect().await?;
-    let plan_display = pretty_format_batches(&plan)?;
+    let plan_display = pretty_format_batches(&plan)?.to_string();
 
     insta::with_settings!({
         description => format!("Federated Query Explain"),
@@ -104,10 +132,12 @@ async fn run_test_query(
             (r"compute_context=.*/([^/]+\.db)", "compute_context=$1")
         ],
     }, {
-        insta::assert_snapshot!(format!("{}_{}_explain", benchmark.name(), query.name), plan_display);
+        insta::assert_snapshot!(format!("{}_{}_explain", benchmark.name(), query.name), plan_display.clone());
     });
 
-    let result = df.collect().await?;
+    let result = df.collect().await.inspect_err(|_| {
+        println!("{plan_display}");
+    })?;
     benchmark.validate(query, &result)?;
 
     Ok(())
