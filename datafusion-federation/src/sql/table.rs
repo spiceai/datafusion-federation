@@ -1,3 +1,4 @@
+use crate::sql::table_reference::MultiPartTableReference;
 use crate::sql::SQLFederationProvider;
 use crate::FederatedTableSource;
 use crate::FederationProvider;
@@ -5,7 +6,6 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::Result;
 use datafusion::logical_expr::TableSource;
 use datafusion::logical_expr::TableType;
-use datafusion::sql::TableReference;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -21,12 +21,12 @@ use super::RemoteTableRef;
 pub trait SQLTable: std::fmt::Debug + Send + Sync {
     /// Returns a reference as a trait object.
     fn as_any(&self) -> &dyn Any;
-    /// Provides the [`TableReference`](`datafusion::sql::TableReference`) used to identify the table in SQL queries.
+    /// Provides the [`MultiPartTableReference`](`crate::sql::table_reference::MultiPartTableReference`) used to identify the table in SQL queries.
     /// This TableReference is used for registering the table with the [`SQLSchemaProvider`](`super::SQLSchemaProvider`).
     /// If the table provider is registered in the Datafusion context under a different name,
     /// the logical plan will be rewritten to use this table reference during execution.
     /// Therefore, any AST analyzer should match against this table reference.
-    fn table_reference(&self) -> TableReference;
+    fn table_reference(&self) -> MultiPartTableReference;
     /// Schema of the remote table
     fn schema(&self) -> SchemaRef;
     /// Returns a logical optimizer specific to this table, will be used to modify the logical plan before execution
@@ -69,7 +69,7 @@ impl RemoteTable {
 
     /// Return table reference of this remote table.
     /// Only returns the object name, ignoring functional params if any
-    pub fn table_reference(&self) -> &TableReference {
+    pub fn table_reference(&self) -> &MultiPartTableReference {
         self.remote_table_ref.table_ref()
     }
 
@@ -83,7 +83,7 @@ impl SQLTable for RemoteTable {
         self
     }
 
-    fn table_reference(&self) -> TableReference {
+    fn table_reference(&self) -> MultiPartTableReference {
         Self::table_reference(self).clone()
     }
 
@@ -95,14 +95,20 @@ impl SQLTable for RemoteTable {
         None
     }
 
-    /// Returns ast analyzer that modifies table that contains functional args after table ident
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
+        let mut rules = vec![];
+
+        // Returns ast analyzer that modifies table that contains functional args after table ident
         if let Some(args) = self.remote_table_ref.args() {
-            Some(
+            rules.push(
                 ast_analyzer::TableArgReplace::default()
                     .with(self.remote_table_ref.table_ref().clone(), args.to_vec())
-                    .into_analyzer(),
-            )
+                    .into_analyzer_rule(),
+            );
+        }
+
+        if !rules.is_empty() {
+            Some(AstAnalyzer::new(rules))
         } else {
             None
         }
@@ -111,7 +117,7 @@ impl SQLTable for RemoteTable {
 
 #[derive(Debug, Clone)]
 pub struct SQLTableSource {
-    pub provider: Arc<SQLFederationProvider>,
+    pub provider: Arc<dyn FederationProvider>,
     pub table: Arc<dyn SQLTable>,
 }
 
@@ -119,8 +125,9 @@ impl SQLTableSource {
     // creates a SQLTableSource and infers the table schema
     pub async fn new(
         provider: Arc<SQLFederationProvider>,
-        table_ref: RemoteTableRef,
+        table_ref: impl Into<RemoteTableRef>,
     ) -> Result<Self> {
+        let table_ref = table_ref.into();
         let table_name = table_ref.to_quoted_string();
         let schema = provider.executor.get_table_schema(&table_name).await?;
         Ok(Self::new_with_schema(provider, table_ref, schema))
@@ -128,23 +135,23 @@ impl SQLTableSource {
 
     /// Create a SQLTableSource with a table reference and schema
     pub fn new_with_schema(
-        provider: Arc<SQLFederationProvider>,
-        table_ref: RemoteTableRef,
+        provider: Arc<dyn FederationProvider>,
+        table_ref: impl Into<RemoteTableRef>,
         schema: SchemaRef,
     ) -> Self {
         Self {
             provider,
-            table: Arc::new(RemoteTable::new(table_ref, schema)),
+            table: Arc::new(RemoteTable::new(table_ref.into(), schema)),
         }
     }
 
     /// Create new with a custom SQLtable instance.
-    pub fn new_with_table(provider: Arc<SQLFederationProvider>, table: Arc<dyn SQLTable>) -> Self {
+    pub fn new_with_table(provider: Arc<dyn FederationProvider>, table: Arc<dyn SQLTable>) -> Self {
         Self { provider, table }
     }
 
     /// Return associated table reference of stored remote table
-    pub fn table_reference(&self) -> TableReference {
+    pub fn table_reference(&self) -> MultiPartTableReference {
         self.table.table_reference()
     }
 }
@@ -165,6 +172,6 @@ impl TableSource for SQLTableSource {
 
 impl FederatedTableSource for SQLTableSource {
     fn federation_provider(&self) -> Arc<dyn FederationProvider> {
-        Arc::clone(&self.provider) as Arc<dyn FederationProvider>
+        Arc::clone(&self.provider)
     }
 }

@@ -1,6 +1,6 @@
-use datafusion::common::tree_node::TreeNodeRecursion;
-
 use crate::FederationProviderRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::{DataFusionError, Result};
 
 /// Used to track if all sources, including tableScan, plan inputs and
 /// expressions, represents an un-ambiguous, none or a sole' [`crate::FederationProvider`].
@@ -16,11 +16,11 @@ impl ScanResult {
             (_, ScanResult::None) => {}
             (ScanResult::None, _) => *self = other,
             (ScanResult::Ambiguous, _) | (_, ScanResult::Ambiguous) => {
-                *self = ScanResult::Ambiguous
+                *self = ScanResult::Ambiguous;
             }
             (ScanResult::Distinct(provider), ScanResult::Distinct(other_provider)) => {
                 if provider != other_provider {
-                    *self = ScanResult::Ambiguous
+                    *self = ScanResult::Ambiguous;
                 }
             }
         }
@@ -41,11 +41,13 @@ impl ScanResult {
         !self.is_none()
     }
 
-    pub fn unwrap(self) -> Option<FederationProviderRef> {
+    pub fn unwrap(self) -> Result<Option<FederationProviderRef>> {
         match self {
-            ScanResult::None => None,
-            ScanResult::Distinct(provider) => Some(provider),
-            ScanResult::Ambiguous => panic!("called `ScanResult::unwrap()` on a `Ambiguous` value"),
+            ScanResult::None => Ok(None),
+            ScanResult::Distinct(provider) => Ok(Some(provider)),
+            ScanResult::Ambiguous => Err(DataFusionError::External(
+                "called `ScanResult::unwrap()` on a `Ambiguous` value".into(),
+            )),
         }
     }
 
@@ -72,6 +74,19 @@ impl PartialEq<Option<FederationProviderRef>> for ScanResult {
         match (self, other) {
             (ScanResult::None, None) => true,
             (ScanResult::Distinct(provider), Some(other_provider)) => provider == other_provider,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq for ScanResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ScanResult::None, ScanResult::None) => true,
+            (ScanResult::Distinct(provider1), ScanResult::Distinct(provider2)) => {
+                provider1 == provider2
+            }
+            (ScanResult::Ambiguous, ScanResult::Ambiguous) => true,
             _ => false,
         }
     }

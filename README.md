@@ -120,7 +120,7 @@ implementations to fallback to a 'vanilla' TableProvider in case the
 The `FederationProvider` can provide a `compute_context`. This allows it to
 differentiate between multiple remote execution context of the same type. For
 example two different mysql instances, database schemas, access level, etc. The
-`FederationProvider` also returns the `Optimizer` that is allows it to
+`FederationProvider` also returns the `Optimizer` that allows it to
 self-determine what part of a sub-plan it can federate.
 
 The `sql` module implements a generic `FederationProvider` for SQL execution

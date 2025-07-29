@@ -10,6 +10,8 @@ use datafusion::{
 };
 use std::sync::Arc;
 
+use super::ast_analyzer::AstAnalyzer;
+
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
 pub type AstAnalyzer = Box<dyn FnMut(ast::Statement) -> Result<ast::Statement>>;
 pub type LogicalOptimizer = Box<dyn FnMut(LogicalPlan) -> Result<LogicalPlan>>;

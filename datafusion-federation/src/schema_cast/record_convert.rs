@@ -173,7 +173,7 @@ mod test {
     #[test]
     fn test_string_to_timestamp_conversion() {
         let result = try_cast_to(batch_input(), to_schema()).expect("converted");
-        let expected = vec![
+        let expected = [
             "+---+-----+---------------------+",
             "| a | b   | c                   |",
             "+---+-----+---------------------+",
@@ -222,7 +222,7 @@ mod test {
     fn test_large_string_to_timestamp_conversion() {
         let result =
             try_cast_to(large_string_batch_input(), large_string_to_schema()).expect("converted");
-        let expected = vec![
+        let expected = [
             "+---+-----+---------------------+",
             "| a | b   | c                   |",
             "+---+-----+---------------------+",

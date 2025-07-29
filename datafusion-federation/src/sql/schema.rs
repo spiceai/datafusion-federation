@@ -1,11 +1,10 @@
-use std::{any::Any, sync::Arc};
-
 use async_trait::async_trait;
-use datafusion::{catalog::SchemaProvider, datasource::TableProvider, error::Result};
-use futures::future::join_all;
 
 use super::{table::SQLTable, RemoteTableRef, SQLTableSource};
 use crate::{sql::SQLFederationProvider, FederatedTableProviderAdaptor};
+use datafusion::{catalog::SchemaProvider, datasource::TableProvider, error::Result};
+use futures::future::join_all;
+use std::{any::Any, sync::Arc};
 
 /// An in-memory schema provider for SQL tables.
 #[derive(Debug)]
