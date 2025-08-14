@@ -241,8 +241,7 @@ fn apply_logical_optimizers(
         let new_schema = plan.schema();
         if &old_schema != new_schema {
             return Err(DataFusionError::Execution(format!(
-                "Schema altered during logical analysis, expected: {}, found: {}",
-                old_schema, new_schema
+                "Schema altered during logical analysis, expected: {old_schema}, found: {new_schema}",
             )));
         }
     }
