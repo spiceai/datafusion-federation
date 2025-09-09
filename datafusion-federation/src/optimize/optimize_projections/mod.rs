@@ -330,9 +330,14 @@ fn optimize_projections(
             return Ok(Transformed::no(plan));
         }
         LogicalPlan::Join(join) => {
-            let left_len = join.left.schema().fields().len();
-            let (left_req_indices, right_req_indices) =
-                split_join_requirements(left_len, indices, &join.join_type);
+            let (left_req_indices, right_req_indices) = split_join_requirements(
+                (
+                    join.left.schema().fields().len(),
+                    join.right.schema().fields().len(),
+                ),
+                indices,
+                &join.join_type,
+            );
             let left_indices = left_req_indices.with_plan_exprs(&plan, join.left.schema())?;
             let right_indices = right_req_indices.with_plan_exprs(&plan, join.right.schema())?;
             // Joins benefit from "small" input tables (lower memory usage).
@@ -647,10 +652,11 @@ fn outer_columns_helper_multi<'a, 'b>(
 /// requirements for the right child. The indices are appropriately split and
 /// adjusted based on the join type.
 fn split_join_requirements(
-    left_len: usize,
+    len: (usize, usize),
     indices: RequiredIndicies,
     join_type: &JoinType,
 ) -> (RequiredIndicies, RequiredIndicies) {
+    let (left_len, right_len) = len;
     match join_type {
         // In these cases requirements are split between left/right children:
         JoinType::Inner
@@ -661,6 +667,11 @@ fn split_join_requirements(
             // Decrease right side indices by `left_len` so that they point to valid
             // positions within the right child:
             indices.split_off(left_len)
+        }
+        JoinType::RightMark => {
+            // Decrease Left side indices by `right_len` so that they point to valid
+            // positions within the left child:
+            indices.split_off(right_len)
         }
         // All requirements can be re-routed to left child directly.
         JoinType::LeftAnti | JoinType::LeftSemi => (indices, RequiredIndicies::new()),
