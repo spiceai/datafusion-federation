@@ -17,7 +17,7 @@ repository = "https://github.com/datafusion-contrib/datafusion-federation"
 arrow-json = "55"
 async-stream = "0.3.5"
 async-trait = "0.1.83"
-datafusion = "48.0.1"
+datafusion = "49.0.2"
 datafusion-federation = { path = "./datafusion-federation", version = "0.4.2" }
 futures = "0.3.31"
 tokio = { version = "1.41", features = ["full"] }
@@ -25,12 +25,10 @@ tokio = { version = "1.41", features = ["full"] }
 [patch.crates-io]
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a4b83432acfe1dfdd140e35d4603701ae76f6607" } # spiceai-1.3.2
 
-datafusion-federation = { path = "./datafusion-federation" }
-
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" }               # spiceai-48
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" }          # spiceai-48
-datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" } # spiceai-48
-datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" } # spiceai-48
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" }               # spiceai-49
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" }          # spiceai-49
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" } # spiceai-49
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" } # spiceai-49
 
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
 arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
