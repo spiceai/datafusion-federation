@@ -11,10 +11,26 @@ readme = "README.md"
 repository = "https://github.com/datafusion-contrib/datafusion-federation"
 
 [workspace.dependencies]
-arrow-json = "56"
+arrow-json = "56.0.0"
 async-stream = "0.3.5"
 async-trait = "0.1.83"
-datafusion = "50.0.0"
+datafusion = "50.3.0"
 datafusion-federation = { path = "./datafusion-federation", version = "0.4.10" }
 futures = "0.3.31"
 tokio = { version = "1.41", features = ["full"] }
+
+[patch.crates-io]
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "9b8ab338f743eff27c7e9ebf3cae0cc89f068b19" }               # spiceai-50
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "9b8ab338f743eff27c7e9ebf3cae0cc89f068b19" }          # spiceai-49
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "9b8ab338f743eff27c7e9ebf3cae0cc89f068b19" } # spiceai-49
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "9b8ab338f743eff27c7e9ebf3cae0cc89f068b19" } # spiceai-49
+
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }        # spiceai-56
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }  # spiceai-56
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }   # spiceai-56
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }   # spiceai-56
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }      # spiceai-56
