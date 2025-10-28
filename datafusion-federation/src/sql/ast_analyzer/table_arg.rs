@@ -87,7 +87,10 @@ impl VisitorMut for TableArgReplace {
         } = table_factor
         {
             let name = &*name;
-            let name_as_tableref = name.into();
+            let Ok(name_as_tableref) = MultiPartTableReference::try_from(name.clone()) else {
+                return ControlFlow::Continue(());
+            };
+
             if let Some((table, arg)) = self
                 .tables
                 .iter()

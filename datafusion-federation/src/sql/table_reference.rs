@@ -13,6 +13,31 @@ use datafusion::{
     },
 };
 
+macro_rules! ident_match {
+    ($part:expr) => {
+        match $part {
+            ObjectNamePart::Identifier(ident) => ident.value.into(),
+            v => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Unsupported ObjectNamePart variant: {:?}",
+                    v
+                )));
+            }
+        }
+    };
+    ($part:expr, true) => {
+        match $part {
+            ObjectNamePart::Identifier(ident) => Ok(ident.value.into()),
+            v => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Unsupported ObjectNamePart variant: {:?}",
+                    v
+                )));
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultiTableReference {
     parts: Vec<Arc<str>>,
@@ -127,49 +152,42 @@ impl std::ops::Deref for MultiTableReference {
     }
 }
 
-impl From<ObjectName> for MultiPartTableReference {
-    fn from(name: ObjectName) -> Self {
+impl TryFrom<ObjectName> for MultiPartTableReference {
+    type Error = DataFusionError;
+
+    fn try_from(name: ObjectName) -> Result<Self, Self::Error> {
         let mut parts = name.0;
-        match parts.len() {
+        let multi_ref = match parts.len() {
             1 => MultiPartTableReference::TableReference(TableReference::Bare {
-                table: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
+                table: ident_match!(parts.remove(0)),
             }),
             2 => MultiPartTableReference::TableReference(TableReference::Partial {
-                schema: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
-                table: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
+                schema: ident_match!(parts.remove(0)),
+                table: ident_match!(parts.remove(0)),
             }),
             3 => MultiPartTableReference::TableReference(TableReference::Full {
-                catalog: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
-                schema: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
-                table: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
+                catalog: ident_match!(parts.remove(0)),
+                schema: ident_match!(parts.remove(0)),
+                table: ident_match!(parts.remove(0)),
             }),
             _ => MultiPartTableReference::Multi(MultiTableReference {
                 parts: parts
+                    .clone()
                     .into_iter()
-                    .map(|p| match p {
-                        ObjectNamePart::Identifier(ident) => ident.value.into(),
-                    })
-                    .collect(),
+                    .map(|p| ident_match!(p, true))
+                    .collect::<Result<Vec<Arc<str>>, Self::Error>>()?,
             }),
-        }
+        };
+
+        Ok(multi_ref)
     }
 }
 
-impl From<&ObjectName> for MultiPartTableReference {
-    fn from(name: &ObjectName) -> Self {
-        name.clone().into()
+impl TryFrom<&ObjectName> for MultiPartTableReference {
+    type Error = DataFusionError;
+
+    fn try_from(name: &ObjectName) -> Result<Self, Self::Error> {
+        MultiPartTableReference::try_from(name.clone())
     }
 }
 
@@ -234,36 +252,22 @@ impl RemoteTableRef {
         let mut parts = name.0;
         let table_ref = match parts.len() {
             1 => MultiPartTableReference::TableReference(TableReference::Bare {
-                table: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
+                table: ident_match!(parts.remove(0)),
             }),
             2 => MultiPartTableReference::TableReference(TableReference::Partial {
-                schema: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
-                table: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
+                schema: ident_match!(parts.remove(0)),
+                table: ident_match!(parts.remove(0)),
             }),
             3 => MultiPartTableReference::TableReference(TableReference::Full {
-                catalog: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
-                schema: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
-                table: match parts.remove(0) {
-                    ObjectNamePart::Identifier(ident) => ident.value.into(),
-                },
+                catalog: ident_match!(parts.remove(0)),
+                schema: ident_match!(parts.remove(0)),
+                table: ident_match!(parts.remove(0)),
             }),
             _ => MultiPartTableReference::Multi(MultiTableReference {
                 parts: parts
                     .into_iter()
-                    .map(|p| match p {
-                        ObjectNamePart::Identifier(ident) => ident.value.into(),
-                    })
-                    .collect(),
+                    .map(|p| ident_match!(p, true))
+                    .collect::<Result<_, DataFusionError>>()?,
             }),
         };
 
