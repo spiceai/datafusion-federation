@@ -75,8 +75,12 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn analyzer(&self) -> Option<Arc<Analyzer>> {
-        Some(Arc::clone(&self.analyzer))
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<Arc<Analyzer>> {
+        if self.executor.can_execute_plan(plan) {
+            Some(Arc::clone(&self.analyzer))
+        } else {
+            None
+        }
     }
 }
 
@@ -101,6 +105,10 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
                 // Avoid attempting double federation
                 return Ok(plan);
             }
+        }
+
+        if !self.planner.executor.can_execute_plan(&plan) {
+            return Ok(plan);
         }
 
         let fed_plan = FederatedPlanNode::new(plan.clone(), self.planner.clone());
