@@ -13,6 +13,7 @@ use std::{
 
 use datafusion::{
     execution::session_state::{SessionState, SessionStateBuilder},
+    logical_expr::LogicalPlan,
     optimizer::{
         analyzer::{
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
@@ -60,8 +61,9 @@ pub trait FederationProvider: Send + Sync + std::fmt::Debug {
     fn compute_context(&self) -> Option<String>;
 
     // Returns an analyzer that can cut out part of the plan
-    // to federate it.
-    fn analyzer(&self) -> Option<Arc<Analyzer>>;
+    // to federate it. The plan is provided to allow the federation provider
+    // to check if it can federate the plan before returning an analyzer.
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<Arc<Analyzer>>;
 }
 
 impl fmt::Display for dyn FederationProvider {

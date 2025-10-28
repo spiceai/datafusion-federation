@@ -29,6 +29,14 @@ pub trait SQLExecutor: Sync + Send {
     /// The specific SQL dialect (currently supports 'sqlite', 'postgres', 'flight')
     fn dialect(&self) -> Arc<dyn Dialect>;
 
+    /// Returns if this executor can execute the query that would be produced from this logical plan.
+    ///
+    /// This is used to indicate to the federation logic that part of this plan cannot be federated,
+    /// i.e. if there are UDFs that only DataFusion can execute.
+    fn can_execute_plan(&self, _logical_plan: &LogicalPlan) -> bool {
+        true
+    }
+
     /// Returns the analyzer rule specific for this engine to modify the logical plan before execution
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
         None

@@ -242,14 +242,13 @@ impl FederationAnalyzerRule {
                 return Ok((None, ScanResult::Distinct(provider)));
             }
 
-            let Some(analyzer) = provider.analyzer() else {
-                // No analyzer provided
-                return Ok((None, ScanResult::None));
-            };
+            if let Some(analyzer) = provider.analyzer(&plan) {
+                // If this is the root plan node; federate the entire plan
+                let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
+                return Ok((Some(optimized), ScanResult::None));
+            }
 
-            // If this is the root plan node; federate the entire plan
-            let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
-            return Ok((Some(optimized), ScanResult::None));
+            sole_provider = ScanResult::Ambiguous;
         }
 
         // The plan is ambiguous; any input that is not yet optimized and has a
@@ -279,7 +278,7 @@ impl FederationAnalyzerRule {
                     return Ok(original_input);
                 };
 
-                let Some(analyzer) = provider.analyzer() else {
+                let Some(analyzer) = provider.analyzer(&original_input) else {
                     // No analyzer for this input; use the original input.
                     return Ok(original_input);
                 };
@@ -421,7 +420,7 @@ impl FederationProvider for NopFederationProvider {
         None
     }
 
-    fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
+    fn analyzer(&self, _plan: &LogicalPlan) -> Option<Arc<datafusion::optimizer::Analyzer>> {
         None
     }
 }
@@ -470,7 +469,7 @@ fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
     let federated_table_exists = plan.exists(|x| {
         if let (Some(provider), _) = get_leaf_provider(x)? {
             // federated table provider should have an analyzer
-            return Ok(provider.analyzer().is_some());
+            return Ok(provider.analyzer(plan).is_some());
         }
         Ok(false)
     })?;
