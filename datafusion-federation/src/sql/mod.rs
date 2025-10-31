@@ -75,11 +75,16 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn analyzer(&self) -> Option<Arc<Analyzer>> {
-        Some(Arc::clone(&self.analyzer))
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<Arc<Analyzer>> {
+        if self.executor.can_execute_plan(plan) {
+            Some(Arc::clone(&self.analyzer))
+        } else {
+            None
+        }
     }
 }
 
+/// This is actually where we figure out how much of the LP we can federate.
 #[derive(Debug)]
 struct SQLFederationAnalyzerRule {
     planner: Arc<SQLFederationPlanner>,
@@ -103,12 +108,9 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
             }
         }
 
-        let fed_plan = FederatedPlanNode::new(plan.clone(), self.planner.clone());
-        let ext_node = Extension {
-            node: Arc::new(fed_plan),
-        };
-
-        let mut plan = LogicalPlan::Extension(ext_node);
+        let mut plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(FederatedPlanNode::new(plan.clone(), self.planner.clone())),
+        });
         if let Some(mut rewriter) = self.planner.executor.logical_optimizer() {
             plan = rewriter(plan)?;
         }

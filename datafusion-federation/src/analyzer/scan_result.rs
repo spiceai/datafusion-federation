@@ -5,13 +5,19 @@ use datafusion::error::{DataFusionError, Result};
 /// Used to track if all sources, including tableScan, plan inputs and
 /// expressions, represents an un-ambiguous, none or a sole' [`crate::FederationProvider`].
 pub enum ScanResult {
+    /// [`LogicalPlan`] subtree has no [`FederationProvider`].
     None,
+
+    /// There is a single [`FederationProvider`] in the [`LogicalPlan`] subtree.
     Distinct(FederationProviderRef),
+
+    /// The [`LogicalPlan`] subtree has several different [`FederationProvider`]s.
     Ambiguous,
 }
 
 impl ScanResult {
-    pub fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: impl Into<Self>) {
+        let other = other.into();
         match (&self, &other) {
             (_, ScanResult::None) => {}
             (ScanResult::None, _) => *self = other,
@@ -24,10 +30,6 @@ impl ScanResult {
                 }
             }
         }
-    }
-
-    pub fn add(&mut self, provider: Option<FederationProviderRef>) {
-        self.merge(ScanResult::from(provider))
     }
 
     pub fn is_ambiguous(&self) -> bool {
