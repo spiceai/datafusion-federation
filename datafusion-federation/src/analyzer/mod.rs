@@ -2,11 +2,10 @@ mod scan_result;
 
 use crate::FederationProvider;
 use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
-use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
 use datafusion::optimizer::eliminate_nested_union::EliminateNestedUnion;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
-use datafusion::optimizer::{Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule};
+use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
@@ -239,43 +238,22 @@ impl FederationAnalyzerRule {
 
         // If all sources are federated to the same provider
         if let ScanResult::Distinct(provider) = sole_provider {
-            // match (is_root, provider.analyzer(plan)) {
-            //     (false, Some(_)) => {
-            //         // The largest sub-plan is higher up.
-            //         return Ok((None, ScanResult::Distinct(provider)));
-            //     }
-            //     (true, Some(analyzer)) => {
-            //         // If this is the root plan node; federate the entire plan
-            //         let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
-            //         return Ok((Some(optimized), ScanResult::None));
-            //     }
-            //     (_, None) => {
-            //         // Provider CAN'T federate this specific plan shape
-            //         // Fall through to try federating children instead
-            //         sole_provider = ScanResult::Ambiguous;
-            //     }
-            // }
-            if !is_root {
-                // The largest sub-plan is higher up.
-                return Ok((None, ScanResult::Distinct(provider)));
+            match (is_root, provider.analyzer(plan)) {
+                (false, Some(_)) => {
+                    // The largest sub-plan is higher up.
+                    return Ok((None, ScanResult::Distinct(provider)));
+                }
+                (true, Some(analyzer)) => {
+                    // If this is the root plan node; federate the entire plan
+                    let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
+                    return Ok((Some(optimized), ScanResult::None));
+                }
+                (_, None) => {
+                    // Provider CAN'T federate this specific plan shape
+                    // Fall through to try federating children instead
+                    sole_provider = ScanResult::Ambiguous;
+                }
             }
-
-            if let Some(analyzer) = provider.analyzer(plan) {
-                // If this is the root plan node; federate the entire plan
-                let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
-                return Ok((Some(optimized), ScanResult::None));
-            }
-
-            sole_provider = ScanResult::Ambiguous;
-
-            // let Some(analyzer) = provider.analyzer(plan) else {
-            //     // No analyzer provided
-            //     return Ok((None, ScanResult::None));
-            // };
-
-            // // If this is the root plan node; federate the entire plan
-            // let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
-            // return Ok((Some(optimized), ScanResult::None));
         }
 
         // The plan is ambiguous; any input that is not yet optimized and has a
@@ -306,15 +284,13 @@ impl FederationAnalyzerRule {
                 };
 
                 let Some(analyzer) = provider.analyzer(&original_input) else {
-                    // No analyzer for this input; use the original input.
+                    // Either provider has no analyzer, or cannot federate [`LogicalPlan`].
                     return Ok(original_input);
                 };
 
                 // Replace the input with the federated counterpart
                 let wrapped = wrap_projection(original_input)?;
-                let optimized = analyzer.execute_and_check(wrapped, config, |_, _| {})?;
-
-                Ok(optimized)
+                analyzer.execute_and_check(wrapped, config, |_, _| {})
             })
             .collect::<Result<Vec<_>>>()?;
 

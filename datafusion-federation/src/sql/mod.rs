@@ -369,6 +369,9 @@ mod tests {
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::expr::Alias;
+    use datafusion::logical_expr::Projection;
+    use datafusion::prelude::Expr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::{self};
     use datafusion::{
@@ -380,9 +383,21 @@ mod tests {
     use super::table::RemoteTable;
     use super::*;
 
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     struct TestExecutor {
         compute_context: String,
+
+        // Return true if this subtree of a logicalplan cannot be federated
+        cannot_federate: Option<Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync>>,
+    }
+
+    impl std::fmt::Debug for TestExecutor {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TestExecutor")
+                .field("compute_context", &self.compute_context)
+                .field("cannot_federate_fn", &self.cannot_federate.is_some())
+                .finish_non_exhaustive()
+        }
     }
 
     #[async_trait]
@@ -393,6 +408,13 @@ mod tests {
 
         fn compute_context(&self) -> Option<String> {
             Some(self.compute_context.clone())
+        }
+
+        fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
+            let Some(ref fnc) = self.cannot_federate else {
+                return true;
+            };
+            !logical_plan.exists(|p| Ok(fnc(p))).unwrap_or(false)
         }
 
         fn dialect(&self) -> Arc<dyn Dialect> {
@@ -429,10 +451,12 @@ mod tests {
     async fn basic_sql_federation_test() -> Result<(), DataFusionError> {
         let test_executor_a = TestExecutor {
             compute_context: "a".into(),
+            cannot_federate: None,
         };
 
         let test_executor_b = TestExecutor {
             compute_context: "b".into(),
+            cannot_federate: None,
         };
 
         let table_a1_ref = "table_a1".to_string();
@@ -529,9 +553,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn basic_sql_federation_analyzer_rule_test() -> Result<(), DataFusionError> {
+        let alias_non_federate: Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync> =
+            Arc::new(|plan| match plan {
+                LogicalPlan::Projection(Projection { expr, .. }) => expr.iter().any(|e| match e {
+                    Expr::Alias(Alias { name, .. }) => name == "non_federate",
+                    _ => false,
+                }),
+                _ => false,
+            });
+
+        let test_executor_a = TestExecutor {
+            compute_context: "a".into(),
+            cannot_federate: Some(Arc::clone(&alias_non_federate)),
+        };
+
+        let test_executor_b = TestExecutor {
+            compute_context: "b".into(),
+            cannot_federate: None,
+        };
+
+        let table_a1_ref = "table_a1".to_string();
+        let table_a1 = get_test_table_provider(table_a1_ref.clone(), test_executor_a.clone());
+
+        let table_b1_ref = "table_b1".to_string();
+        let table_b1 = get_test_table_provider(table_b1_ref.clone(), test_executor_b.clone());
+
+        let table_b2_ref = "table_b2".to_string();
+        let table_b2 = get_test_table_provider(table_b2_ref.clone(), test_executor_b);
+
+        // Create a new SessionState with the optimizer rule we created above
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::default()));
+
+        ctx.register_table(table_a1_ref.clone(), table_a1).unwrap();
+        ctx.register_table(table_b1_ref.clone(), table_b1).unwrap();
+        ctx.register_table(table_b2_ref.clone(), table_b2).unwrap();
+
+        // Basic unsupported federation of `AS 'non_federate'`. Note filter non_federate > 0 can be
+        // pushed down since it will be optimised into `Filter: table_a1.a > Int64(0)`.
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT non_federate, b, c FROM (SELECT a AS 'non_federate', b, c FROM table_a1) WHERE non_federate > 0"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Projection: table_a1.a AS non_federate, table_a1.b, table_a1.c
+          Federated
+         Projection: table_a1.a, table_a1.b, table_a1.c
+          Filter: table_a1.a > Int64(0)
+            TableScan: table_a1
+        ");
+
+        // Basic join of two different context tables.
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT b.a, b.b, a.b, a.c FROM table_a1 a JOIN table_b1 b ON a.a=b.a"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Projection: b.a, b.b, a.b, a.c
+          Inner Join: a.a = b.a
+            Federated
+         Projection: a.a, a.b, a.c
+          SubqueryAlias: a
+            TableScan: table_a1
+            Projection: b.a, b.b
+              Federated
+         Projection: b.a, b.b, b.c
+          SubqueryAlias: b
+            TableScan: table_b1
+        "
+        );
+
+        // Basic join of two same-context tables.
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT b.a, b.b, a.b, a.c FROM table_b1 a JOIN table_b2 b ON a.a=b.a"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Federated
+         Projection: b.a, b.b, a.b, a.c
+          Inner Join:  Filter: a.a = b.a
+            SubqueryAlias: a
+              TableScan: table_b1
+            SubqueryAlias: b
+              TableScan: table_b2
+        "
+        );
+
+        // JOIN ON different contexts, one child has non-federateable [`LogicalPlan`].
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT a.*, j.non_federate FROM (SELECT b.a AS a, b.b as 'non_federate', a.b as b, a.c as c FROM table_b1 a JOIN table_b2 b ON a.a=b.a) j JOIN table_a1 a ON j.a = a.a"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Projection: a.a, a.b, a.c, j.non_federate
+          Inner Join: j.a = a.a
+            Projection: j.a, j.non_federate
+              Federated
+         Projection: j.a, j.non_federate, j.b, j.c
+          SubqueryAlias: j
+            Projection: b.a, b.b AS non_federate, a.b, a.c
+              Inner Join:  Filter: a.a = b.a
+                SubqueryAlias: a
+                  TableScan: table_b1
+                SubqueryAlias: b
+                  TableScan: table_b2
+            Federated
+         Projection: a.a, a.b, a.c
+          SubqueryAlias: a
+            TableScan: table_a1
+        "
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn multi_reference_sql_federation_test() -> Result<(), DataFusionError> {
         let test_executor_a = TestExecutor {
             compute_context: "test".into(),
+            cannot_federate: None,
         };
 
         let lowercase_table_ref = "default.table".to_string();

@@ -3,6 +3,9 @@ mod validation;
 
 use anyhow::{anyhow, Result};
 use bench::{Benchmark, Query};
+use datafusion::catalog::TableProvider;
+use datafusion_federation::sql::{SQLFederationProvider, SQLTableSource};
+use datafusion_federation::FederatedTableProviderAdaptor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -149,13 +152,16 @@ async fn register_federated_duckdb_tables(
     duckdb_table_factory: &DuckDBTableFactory,
 ) -> Result<()> {
     for table_name in table_names {
-        ctx.register_table(
-            &table_name,
+        let tbl: Arc<dyn TableProvider> = Arc::new(
             duckdb_table_factory
-                .table_provider(TableReference::bare(table_name.as_str()))
+                .table_provider_fed(TableReference::bare(table_name.as_str()))
                 .await
                 .map_err(|e| anyhow!("Failed to register duckdb table: {}", e))?,
-        )?;
+        );
+        tbl.as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("was not 'FederatedTableProviderAdaptor");
+        ctx.register_table(&table_name, tbl)?;
     }
 
     Ok(())
