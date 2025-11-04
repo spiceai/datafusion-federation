@@ -251,7 +251,6 @@ impl FederationAnalyzerRule {
                 (_, None) => {
                     // Provider CAN'T federate this specific plan shape
                     // Fall through to try federating children instead
-                    sole_provider = ScanResult::Ambiguous;
                 }
             }
         }

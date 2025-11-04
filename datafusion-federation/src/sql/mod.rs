@@ -356,6 +356,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
     }
 }
 
+#[allow(clippy::type_complexity)]
 #[cfg(test)]
 mod tests {
 
