@@ -64,7 +64,7 @@ pub trait FederationProvider: Send + Sync + std::fmt::Debug {
     //
     // Returns [`None`] if either the provider cannot federate any plan
     // (e.g. [`crate::analyzer::NopFederationProvider`]), or cannot federate
-    //  this [`LogicalPlan`].
+    //  this specific [`LogicalPlan`].
     fn analyzer(&self, plan: &LogicalPlan) -> Option<Arc<Analyzer>>;
 }
 

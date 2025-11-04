@@ -84,7 +84,6 @@ impl FederationProvider for SQLFederationProvider {
     }
 }
 
-/// This is actually where we figure out how much of the LP we can federate.
 #[derive(Debug)]
 struct SQLFederationAnalyzerRule {
     planner: Arc<SQLFederationPlanner>,
