@@ -40,8 +40,9 @@ impl AnalyzerRule for FederationAnalyzerRule {
         }
 
         // Run optimizer rules before federation
-        let opt_config = OptimizerContext::new();
-        let plan = self.optimizer.optimize(plan, &opt_config, |_, _| {})?;
+        let plan = self
+            .optimizer
+            .optimize(plan, &OptimizerContext::new(), |_, _| {})?;
 
         // Find all federation providers for TableReferences that appear in the plan, to resolve OuterRefColumns
         let providers = get_plan_provider_recursively(&plan)?;
@@ -101,7 +102,7 @@ impl FederationAnalyzerRule {
             }
 
             let (sub_provider, _) = get_leaf_provider(p)?;
-            sole_provider.add(sub_provider);
+            sole_provider.merge(sub_provider);
 
             Ok(sole_provider.check_recursion())
         })?;
@@ -204,7 +205,7 @@ impl FederationAnalyzerRule {
             return Ok((None, leaf_provider.into()));
         }
         // Aggregate leaf & expression providers
-        sole_provider.add(leaf_provider);
+        sole_provider.merge(leaf_provider);
         sole_provider.merge(exprs_result.clone());
 
         let inputs = plan.inputs();
@@ -237,19 +238,21 @@ impl FederationAnalyzerRule {
 
         // If all sources are federated to the same provider
         if let ScanResult::Distinct(provider) = sole_provider {
-            if !is_root {
-                // The largest sub-plan is higher up.
-                return Ok((None, ScanResult::Distinct(provider)));
+            match (is_root, provider.analyzer(plan)) {
+                (false, Some(_)) => {
+                    // The largest sub-plan is higher up.
+                    return Ok((None, ScanResult::Distinct(provider)));
+                }
+                (true, Some(analyzer)) => {
+                    // If this is the root plan node; federate the entire plan
+                    let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
+                    return Ok((Some(optimized), ScanResult::None));
+                }
+                (_, None) => {
+                    // Provider CAN'T federate this specific plan shape
+                    // Fall through to try federating children instead
+                }
             }
-
-            let Some(analyzer) = provider.analyzer() else {
-                // No analyzer provided
-                return Ok((None, ScanResult::None));
-            };
-
-            // If this is the root plan node; federate the entire plan
-            let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
-            return Ok((Some(optimized), ScanResult::None));
         }
 
         // The plan is ambiguous; any input that is not yet optimized and has a
@@ -279,16 +282,14 @@ impl FederationAnalyzerRule {
                     return Ok(original_input);
                 };
 
-                let Some(analyzer) = provider.analyzer() else {
-                    // No analyzer for this input; use the original input.
+                let Some(analyzer) = provider.analyzer(&original_input) else {
+                    // Either provider has no analyzer, or cannot federate [`LogicalPlan`].
                     return Ok(original_input);
                 };
 
                 // Replace the input with the federated counterpart
                 let wrapped = wrap_projection(original_input)?;
-                let optimized = analyzer.execute_and_check(wrapped, config, |_, _| {})?;
-
-                Ok(optimized)
+                analyzer.execute_and_check(wrapped, config, |_, _| {})
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -410,19 +411,26 @@ impl FederationAnalyzerRule {
 /// NopFederationProvider is used to represent tables that are not federated, but
 /// are resolved by DataFusion. This simplifies the logic of the optimizer rule.
 #[derive(Debug)]
-struct NopFederationProvider {}
+pub(crate) struct NopFederationProvider {}
+
+pub static NOP_NAME: &str = "nop";
 
 impl FederationProvider for NopFederationProvider {
     fn name(&self) -> &str {
-        "nop"
+        NOP_NAME
     }
 
     fn compute_context(&self) -> Option<String> {
         None
     }
 
-    fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
+    fn analyzer(&self, _plan: &LogicalPlan) -> Option<Arc<datafusion::optimizer::Analyzer>> {
         None
+    }
+}
+impl NopFederationProvider {
+    pub fn is_nop(provider: Arc<dyn FederationProvider>) -> bool {
+        provider.name() == NOP_NAME
     }
 }
 
@@ -434,10 +442,7 @@ fn get_plan_provider_recursively(
     let mut providers: HashMap<TableReference, Arc<dyn FederationProvider>> = HashMap::new();
 
     plan.apply_with_subqueries(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
-        let (federation_provider, table_reference) = get_leaf_provider(p)?;
-        if let (Some(federation_provider), Some(table_reference)) =
-            (federation_provider, table_reference)
-        {
+        if let (Some(federation_provider), Some(table_reference)) = get_leaf_provider(p)? {
             providers.insert(table_reference, federation_provider);
         }
 
@@ -469,8 +474,7 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
     let federated_table_exists = plan.exists(|x| {
         if let (Some(provider), _) = get_leaf_provider(x)? {
-            // federated table provider should have an analyzer
-            return Ok(provider.analyzer().is_some());
+            return Ok(!NopFederationProvider::is_nop(provider));
         }
         Ok(false)
     })?;
