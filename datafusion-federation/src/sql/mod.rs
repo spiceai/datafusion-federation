@@ -35,8 +35,8 @@ pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
 
 use crate::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerRule, FederationPlanner,
-    FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerForLogicalPlan,
+    FederationAnalyzerRule, FederationPlanner, FederationProvider,
 };
 
 /// Returns a federation analyzer rule that is optimized for SQL federation.
@@ -75,11 +75,11 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn analyzer(&self, plan: &LogicalPlan) -> Option<Arc<Analyzer>> {
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         if self.executor.can_execute_plan(plan) {
-            Some(Arc::clone(&self.analyzer))
+            Some(Arc::clone(&self.analyzer).into())
         } else {
-            None
+            Some(FederationAnalyzerForLogicalPlan::Unable)
         }
     }
 }
