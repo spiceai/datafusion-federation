@@ -35,8 +35,8 @@ pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
 
 use crate::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerRule, FederationPlanner,
-    FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerForLogicalPlan,
+    FederationAnalyzerRule, FederationPlanner, FederationProvider,
 };
 
 /// Returns a federation analyzer rule that is optimized for SQL federation.
@@ -75,11 +75,11 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn analyzer(&self, plan: &LogicalPlan) -> Option<Arc<Analyzer>> {
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         if self.executor.can_execute_plan(plan) {
-            Some(Arc::clone(&self.analyzer))
+            Some(Arc::clone(&self.analyzer).into())
         } else {
-            None
+            Some(FederationAnalyzerForLogicalPlan::Unable)
         }
     }
 }
@@ -595,7 +595,7 @@ mod tests {
         // pushed down since it will be optimised into `Filter: table_a1.a > Int64(0)`.
         insta::assert_snapshot!(ctx
             .sql(
-                r#"SELECT non_federate, b, c FROM (SELECT a AS 'non_federate', b, c FROM table_a1) WHERE non_federate > 0"#,
+                r#"SELECT a as non_federate, b, c FROM (SELECT a, b, c FROM table_a1) WHERE a > 0"#,
             )
             .await?
             .into_optimized_plan()?

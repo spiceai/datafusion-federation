@@ -1,7 +1,7 @@
 mod scan_result;
 
-use crate::FederationProvider;
 use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
+use crate::{FederationAnalyzerForLogicalPlan, FederationProvider};
 use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
 use datafusion::optimizer::eliminate_nested_union::EliminateNestedUnion;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
@@ -243,12 +243,12 @@ impl FederationAnalyzerRule {
                     // The largest sub-plan is higher up.
                     return Ok((None, ScanResult::Distinct(provider)));
                 }
-                (true, Some(analyzer)) => {
+                (true, Some(FederationAnalyzerForLogicalPlan::With(analyzer))) => {
                     // If this is the root plan node; federate the entire plan
                     let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
                     return Ok((Some(optimized), ScanResult::None));
                 }
-                (_, None) => {
+                (_, None | Some(FederationAnalyzerForLogicalPlan::Unable)) => {
                     // Provider CAN'T federate this specific plan shape
                     // Fall through to try federating children instead
                 }
@@ -282,7 +282,9 @@ impl FederationAnalyzerRule {
                     return Ok(original_input);
                 };
 
-                let Some(analyzer) = provider.analyzer(&original_input) else {
+                let Some(FederationAnalyzerForLogicalPlan::With(analyzer)) =
+                    provider.analyzer(&original_input)
+                else {
                     // Either provider has no analyzer, or cannot federate [`LogicalPlan`].
                     return Ok(original_input);
                 };
@@ -413,24 +415,17 @@ impl FederationAnalyzerRule {
 #[derive(Debug)]
 pub(crate) struct NopFederationProvider {}
 
-pub static NOP_NAME: &str = "nop";
-
 impl FederationProvider for NopFederationProvider {
     fn name(&self) -> &str {
-        NOP_NAME
+        "nop"
     }
 
     fn compute_context(&self) -> Option<String> {
         None
     }
 
-    fn analyzer(&self, _plan: &LogicalPlan) -> Option<Arc<datafusion::optimizer::Analyzer>> {
+    fn analyzer(&self, _plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         None
-    }
-}
-impl NopFederationProvider {
-    pub fn is_nop(provider: Arc<dyn FederationProvider>) -> bool {
-        provider.name() == NOP_NAME
     }
 }
 
@@ -474,7 +469,7 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
     let federated_table_exists = plan.exists(|x| {
         if let (Some(provider), _) = get_leaf_provider(x)? {
-            return Ok(!NopFederationProvider::is_nop(provider));
+            return Ok(provider.analyzer(plan).is_some());
         }
         Ok(false)
     })?;

@@ -52,6 +52,12 @@ pub fn default_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
 
 pub type FederationProviderRef = Arc<dyn FederationProvider>;
 
+impl From<Arc<Analyzer>> for FederationAnalyzerForLogicalPlan {
+    fn from(value: Arc<Analyzer>) -> Self {
+        Self::With(value)
+    }
+}
+
 pub trait FederationProvider: Send + Sync + std::fmt::Debug {
     // Returns the name of the provider, used for comparison.
     fn name(&self) -> &str;
@@ -62,10 +68,18 @@ pub trait FederationProvider: Send + Sync + std::fmt::Debug {
 
     // Returns an analyzer that can cut out, and federate part of the [`LogicalPlan`].
     //
-    // Returns [`None`] if either the provider cannot federate any plan
-    // (e.g. [`crate::analyzer::NopFederationProvider`]), or cannot federate
-    //  this specific [`LogicalPlan`].
-    fn analyzer(&self, plan: &LogicalPlan) -> Option<Arc<Analyzer>>;
+    // Returns:
+    //   - [`None`] if the provider cannot federate any plan (e.g. [`crate::analyzer::NopFederationProvider`]).
+    //   - Some(FederationAnalyzerForLogicalPlan::Unable) if the provider cannot federate this specific [`LogicalPlan`].
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan>;
+}
+
+/// [`LogicalPlan`] specific federation [`Analyzer`] from a [`FederationProvider`].
+#[derive(Debug)]
+pub enum FederationAnalyzerForLogicalPlan {
+    /// The [`FederationProvider`] cannot federate the [`LogicalPlan`].
+    Unable,
+    With(Arc<Analyzer>),
 }
 
 impl fmt::Display for dyn FederationProvider {
