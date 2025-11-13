@@ -595,7 +595,7 @@ mod tests {
         // pushed down since it will be optimised into `Filter: table_a1.a > Int64(0)`.
         insta::assert_snapshot!(ctx
             .sql(
-                r#"SELECT non_federate, b, c FROM (SELECT a AS 'non_federate', b, c FROM table_a1) WHERE non_federate > 0"#,
+                r#"SELECT a as non_federate, b, c FROM (SELECT a, b, c FROM table_a1) WHERE a > 0"#,
             )
             .await?
             .into_optimized_plan()?
