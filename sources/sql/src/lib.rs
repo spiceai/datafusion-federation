@@ -13,7 +13,7 @@ use datafusion::{
             AggregateFunction, Alias, Exists, InList, InSubquery, ScalarFunction, Sort, Unnest,
             WindowFunction,
         },
-        Between, BinaryExpr, Case, Cast, Expr, Extension, GroupingSet, Like, LogicalPlan, Subquery,
+        Between, BinaryExpr, Case, Cast, Explain, Expr, Extension, GroupingSet, Like, LogicalPlan, Subquery,
         TryCast,
     },
     optimizer::analyzer::{Analyzer, AnalyzerRule},
@@ -629,11 +629,28 @@ impl VirtualExecutionPlan {
     }
 
     fn sql(&self) -> Result<String> {
-        // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
-        let mut known_rewrites = HashMap::new();
-        let ast = Unparser::new(self.executor.dialect().as_ref())
-            .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
-        Ok(format!("{ast}"))
+        // Check if this is an EXPLAIN or EXPLAIN ANALYZE query
+        if let LogicalPlan::Explain(explain) = &self.plan {
+            // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
+            let mut known_rewrites = HashMap::new();
+            let rewritten_plan = rewrite_table_scans(explain.plan.as_ref(), &mut known_rewrites)?;
+            let ast = Unparser::new(self.executor.dialect().as_ref())
+                .plan_to_sql(&rewritten_plan)?;
+            
+            // Prefix with EXPLAIN or EXPLAIN ANALYZE
+            let prefix = if explain.analyze {
+                "EXPLAIN ANALYZE "
+            } else {
+                "EXPLAIN "
+            };
+            Ok(format!("{}{}", prefix, ast))
+        } else {
+            // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
+            let mut known_rewrites = HashMap::new();
+            let ast = Unparser::new(self.executor.dialect().as_ref())
+                .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
+            Ok(format!("{ast}"))
+        }
     }
 }
 
@@ -922,6 +939,46 @@ mod tests {
             "SQL under test: {}",
             sql_query
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_explain_queries() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let executor = Arc::new(TestSQLExecutor {});
+        let provider = Arc::new(SQLFederationProvider::new(executor.clone()));
+        
+        // Test EXPLAIN query
+        let explain_query = "EXPLAIN SELECT a FROM app_table";
+        let df = ctx.sql(explain_query).await?;
+        
+        let plan = df.logical_plan();
+        println!("EXPLAIN logical plan: \n{:#?}", plan);
+        
+        // Create a VirtualExecutionPlan to test the sql() method
+        let virtual_plan = VirtualExecutionPlan::new(plan.clone(), executor.clone());
+        let generated_sql = virtual_plan.sql()?;
+        
+        println!("Generated SQL for EXPLAIN: {}", generated_sql);
+        assert!(generated_sql.starts_with("EXPLAIN "), "EXPLAIN query should be prefixed with EXPLAIN");
+        assert!(generated_sql.contains("remote_table"), "EXPLAIN query should have table rewrites");
+
+        // Test EXPLAIN ANALYZE query
+        let explain_analyze_query = "EXPLAIN ANALYZE SELECT a FROM app_table";
+        let df = ctx.sql(explain_analyze_query).await?;
+        
+        let plan = df.logical_plan();
+        println!("EXPLAIN ANALYZE logical plan: \n{:#?}", plan);
+        
+        let virtual_plan = VirtualExecutionPlan::new(plan.clone(), executor.clone());
+        let generated_sql = virtual_plan.sql()?;
+        
+        println!("Generated SQL for EXPLAIN ANALYZE: {}", generated_sql);
+        assert!(generated_sql.starts_with("EXPLAIN ANALYZE "), "EXPLAIN ANALYZE query should be prefixed with EXPLAIN ANALYZE");
+        assert!(generated_sql.contains("remote_table"), "EXPLAIN ANALYZE query should have table rewrites");
 
         Ok(())
     }
