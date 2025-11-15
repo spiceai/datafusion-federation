@@ -191,7 +191,7 @@ impl VirtualExecutionPlan {
             let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
             let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
             RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
-            
+
             // Prefix with EXPLAIN or EXPLAIN ANALYZE
             let prefix = if explain.analyze {
                 "EXPLAIN ANALYZE "
