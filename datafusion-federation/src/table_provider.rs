@@ -1,13 +1,15 @@
-use std::{any::Any, sync::Arc};
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    catalog::Session,
     common::Constraints,
     datasource::TableProvider,
     error::{DataFusionError, Result},
-    execution::context::SessionState,
-    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableSource, TableType},
+    logical_expr::{
+        dml::InsertOp, Expr, LogicalPlan, TableProviderFilterPushDown, TableSource, TableType,
+    },
     physical_plan::ExecutionPlan,
 };
 
@@ -15,6 +17,7 @@ use crate::FederationProvider;
 
 // FederatedTableSourceWrapper helps to recover the FederatedTableSource
 // from a TableScan. This wrapper may be avoidable.
+#[derive(Debug)]
 pub struct FederatedTableProviderAdaptor {
     pub source: Arc<dyn FederatedTableSource>,
     pub table_provider: Option<Arc<dyn TableProvider>>,
@@ -70,7 +73,7 @@ impl TableProvider for FederatedTableProviderAdaptor {
 
         self.source.table_type()
     }
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         if let Some(table_provider) = &self.table_provider {
             return table_provider
                 .get_logical_plan()
@@ -106,7 +109,7 @@ impl TableProvider for FederatedTableProviderAdaptor {
     // with a virtual TableProvider that provides federation for a sub-plan.
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -122,12 +125,12 @@ impl TableProvider for FederatedTableProviderAdaptor {
 
     async fn insert_into(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(table_provider) = &self.table_provider {
-            return table_provider.insert_into(_state, input, overwrite).await;
+            return table_provider.insert_into(_state, input, insert_op).await;
         }
 
         Err(DataFusionError::NotImplemented(
@@ -140,6 +143,16 @@ impl TableProvider for FederatedTableProviderAdaptor {
 // to allow grouping of TableScans of the same FederationProvider.
 #[async_trait]
 pub trait FederatedTableSource: TableSource {
-    // Return the FederationProvider associated with this Table
+    /// Return the FederationProvider associated with this Table
     fn federation_provider(&self) -> Arc<dyn FederationProvider>;
+}
+
+impl std::fmt::Debug for dyn FederatedTableSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "FederatedTableSource: {:?}",
+            self.federation_provider().name()
+        )
+    }
 }

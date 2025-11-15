@@ -1,22 +1,64 @@
-use core::fmt;
+mod analyzer;
+mod plan_node;
+pub mod schema_cast;
+#[cfg(feature = "sql")]
+pub mod sql;
+mod table_provider;
+
 use std::{
+    fmt,
     hash::{Hash, Hasher},
     sync::Arc,
 };
 
-use datafusion::optimizer::analyzer::Analyzer;
+use datafusion::{
+    execution::session_state::{SessionState, SessionStateBuilder},
+    logical_expr::LogicalPlan,
+    optimizer::{
+        analyzer::{
+            resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
+        },
+        Analyzer, AnalyzerRule,
+    },
+};
 
-mod analyzer;
-pub use analyzer::*;
-mod table_provider;
-pub use table_provider::*;
+pub use analyzer::{get_table_source, FederationAnalyzerRule};
+pub use plan_node::{
+    FederatedPlanNode, FederatedPlanner, FederatedQueryPlanner, FederationPlanner,
+};
+pub use table_provider::{FederatedTableProviderAdaptor, FederatedTableSource};
 
-mod plan_node;
-pub use plan_node::*;
-pub mod schema_cast;
+pub fn default_session_state() -> SessionState {
+    let rules = default_analyzer_rules();
+    SessionStateBuilder::new()
+        .with_analyzer_rules(rules)
+        .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+        .with_default_features()
+        .build()
+}
+
+/// datafusion-federation customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
+/// as opposed to when underlying federated query engines will execute the query.
+///
+/// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added.
+pub fn default_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    vec![
+        Arc::new(FederationAnalyzerRule::new()),
+        // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
+        Arc::new(ResolveGroupingFunction::new()),
+        Arc::new(TypeCoercion::new()),
+    ]
+}
 
 pub type FederationProviderRef = Arc<dyn FederationProvider>;
-pub trait FederationProvider: Send + Sync {
+
+impl From<Arc<Analyzer>> for FederationAnalyzerForLogicalPlan {
+    fn from(value: Arc<Analyzer>) -> Self {
+        Self::With(value)
+    }
+}
+
+pub trait FederationProvider: Send + Sync + std::fmt::Debug {
     // Returns the name of the provider, used for comparison.
     fn name(&self) -> &str;
 
@@ -24,9 +66,20 @@ pub trait FederationProvider: Send + Sync {
     // will execute a query. For example: database instance & catalog.
     fn compute_context(&self) -> Option<String>;
 
-    // Returns an analyzer that can cut out part of the plan
-    // to federate it.
-    fn analyzer(&self) -> Option<Arc<Analyzer>>;
+    // Returns an analyzer that can cut out, and federate part of the [`LogicalPlan`].
+    //
+    // Returns:
+    //   - [`None`] if the provider cannot federate any plan (e.g. [`crate::analyzer::NopFederationProvider`]).
+    //   - Some(FederationAnalyzerForLogicalPlan::Unable) if the provider cannot federate this specific [`LogicalPlan`].
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan>;
+}
+
+/// [`LogicalPlan`] specific federation [`Analyzer`] from a [`FederationProvider`].
+#[derive(Debug)]
+pub enum FederationAnalyzerForLogicalPlan {
+    /// The [`FederationProvider`] cannot federate the [`LogicalPlan`].
+    Unable,
+    With(Arc<Analyzer>),
 }
 
 impl fmt::Display for dyn FederationProvider {
@@ -50,3 +103,29 @@ impl Hash for dyn FederationProvider {
 }
 
 impl Eq for dyn FederationProvider {}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::optimizer::Analyzer;
+
+    /// Verifies that the default analyzer rules are in the expected order.
+    ///
+    /// If this test fails, `DataFusion` has modified the default analyzer rules and `get_analyzer_rules()` should be updated.
+    #[test]
+    fn test_verify_default_analyzer_rules() {
+        let default_rules = Analyzer::new().rules;
+        assert_eq!(
+            default_rules.len(),
+            2,
+            "Default analyzer rules have changed"
+        );
+        let expected_rule_names = vec!["resolve_grouping_function", "type_coercion"];
+        for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
+            assert_eq!(
+                expected_name,
+                rule.name(),
+                "Default analyzer rule order has changed"
+            );
+        }
+    }
+}

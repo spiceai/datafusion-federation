@@ -1,6 +1,10 @@
 name: Test
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
 
 jobs:
   check:
@@ -15,7 +19,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo check
+      - run: cargo check --all-features
 
   test:
     name: Test
@@ -29,7 +33,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo test
+      - run: cargo test --all-features
 
   rustfmt:
     name: Rustfmt
@@ -55,7 +59,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo clippy -- -Dwarnings
+      - run: cargo clippy -- -D warnings
 
   package:
     name: Package
@@ -69,5 +73,5 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo build
-      - run: cargo package -p datafusion-federation --allow-dirty
+      - run: cargo build --all --all-features
+      - run: cargo package -p datafusion-federation --allow-dirty --all-features
