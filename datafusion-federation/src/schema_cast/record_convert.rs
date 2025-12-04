@@ -52,6 +52,12 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
     let actual_schema = record_batch.schema();
 
     if actual_schema.fields().len() != expected_schema.fields().len() {
+        tracing::debug!(
+            actual_schema = ?actual_schema,
+            expected_schema = ?expected_schema,
+            "Schema mismatch in try_cast_to"
+        );
+        tracing::trace!(record_batch = ?record_batch, "Record batch contents");
         return Err(Error::UnexpectedNumberOfColumns {
             expected: expected_schema.fields().len(),
             found: actual_schema.fields().len(),
@@ -122,10 +128,26 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
                     .map_err(|e| Error::UnableToConvertRecordBatch { source: e }),
             }
         })
-        .collect::<Result<Vec<Arc<dyn Array>>>>()?;
+        .collect::<Result<Vec<Arc<dyn Array>>>>()
+        .map_err(|e| {
+            tracing::debug!(
+                actual_schema = ?actual_schema,
+                expected_schema = ?expected_schema,
+                "Cast error in try_cast_to"
+            );
+            tracing::trace!(record_batch = ?record_batch, "Record batch contents");
+            e
+        })?;
 
-    RecordBatch::try_new(expected_schema, cols)
-        .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+    RecordBatch::try_new(expected_schema.clone(), cols).map_err(|e| {
+        tracing::debug!(
+            actual_schema = ?actual_schema,
+            expected_schema = ?expected_schema,
+            "RecordBatch creation error in try_cast_to"
+        );
+        tracing::trace!(record_batch = ?record_batch, "Record batch contents");
+        Error::UnableToConvertRecordBatch { source: e }
+    })
 }
 
 #[cfg(test)]
