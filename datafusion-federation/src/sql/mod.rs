@@ -17,7 +17,7 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{Extension, LogicalPlan},
+    logical_expr::{Explain, Extension, LogicalPlan},
     optimizer::{eliminate_nested_union::EliminateNestedUnion, Analyzer, AnalyzerRule, Optimizer},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -180,16 +180,37 @@ impl VirtualExecutionPlan {
     }
 
     fn final_sql(&self) -> Result<String> {
-        let plan = self.plan.clone();
-        let known_rewrites = collect_known_rewrites(&plan)?;
-        let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
-        let (logical_optimizers, ast_analyzers) = gather_analyzers(&plan)?;
-        let plan = apply_logical_optimizers(plan, logical_optimizers)?;
-        let ast = self.plan_to_statement(&plan)?;
-        let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
-        let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
-        RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
-        Ok(ast.to_string())
+        // Check if this is an EXPLAIN or EXPLAIN ANALYZE query
+        if let LogicalPlan::Explain(explain) = &self.plan {
+            let plan = explain.plan.as_ref().clone();
+            let known_rewrites = collect_known_rewrites(&plan)?;
+            let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+            let (logical_optimizers, ast_analyzers) = gather_analyzers(&plan)?;
+            let plan = apply_logical_optimizers(plan, logical_optimizers)?;
+            let ast = self.plan_to_statement(&plan)?;
+            let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
+            let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
+            RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
+            
+            // Prefix with EXPLAIN or EXPLAIN ANALYZE
+            let prefix = if explain.analyze {
+                "EXPLAIN ANALYZE "
+            } else {
+                "EXPLAIN "
+            };
+            Ok(format!("{}{}", prefix, ast.to_string()))
+        } else {
+            let plan = self.plan.clone();
+            let known_rewrites = collect_known_rewrites(&plan)?;
+            let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+            let (logical_optimizers, ast_analyzers) = gather_analyzers(&plan)?;
+            let plan = apply_logical_optimizers(plan, logical_optimizers)?;
+            let ast = self.plan_to_statement(&plan)?;
+            let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
+            let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
+            RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
+            Ok(ast.to_string())
+        }
     }
 
     fn rewrite_with_executor_ast_analyzer(
