@@ -11,26 +11,26 @@ readme = "README.md"
 repository = "https://github.com/datafusion-contrib/datafusion-federation"
 
 [workspace.dependencies]
-arrow-json = "56"
+arrow-json = "57"
 async-stream = "0.3.5"
 async-trait = "0.1.83"
-datafusion = "50"
+datafusion = "51"
 datafusion-federation = { path = "./datafusion-federation", version = "0.4.2" }
 futures = "0.3.31"
 tokio = { version = "1.41", features = ["full"] }
 
 [patch.crates-io]
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "dd02045c3aa77895723e873222cbe30f5c8f77a9" } # spiceai-1.3.2
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "2b2d90826ccba84435174e10c551dbdf3dae41f3" } # spiceai-57
 
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }               # spiceai-50
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }          # spiceai-50
-datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" } # spiceai-50
-datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" } # spiceai-50
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "606561070b2a9f702d5e36c6139eed21836c50bd" }               # upstream:v51
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "606561070b2a9f702d5e36c6139eed21836c50bd" }          # upstream:v51
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "606561070b2a9f702d5e36c6139eed21836c50bd" } # upstream:v51
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", rev = "606561070b2a9f702d5e36c6139eed21836c50bd" } # upstream:v51
 
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }        # spiceai-56
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }   # spiceai-56
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }      # spiceai-56
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "122357d9232caa9d512e4dc58176c9152f19595b" }        # spiceai-57
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "122357d9232caa9d512e4dc58176c9152f19595b" } # spiceai-57
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "122357d9232caa9d512e4dc58176c9152f19595b" }   # spiceai-57
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "122357d9232caa9d512e4dc58176c9152f19595b" }    # spiceai-57
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "122357d9232caa9d512e4dc58176c9152f19595b" }    # spiceai-57
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "122357d9232caa9d512e4dc58176c9152f19595b" } # spiceai-57
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "122357d9232caa9d512e4dc58176c9152f19595b" }      # spiceai-57

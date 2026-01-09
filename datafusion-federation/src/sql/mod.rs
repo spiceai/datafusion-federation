@@ -12,6 +12,7 @@ use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
 use ast_analyzer::{AstAnalyzer, RewriteMultiTableReference};
 use async_trait::async_trait;
 use datafusion::{
+    common::DFSchema,
     arrow::datatypes::{Schema, SchemaRef},
     common::tree_node::TreeNode,
     config::ConfigOptions,
@@ -160,7 +161,7 @@ struct VirtualExecutionPlan {
 
 impl VirtualExecutionPlan {
     pub fn new(plan: LogicalPlan, executor: Arc<dyn SQLExecutor>) -> Self {
-        let schema: Schema = plan.schema().as_ref().into();
+        let schema: Schema = <DFSchema as AsRef<Schema>>::as_ref(plan.schema().as_ref()).clone();
         let props = PlanProperties::new(
             EquivalenceProperties::new(Arc::new(schema)),
             Partitioning::UnknownPartitioning(1),
@@ -176,7 +177,7 @@ impl VirtualExecutionPlan {
 
     fn schema(&self) -> SchemaRef {
         let df_schema = self.plan.schema().as_ref();
-        Arc::new(Schema::from(df_schema))
+        Arc::new(<DFSchema as AsRef<Schema>>::as_ref(df_schema).clone())
     }
 
     fn final_sql(&self) -> Result<String> {
@@ -375,6 +376,7 @@ mod tests {
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::{self};
     use datafusion::{
+    common::DFSchema,
         arrow::datatypes::{DataType, Field},
         datasource::TableProvider,
         execution::context::SessionContext,
