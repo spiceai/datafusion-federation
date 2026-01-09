@@ -34,6 +34,7 @@ pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
+pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
 
 use crate::{
     get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerForLogicalPlan,
