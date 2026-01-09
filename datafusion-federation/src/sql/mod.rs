@@ -9,7 +9,7 @@ mod table_reference;
 use std::{any::Any, fmt, sync::Arc, vec};
 
 use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
-use ast_analyzer::{AstAnalyzer, RewriteMultiTableReference};
+use ast_analyzer::RewriteMultiTableReference;
 use async_trait::async_trait;
 use datafusion::{
     common::DFSchema,
