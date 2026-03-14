@@ -490,6 +490,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::physical_plan::PhysicalExpr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::plan_to_sql;
     use datafusion::{
@@ -520,7 +521,12 @@ mod tests {
             unimplemented!()
         }
 
-        fn execute(&self, _query: &str, _schema: SchemaRef) -> Result<SendableRecordBatchStream> {
+        fn execute(
+            &self,
+            _query: &str,
+            _schema: SchemaRef,
+            _filters: &[Arc<dyn PhysicalExpr>],
+        ) -> Result<SendableRecordBatchStream> {
             unimplemented!()
         }
 
@@ -876,7 +882,7 @@ mod tests {
             ),
             (
                 "SELECT foo.df_table.a FROM foo.df_table",
-                r#"SELECT a FROM "default".remote_table"#,
+                r#"SELECT remote_table.a FROM "default".remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",

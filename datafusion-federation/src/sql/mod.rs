@@ -22,7 +22,7 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
     logical_expr::{Extension, LogicalPlan},
-    optimizer::{eliminate_nested_union::EliminateNestedUnion, Analyzer, AnalyzerRule, Optimizer},
+    optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
@@ -51,7 +51,7 @@ use crate::{
 /// Returns a federation analyzer rule that is optimized for SQL federation.
 pub fn federation_analyzer_rule() -> FederationAnalyzerRule {
     FederationAnalyzerRule::new().with_optimizer(Optimizer::with_rules(vec![
-        Arc::new(EliminateNestedUnion::new()),
+        Arc::new(OptimizeUnions::new()),
         Arc::new(PushDownFilterFederation::new()),
         Arc::new(OptimizeProjectionsFederation::new()),
     ]))
@@ -323,7 +323,7 @@ impl DisplayAs for VirtualExecutionPlan {
             write!(f, " base_sql={statement}")?;
         }
 
-        let (logical_optimizers, ast_analyzers, sql_query_rewriters) = match gather_analyzers(&plan)
+        let (logical_optimizers, ast_analyzers, _sql_query_rewriters) = match gather_analyzers(&plan)
         {
             Ok(analyzers) => analyzers,
             Err(_) => return Ok(()),
@@ -427,7 +427,6 @@ impl ExecutionPlan for VirtualExecutionPlan {
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         let parent_filters: Vec<_> = child_pushdown_result
-            .clone()
             .parent_filters
             .into_iter()
             .map(|f| f.filter)
@@ -588,7 +587,7 @@ mod tests {
             self
         }
 
-        fn table_reference(&self) -> TableReference {
+        fn table_reference(&self) -> MultiPartTableReference {
             self.table.table_reference().clone()
         }
 
@@ -914,7 +913,7 @@ mod tests {
         });
 
         let expected = vec![
-            r#"SELECT a, b, c FROM "default"."table" UNION ALL SELECT a, b, c FROM "default"."Table"(1) AS Table"#,
+            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) AS Table"#,
         ];
 
         assert_eq!(
@@ -929,6 +928,7 @@ mod tests {
     async fn sql_query_rewriter_hook_invoked_and_rewrites_sql() -> Result<(), DataFusionError> {
         let executor = TestExecutor {
             compute_context: "rewrite".into(),
+            cannot_federate: None,
         };
         let rewrite_calls = Arc::new(AtomicUsize::new(0));
         let table_ref = "table_with_rewriter".to_string();
@@ -955,7 +955,7 @@ mod tests {
         let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;
 
         let mut final_queries = vec![];
-        let _ = physical_plan.apply(|node| {
+        physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
                     .as_any()
@@ -964,7 +964,7 @@ mod tests {
                 final_queries.push(node.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
-        });
+        })?;
 
         let [final_query] = final_queries.as_slice() else {
             panic!("expected a single federated SQL query");

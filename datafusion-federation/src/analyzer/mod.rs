@@ -3,7 +3,7 @@ mod scan_result;
 use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
 use crate::{FederationAnalyzerForLogicalPlan, FederationProvider};
 use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
-use datafusion::optimizer::eliminate_nested_union::EliminateNestedUnion;
+use datafusion::optimizer::optimize_unions::OptimizeUnions;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
 use datafusion::{
@@ -74,7 +74,7 @@ impl FederationAnalyzerRule {
 
     pub fn default_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
         vec![
-            Arc::new(EliminateNestedUnion::new()),
+            Arc::new(OptimizeUnions::new()),
             Arc::new(PushDownFilter::new()),
         ]
     }
