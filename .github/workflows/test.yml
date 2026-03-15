@@ -16,7 +16,7 @@ jobs:
           fetch-depth: 0
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo check --all-features
@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo test --all-features
@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo clippy -- -D warnings
@@ -70,7 +70,7 @@ jobs:
           fetch-depth: 0
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo build --all --all-features

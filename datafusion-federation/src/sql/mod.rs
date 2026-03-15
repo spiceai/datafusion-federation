@@ -12,12 +12,9 @@ use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
 use ast_analyzer::RewriteMultiTableReference;
 use async_trait::async_trait;
 use datafusion::{
-    common::DFSchema,
     arrow::datatypes::{Schema, SchemaRef},
-    common::{
-        tree_node::TreeNode,
-        Statistics,
-    },
+    common::DFSchema,
+    common::{tree_node::TreeNode, Statistics},
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
@@ -37,11 +34,11 @@ use datafusion::{
 };
 use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
+pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
 pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef, SqlQueryRewriter};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
-pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
 
 use crate::{
     get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerForLogicalPlan,
@@ -61,7 +58,7 @@ pub fn federation_analyzer_rule() -> FederationAnalyzerRule {
 #[derive(Debug)]
 pub struct SQLFederationProvider {
     analyzer: Arc<Analyzer>,
-    pub executor: Arc<dyn SQLExecutor>,
+    pub(crate) executor: Arc<dyn SQLExecutor>,
 }
 
 impl SQLFederationProvider {
@@ -72,6 +69,10 @@ impl SQLFederationProvider {
             )])),
             executor,
         }
+    }
+
+    pub fn executor(&self) -> &Arc<dyn SQLExecutor> {
+        &self.executor
     }
 }
 
@@ -134,12 +135,16 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
 
 #[derive(Debug)]
 pub struct SQLFederationPlanner {
-    pub executor: Arc<dyn SQLExecutor>,
+    pub(crate) executor: Arc<dyn SQLExecutor>,
 }
 
 impl SQLFederationPlanner {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self { executor }
+    }
+
+    pub fn executor(&self) -> &Arc<dyn SQLExecutor> {
+        &self.executor
     }
 }
 
@@ -323,11 +328,11 @@ impl DisplayAs for VirtualExecutionPlan {
             write!(f, " base_sql={statement}")?;
         }
 
-        let (logical_optimizers, ast_analyzers, _sql_query_rewriters) = match gather_analyzers(&plan)
-        {
-            Ok(analyzers) => analyzers,
-            Err(_) => return Ok(()),
-        };
+        let (logical_optimizers, ast_analyzers, _sql_query_rewriters) =
+            match gather_analyzers(&plan) {
+                Ok(analyzers) => analyzers,
+                Err(_) => return Ok(()),
+            };
 
         let old_plan = plan.clone();
 
@@ -471,9 +476,7 @@ mod tests {
     use datafusion::prelude::Expr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::{self};
-    use datafusion::sql::TableReference;
     use datafusion::{
-    common::DFSchema,
         arrow::datatypes::{DataType, Field},
         datasource::TableProvider,
         execution::context::SessionContext,
