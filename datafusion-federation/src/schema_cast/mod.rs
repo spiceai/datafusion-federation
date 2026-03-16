@@ -1,14 +1,18 @@
 use async_stream::stream;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::Statistics;
+use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PhysicalExpr,
+    PlanProperties,
 };
 use futures::StreamExt;
 use std::any::Any;
-use std::clone::Clone;
 use std::fmt;
 use std::sync::Arc;
 
@@ -23,6 +27,7 @@ pub struct SchemaCastScanExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
     properties: PlanProperties,
+    metrics_set: ExecutionPlanMetricsSet,
 }
 
 impl SchemaCastScanExec {
@@ -40,6 +45,7 @@ impl SchemaCastScanExec {
             input,
             schema,
             properties,
+            metrics_set: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -100,17 +106,40 @@ impl ExecutionPlan for SchemaCastScanExec {
     ) -> Result<SendableRecordBatchStream> {
         let mut stream = self.input.execute(partition, context)?;
         let schema = Arc::clone(&self.schema);
+        let baseline_metrics = BaselineMetrics::new(&self.metrics_set, partition);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             {
                 stream! {
                     while let Some(batch) = stream.next().await {
+                        let _timer = baseline_metrics.elapsed_compute().timer();
                         let batch = record_convert::try_cast_to(batch?, Arc::clone(&schema));
-                        yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
+                        let batch = batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
+                        if let Ok(ref b) = batch {
+                            baseline_metrics.output_rows().add(b.num_rows());
+                        }
+                        yield batch;
                     }
                 }
             },
         )))
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics_set.clone_inner())
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
     }
 }
