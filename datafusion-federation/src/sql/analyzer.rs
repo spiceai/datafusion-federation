@@ -1,102 +1,33 @@
-use core::fmt;
-use std::{any::Any, collections::HashMap, sync::Arc, vec};
+use std::{collections::HashMap, sync::Arc};
 
-use async_trait::async_trait;
 use datafusion::{
-    arrow::datatypes::{Schema, SchemaRef},
-    common::Column,
-    config::ConfigOptions,
-    error::Result,
-    execution::{context::SessionState, TaskContext},
+    common::{Column, Spans},
     logical_expr::{
         expr::{
-            AggregateFunction, Alias, Exists, InList, InSubquery, ScalarFunction, Sort, Unnest,
-            WindowFunction,
+            AggregateFunction, AggregateFunctionParams, Alias, Exists, InList, InSubquery,
+            PlannedReplaceSelectItem, ScalarFunction, Sort, Unnest, WildcardOptions,
+            WindowFunction, WindowFunctionParams,
         },
-        Between, BinaryExpr, Case, Cast, Explain, Expr, Extension, GroupingSet, Like, LogicalPlan, Subquery,
+        Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Limit, LogicalPlan, Subquery,
         TryCast,
     },
-    optimizer::analyzer::{Analyzer, AnalyzerRule},
-    physical_expr::EquivalenceProperties,
-    physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream,
-    },
-    sql::{
-        unparser::{plan_to_sql, Unparser},
-        TableReference,
-    },
-};
-use datafusion_federation::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
+    sql::TableReference,
 };
 
-mod schema;
-pub use schema::*;
+use crate::get_table_source;
 
-#[cfg(feature = "connectorx")]
-pub mod connectorx;
-mod executor;
-pub use executor::*;
+use super::SQLTableSource;
 
-// #[macro_use]
-// extern crate derive_builder;
+type Result<T> = std::result::Result<T, datafusion::error::DataFusionError>;
 
-// SQLFederationProvider provides federation to SQL DMBSs.
-pub struct SQLFederationProvider {
-    analyzer: Arc<Analyzer>,
-    executor: Arc<dyn SQLExecutor>,
-}
+/// Rewrite LogicalPlan's table scans and expressions to use the federated table name.
+#[derive(Debug)]
+pub struct RewriteTableScanAnalyzer;
 
-impl SQLFederationProvider {
-    pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
-        Self {
-            analyzer: Arc::new(Analyzer::with_rules(vec![Arc::new(
-                SQLFederationAnalyzerRule::new(Arc::clone(&executor)),
-            )])),
-            executor,
-        }
-    }
-}
-
-impl FederationProvider for SQLFederationProvider {
-    fn name(&self) -> &str {
-        "sql_federation_provider"
-    }
-
-    fn compute_context(&self) -> Option<String> {
-        self.executor.compute_context()
-    }
-
-    fn analyzer(&self) -> Option<Arc<Analyzer>> {
-        Some(Arc::clone(&self.analyzer))
-    }
-}
-
-struct SQLFederationAnalyzerRule {
-    planner: Arc<dyn FederationPlanner>,
-}
-
-impl SQLFederationAnalyzerRule {
-    pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
-        Self {
-            planner: Arc::new(SQLFederationPlanner::new(Arc::clone(&executor))),
-        }
-    }
-}
-
-impl AnalyzerRule for SQLFederationAnalyzerRule {
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        let fed_plan = FederatedPlanNode::new(plan.clone(), Arc::clone(&self.planner));
-        let ext_node = Extension {
-            node: Arc::new(fed_plan),
-        };
-        Ok(LogicalPlan::Extension(ext_node))
-    }
-
-    /// A human readable name for this analyzer rule
-    fn name(&self) -> &str {
-        "federate_sql"
+impl RewriteTableScanAnalyzer {
+    pub fn rewrite(plan: LogicalPlan) -> Result<LogicalPlan> {
+        let known_rewrites = &mut HashMap::new();
+        rewrite_table_scans(&plan, known_rewrites)
     }
 }
 
@@ -117,7 +48,7 @@ fn rewrite_table_scans(
 
             match federated_source.as_any().downcast_ref::<SQLTableSource>() {
                 Some(sql_table_source) => {
-                    let remote_table_name = TableReference::from(sql_table_source.table_name());
+                    let remote_table_name = sql_table_source.table_reference();
                     known_rewrites.insert(original_table_name, remote_table_name.clone());
 
                     // Rewrite the schema of this node to have the remote table as the qualifier.
@@ -139,10 +70,33 @@ fn rewrite_table_scans(
         }
     }
 
+    if let LogicalPlan::Limit(limit) = plan {
+        let rewritten_skip = limit
+            .skip
+            .as_ref()
+            .map(|skip| rewrite_table_scans_in_expr(*skip.clone(), known_rewrites).map(Box::new))
+            .transpose()?;
+
+        let rewritten_fetch = limit
+            .fetch
+            .as_ref()
+            .map(|fetch| rewrite_table_scans_in_expr(*fetch.clone(), known_rewrites).map(Box::new))
+            .transpose()?;
+
+        // explicitly set fetch and skip
+        let new_plan = LogicalPlan::Limit(Limit {
+            skip: rewritten_skip,
+            fetch: rewritten_fetch,
+            input: Arc::new(rewrite_table_scans(&limit.input, known_rewrites)?),
+        });
+
+        return Ok(new_plan);
+    }
+
     let rewritten_inputs = plan
         .inputs()
         .into_iter()
-        .map(|i| rewrite_table_scans(i, known_rewrites))
+        .map(|plan| rewrite_table_scans(plan, known_rewrites))
         .collect::<Result<Vec<_>>>()?;
 
     let mut new_expressions = vec![];
@@ -159,7 +113,7 @@ fn rewrite_table_scans(
 // The function replaces occurrences of table_ref_str in col_name with the new name defined by rewrite.
 // The name to rewrite should NOT be a substring of another name.
 // Supports multiple occurrences of table_ref_str in col_name.
-fn rewrite_column_name_in_expr(
+pub fn rewrite_column_name_in_expr(
     col_name: &str,
     table_ref_str: &str,
     rewrite: &str,
@@ -170,9 +124,7 @@ fn rewrite_column_name_in_expr(
     }
 
     // Find the first occurrence of table_ref_str starting from start_pos
-    let Some(idx) = col_name[start_pos..].find(table_ref_str) else {
-        return None;
-    };
+    let idx = col_name[start_pos..].find(table_ref_str)?;
 
     // Calculate the absolute index of the occurrence in string as the index above is relative to start_pos
     let idx = start_pos + idx;
@@ -216,7 +168,6 @@ fn rewrite_column_name_in_expr(
         rewrite,
         &col_name[idx + table_ref_str.len()..]
     );
-
     // Check if the rewritten name contains more occurrence of table_ref_str, and rewrite them as well
     // This is done by providing the updated start_pos for search
     match rewrite_column_name_in_expr(&rewritten_name, table_ref_str, rewrite, idx + rewrite.len())
@@ -241,6 +192,7 @@ fn rewrite_table_scans_in_expr(
             Ok(Expr::ScalarSubquery(Subquery {
                 subquery: Arc::new(new_subquery),
                 outer_ref_columns,
+                spans: Spans::new(),
             }))
         }
         Expr::BinaryExpr(binary_expr) => {
@@ -256,6 +208,12 @@ fn rewrite_table_scans_in_expr(
             if let Some(rewrite) = col.relation.as_ref().and_then(|r| known_rewrites.get(r)) {
                 Ok(Expr::Column(Column::new(Some(rewrite.clone()), &col.name)))
             } else {
+                // This prevent over-eager rewrite and only pass the column into below rewritten
+                // rule like MAX(...)
+                if col.relation.is_some() {
+                    return Ok(Expr::Column(col));
+                }
+
                 // Check if any of the rewrites match any substring in col.name, and replace that part of the string if so.
                 // This will handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
                 let (new_name, was_rewritten) = known_rewrites.iter().fold(
@@ -402,14 +360,6 @@ fn rewrite_table_scans_in_expr(
                 try_cast.data_type,
             )))
         }
-        Expr::Sort(sort) => {
-            let expr = rewrite_table_scans_in_expr(*sort.expr, known_rewrites)?;
-            Ok(Expr::Sort(Sort::new(
-                Box::new(expr),
-                sort.asc,
-                sort.nulls_first,
-            )))
-        }
         Expr::ScalarFunction(sf) => {
             let args = sf
                 .args
@@ -423,16 +373,19 @@ fn rewrite_table_scans_in_expr(
         }
         Expr::AggregateFunction(af) => {
             let args = af
+                .params
                 .args
                 .into_iter()
                 .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
                 .collect::<Result<Vec<Expr>>>()?;
             let filter = af
+                .params
                 .filter
                 .map(|e| rewrite_table_scans_in_expr(*e, known_rewrites))
                 .transpose()?
                 .map(Box::new);
             let order_by = af
+                .params
                 .order_by
                 .into_iter()
                 .map(|sort| {
@@ -444,30 +397,41 @@ fn rewrite_table_scans_in_expr(
                 .collect::<Result<Vec<_>>>()?;
             let params = AggregateFunctionParams {
                 args,
-                distinct: af.distinct,
+                distinct: af.params.distinct,
                 filter,
                 order_by,
-                null_treatment: af.null_treatment,
+                null_treatment: af.params.null_treatment,
+            };
+            Ok(Expr::AggregateFunction(AggregateFunction {
+                func: af.func,
+                params,
             }))
         }
         Expr::WindowFunction(wf) => {
             let args = wf
+                .params
                 .args
                 .into_iter()
                 .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
                 .collect::<Result<Vec<Expr>>>()?;
             let partition_by = wf
+                .params
                 .partition_by
                 .into_iter()
                 .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
                 .collect::<Result<Vec<Expr>>>()?;
             let order_by = wf
+                .params
                 .order_by
                 .into_iter()
-                .map(|e| rewrite_table_scans_in_expr(e, known_rewrites))
-                .collect::<Result<Vec<Expr>>>()?;
-            Ok(Expr::WindowFunction(WindowFunction::new(
-                wf.fun,
+                .map(|sort| {
+                    Ok(Sort {
+                        expr: rewrite_table_scans_in_expr(sort.expr, known_rewrites)?,
+                        ..sort
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let params = WindowFunctionParams {
                 args,
                 partition_by,
                 order_by,
@@ -501,6 +465,7 @@ fn rewrite_table_scans_in_expr(
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
                 outer_ref_columns,
+                spans: Spans::new(),
             };
             Ok(Expr::Exists(Exists::new(subquery, exists.negated)))
         }
@@ -516,6 +481,7 @@ fn rewrite_table_scans_in_expr(
             let subquery = Subquery {
                 subquery: Arc::new(subquery_plan),
                 outer_ref_columns,
+                spans: Spans::new(),
             };
             Ok(Expr::InSubquery(InSubquery::new(
                 Box::new(expr),
@@ -523,16 +489,35 @@ fn rewrite_table_scans_in_expr(
                 is.negated,
             )))
         }
-        Expr::Wildcard { qualifier } => {
-            if let Some(rewrite) = qualifier
-                .as_ref()
-                .and_then(|q| known_rewrites.get(&TableReference::from(q)))
-            {
+        // TODO: remove the next line after `Expr::Wildcard` is removed in datafusion
+        #[expect(deprecated)]
+        Expr::Wildcard { qualifier, options } => {
+            let options = WildcardOptions {
+                replace: options
+                    .replace
+                    .map(|replace| -> Result<PlannedReplaceSelectItem> {
+                        Ok(PlannedReplaceSelectItem {
+                            planned_expressions: replace
+                                .planned_expressions
+                                .into_iter()
+                                .map(|expr| rewrite_table_scans_in_expr(expr, known_rewrites))
+                                .collect::<Result<Vec<_>>>()?,
+                            ..replace
+                        })
+                    })
+                    .transpose()?,
+                ..*options
+            };
+            if let Some(rewrite) = qualifier.as_ref().and_then(|q| known_rewrites.get(q)) {
                 Ok(Expr::Wildcard {
-                    qualifier: Some(rewrite.clone().to_string()),
+                    qualifier: Some(rewrite.clone()),
+                    options: Box::new(options),
                 })
             } else {
-                Ok(Expr::Wildcard { qualifier })
+                Ok(Expr::Wildcard {
+                    qualifier,
+                    options: Box::new(options),
+                })
             }
         }
         Expr::GroupingSet(gs) => match gs {
@@ -581,138 +566,6 @@ fn rewrite_table_scans_in_expr(
     }
 }
 
-struct SQLFederationPlanner {
-    executor: Arc<dyn SQLExecutor>,
-}
-
-impl SQLFederationPlanner {
-    pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
-        Self { executor }
-    }
-}
-
-#[async_trait]
-impl FederationPlanner for SQLFederationPlanner {
-    async fn plan_federation(
-        &self,
-        node: &FederatedPlanNode,
-        _session_state: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let schema = Arc::new(node.plan().schema().as_arrow().clone());
-        let input = Arc::new(VirtualExecutionPlan::new(
-            node.plan().clone(),
-            Arc::clone(&self.executor),
-        ));
-        let schema_cast_exec = schema_cast::SchemaCastScanExec::new(input, schema);
-        Ok(Arc::new(schema_cast_exec))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct VirtualExecutionPlan {
-    plan: LogicalPlan,
-    executor: Arc<dyn SQLExecutor>,
-    props: PlanProperties,
-}
-
-impl VirtualExecutionPlan {
-    pub fn new(plan: LogicalPlan, executor: Arc<dyn SQLExecutor>) -> Self {
-        let schema: Schema = plan.schema().as_ref().into();
-        let props = PlanProperties::new(
-            EquivalenceProperties::new(Arc::new(schema)),
-            Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
-        );
-        Self {
-            plan,
-            executor,
-            props,
-        }
-    }
-
-    fn schema(&self) -> SchemaRef {
-        let df_schema = self.plan.schema().as_ref();
-        Arc::new(Schema::from(df_schema))
-    }
-
-    fn sql(&self) -> Result<String> {
-        // Check if this is an EXPLAIN or EXPLAIN ANALYZE query
-        if let LogicalPlan::Explain(explain) = &self.plan {
-            // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
-            let mut known_rewrites = HashMap::new();
-            let rewritten_plan = rewrite_table_scans(explain.plan.as_ref(), &mut known_rewrites)?;
-            let ast = Unparser::new(self.executor.dialect().as_ref())
-                .plan_to_sql(&rewritten_plan)?;
-            
-            // Prefix with EXPLAIN or EXPLAIN ANALYZE
-            let prefix = if explain.analyze {
-                "EXPLAIN ANALYZE "
-            } else {
-                "EXPLAIN "
-            };
-            Ok(format!("{}{}", prefix, ast))
-        } else {
-            // Find all table scans, recover the SQLTableSource, find the remote table name and replace the name of the TableScan table.
-            let mut known_rewrites = HashMap::new();
-            let ast = Unparser::new(self.executor.dialect().as_ref())
-                .plan_to_sql(&rewrite_table_scans(&self.plan, &mut known_rewrites)?)?;
-            Ok(format!("{ast}"))
-        }
-    }
-}
-
-impl DisplayAs for VirtualExecutionPlan {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "VirtualExecutionPlan")?;
-        let Ok(ast) = plan_to_sql(&self.plan) else {
-            return Ok(());
-        };
-        write!(f, " name={}", self.executor.name())?;
-        if let Some(ctx) = self.executor.compute_context() {
-            write!(f, " compute_context={ctx}")?;
-        }
-        write!(f, " sql={ast}")?;
-        if let Ok(query) = self.sql() {
-            write!(f, " rewritten_sql={query}")?;
-        };
-
-        Ok(())
-    }
-}
-
-impl ExecutionPlan for VirtualExecutionPlan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        self.executor.execute(self.sql()?.as_str(), self.schema())
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.props
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::sql::table::SQLTable;
@@ -726,24 +579,22 @@ mod tests {
     use datafusion::sql::unparser::plan_to_sql;
     use datafusion::{
         arrow::datatypes::{DataType, Field},
-        catalog::schema::{MemorySchemaProvider, SchemaProvider},
+        catalog::{MemorySchemaProvider, SchemaProvider},
         common::Column,
         datasource::{DefaultTableSource, TableProvider},
-        error::DataFusionError,
         execution::context::SessionContext,
         logical_expr::LogicalPlanBuilder,
-        sql::{unparser::dialect::DefaultDialect, unparser::dialect::Dialect},
+        prelude::Expr,
     };
-    use datafusion_federation::FederatedTableProviderAdaptor;
 
     use super::*;
 
-    struct TestSQLExecutor {}
+    struct TestExecutor;
 
     #[async_trait]
-    impl SQLExecutor for TestSQLExecutor {
+    impl SQLExecutor for TestExecutor {
         fn name(&self) -> &str {
-            "test_sql_table_source"
+            "TestExecutor"
         }
 
         fn compute_context(&self) -> Option<String> {
@@ -751,7 +602,7 @@ mod tests {
         }
 
         fn dialect(&self) -> Arc<dyn Dialect> {
-            Arc::new(DefaultDialect {})
+            unimplemented!()
         }
 
         fn execute(
@@ -764,35 +615,52 @@ mod tests {
         }
 
         async fn table_names(&self) -> Result<Vec<String>> {
-            Err(DataFusionError::NotImplemented(
-                "table inference not implemented".to_string(),
-            ))
+            unimplemented!()
         }
 
         async fn get_table_schema(&self, _table_name: &str) -> Result<SchemaRef> {
-            Err(DataFusionError::NotImplemented(
-                "table inference not implemented".to_string(),
-            ))
+            unimplemented!()
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestTable {
+        name: RemoteTableRef,
+        schema: SchemaRef,
+    }
+
+    impl TestTable {
+        fn new(name: String, schema: SchemaRef) -> Self {
+            TestTable {
+                name: name.try_into().unwrap(),
+                schema,
+            }
+        }
+    }
+
+    impl SQLTable for TestTable {
+        fn table_reference(&self) -> TableReference {
+            TableReference::from(&self.name)
+        }
+
+        fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+            self.schema.clone()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
     fn get_test_table_provider() -> Arc<dyn TableProvider> {
-        let sql_federation_provider =
-            Arc::new(SQLFederationProvider::new(Arc::new(TestSQLExecutor {})));
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Utf8, false),
             Field::new("c", DataType::Date32, false),
         ]));
-        let table_source = Arc::new(
-            SQLTableSource::new_with_schema(
-                sql_federation_provider,
-                "remote_table".to_string(),
-                schema,
-            )
-            .expect("to have a valid SQLTableSource"),
-        );
+        let table = Arc::new(TestTable::new("remote_table".to_string(), schema));
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(TestExecutor)));
+        let table_source = Arc::new(SQLTableSource { provider, table });
         Arc::new(FederatedTableProviderAdaptor::new(table_source))
     }
 
@@ -825,19 +693,17 @@ mod tests {
 
     #[test]
     fn test_rewrite_table_scans_basic() -> Result<()> {
-        let default_table_source = get_test_table_source();
-        let plan =
-            LogicalPlanBuilder::scan("foo.df_table", default_table_source, None)?.project(vec![
+        let plan = LogicalPlanBuilder::scan("foo.df_table", get_test_table_source(), None)?
+            .project(vec![
                 Expr::Column(Column::from_qualified_name("foo.df_table.a")),
                 Expr::Column(Column::from_qualified_name("foo.df_table.b")),
                 Expr::Column(Column::from_qualified_name("foo.df_table.c")),
-            ])?;
+            ])?
+            .build()?;
 
-        let mut known_rewrites = HashMap::new();
-        let rewritten_plan = rewrite_table_scans(&plan.build()?, &mut known_rewrites)?;
+        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(plan)?;
 
         println!("rewritten_plan: \n{:#?}", rewritten_plan);
-
         let unparsed_sql = plan_to_sql(&rewritten_plan)?;
 
         println!("unparsed_sql: \n{unparsed_sql}");
@@ -866,37 +732,53 @@ mod tests {
         let agg_tests = vec![
             (
                 "SELECT MAX(a) FROM foo.df_table",
-                r#"SELECT MAX(remote_table.a) FROM remote_table"#,
+                r#"SELECT max(remote_table.a) FROM remote_table"#,
+            ),
+            (
+                "SELECT foo.df_table.a FROM foo.df_table",
+                r#"SELECT remote_table.a FROM remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",
-                r#"SELECT MIN(remote_table.a) FROM remote_table"#,
+                r#"SELECT min(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT AVG(a) FROM foo.df_table",
-                r#"SELECT AVG(remote_table.a) FROM remote_table"#,
+                r#"SELECT avg(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT SUM(a) FROM foo.df_table",
-                r#"SELECT SUM(remote_table.a) FROM remote_table"#,
+                r#"SELECT sum(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT COUNT(a) FROM foo.df_table",
-                r#"SELECT COUNT(remote_table.a) FROM remote_table"#,
+                r#"SELECT count(remote_table.a) FROM remote_table"#,
             ),
             (
                 "SELECT COUNT(a) as cnt FROM foo.df_table",
-                r#"SELECT COUNT(remote_table.a) AS cnt FROM remote_table"#,
+                r#"SELECT count(remote_table.a) AS cnt FROM remote_table"#,
+            ),
+            (
+                "SELECT COUNT(a) as cnt FROM foo.df_table",
+                r#"SELECT count(remote_table.a) AS cnt FROM remote_table"#,
+            ),
+            (
+                "SELECT app_table from (SELECT a as app_table FROM app_table) b",
+                r#"SELECT b.app_table FROM (SELECT remote_table.a AS app_table FROM remote_table) AS b"#,
+            ),
+            (
+                "SELECT MAX(app_table) from (SELECT a as app_table FROM app_table) b",
+                r#"SELECT max(b.app_table) FROM (SELECT remote_table.a AS app_table FROM remote_table) AS b"#,
             ),
             // multiple occurrences of the same table in single aggregation expression
             (
                 "SELECT COUNT(CASE WHEN a > 0 THEN a ELSE 0 END) FROM app_table",
-                r#"SELECT COUNT(CASE WHEN (remote_table.a > 0) THEN remote_table.a ELSE 0 END) FROM remote_table"#,
+                r#"SELECT count(CASE WHEN (remote_table.a > 0) THEN remote_table.a ELSE 0 END) FROM remote_table"#,
             ),
             // different tables in single aggregation expression
             (
-                "SELECT COUNT(CASE WHEN app_table.a > 0 THEN app_table.a ELSE foo.df_table.a END) FROM app_table, foo.df_table",
-                r#"SELECT COUNT(CASE WHEN (remote_table.a > 0) THEN remote_table.a ELSE remote_table.a END) FROM remote_table JOIN remote_table ON true"#,
+                "SELECT COUNT(CASE WHEN appt.a > 0 THEN appt.a ELSE dft.a END) FROM app_table as appt, foo.df_table as dft",
+                "SELECT count(CASE WHEN (appt.a > 0) THEN appt.a ELSE dft.a END) FROM remote_table AS appt CROSS JOIN remote_table AS dft"
             ),
         ];
 
@@ -915,7 +797,7 @@ mod tests {
         let tests = vec![
             (
                 "SELECT COUNT(app_table_a) FROM (SELECT a as app_table_a FROM app_table)",
-                r#"SELECT COUNT(app_table_a) FROM (SELECT remote_table.a AS app_table_a FROM remote_table)"#,
+                r#"SELECT count(app_table_a) FROM (SELECT remote_table.a AS app_table_a FROM remote_table)"#,
             ),
             (
                 "SELECT app_table_a FROM (SELECT a as app_table_a FROM app_table)",
@@ -934,17 +816,39 @@ mod tests {
         Ok(())
     }
 
-    async fn test_sql(
-        ctx: &SessionContext,
-        sql_query: &str,
-        expected_sql: &str,
-    ) -> Result<(), datafusion::error::DataFusionError> {
+    #[tokio::test]
+    async fn test_rewrite_table_scans_preserve_existing_alias() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let tests = vec![
+            (
+                "SELECT b.a AS app_table_a FROM app_table AS b",
+                r#"SELECT b.a AS app_table_a FROM remote_table AS b"#,
+            ),
+            (
+                "SELECT app_table_a FROM (SELECT a as app_table_a FROM app_table AS b)",
+                r#"SELECT app_table_a FROM (SELECT b.a AS app_table_a FROM remote_table AS b)"#,
+            ),
+            (
+                "SELECT COUNT(b.a) FROM app_table AS b",
+                r#"SELECT count(b.a) FROM remote_table AS b"#,
+            ),
+        ];
+
+        for test in tests {
+            test_sql(&ctx, test.0, test.1).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn test_sql(ctx: &SessionContext, sql_query: &str, expected_sql: &str) -> Result<()> {
         let data_frame = ctx.sql(sql_query).await?;
 
         println!("before optimization: \n{:#?}", data_frame.logical_plan());
 
-        let mut known_rewrites = HashMap::new();
-        let rewritten_plan = rewrite_table_scans(data_frame.logical_plan(), &mut known_rewrites)?;
+        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(data_frame.logical_plan().clone())?;
 
         println!("rewritten_plan: \n{:#?}", rewritten_plan);
 
@@ -963,41 +867,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_explain_queries() -> Result<()> {
+    async fn test_rewrite_table_scans_limit_offset() -> Result<()> {
         init_tracing();
         let ctx = get_test_df_context();
 
-        let executor = Arc::new(TestSQLExecutor {});
-        let provider = Arc::new(SQLFederationProvider::new(executor.clone()));
-        
-        // Test EXPLAIN query
-        let explain_query = "EXPLAIN SELECT a FROM app_table";
-        let df = ctx.sql(explain_query).await?;
-        
-        let plan = df.logical_plan();
-        println!("EXPLAIN logical plan: \n{:#?}", plan);
-        
-        // Create a VirtualExecutionPlan to test the sql() method
-        let virtual_plan = VirtualExecutionPlan::new(plan.clone(), executor.clone());
-        let generated_sql = virtual_plan.sql()?;
-        
-        println!("Generated SQL for EXPLAIN: {}", generated_sql);
-        assert!(generated_sql.starts_with("EXPLAIN "), "EXPLAIN query should be prefixed with EXPLAIN");
-        assert!(generated_sql.contains("remote_table"), "EXPLAIN query should have table rewrites");
+        let tests = vec![
+            // Basic LIMIT
+            (
+                "SELECT a FROM foo.df_table LIMIT 5",
+                r#"SELECT remote_table.a FROM remote_table LIMIT 5"#,
+            ),
+            // Basic OFFSET
+            (
+                "SELECT a FROM foo.df_table OFFSET 5",
+                r#"SELECT remote_table.a FROM remote_table OFFSET 5"#,
+            ),
+            // OFFSET after LIMIT
+            (
+                "SELECT a FROM foo.df_table LIMIT 10 OFFSET 5",
+                r#"SELECT remote_table.a FROM remote_table LIMIT 10 OFFSET 5"#,
+            ),
+            // LIMIT after OFFSET
+            (
+                "SELECT a FROM foo.df_table OFFSET 5 LIMIT 10",
+                r#"SELECT remote_table.a FROM remote_table LIMIT 10 OFFSET 5"#,
+            ),
+            // Zero OFFSET
+            (
+                "SELECT a FROM foo.df_table OFFSET 0",
+                r#"SELECT remote_table.a FROM remote_table OFFSET 0"#,
+            ),
+            // Zero LIMIT
+            (
+                "SELECT a FROM foo.df_table LIMIT 0",
+                r#"SELECT remote_table.a FROM remote_table LIMIT 0"#,
+            ),
+            // Zero LIMIT and OFFSET
+            (
+                "SELECT a FROM foo.df_table LIMIT 0 OFFSET 0",
+                r#"SELECT remote_table.a FROM remote_table LIMIT 0 OFFSET 0"#,
+            ),
+        ];
 
-        // Test EXPLAIN ANALYZE query
-        let explain_analyze_query = "EXPLAIN ANALYZE SELECT a FROM app_table";
-        let df = ctx.sql(explain_analyze_query).await?;
-        
-        let plan = df.logical_plan();
-        println!("EXPLAIN ANALYZE logical plan: \n{:#?}", plan);
-        
-        let virtual_plan = VirtualExecutionPlan::new(plan.clone(), executor.clone());
-        let generated_sql = virtual_plan.sql()?;
-        
-        println!("Generated SQL for EXPLAIN ANALYZE: {}", generated_sql);
-        assert!(generated_sql.starts_with("EXPLAIN ANALYZE "), "EXPLAIN ANALYZE query should be prefixed with EXPLAIN ANALYZE");
-        assert!(generated_sql.contains("remote_table"), "EXPLAIN ANALYZE query should have table rewrites");
+        for test in tests {
+            test_sql(&ctx, test.0, test.1).await?;
+        }
+
+        Ok(())
+    }
+
+    fn get_multipart_test_table_provider() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Date32, false),
+        ]));
+        let table = Arc::new(TestTable::new("default.remote_table".to_string(), schema));
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(TestExecutor)));
+        let table_source = Arc::new(SQLTableSource { provider, table });
+        Arc::new(FederatedTableProviderAdaptor::new(table_source))
+    }
+
+    fn get_multipart_test_df_context() -> SessionContext {
+        let ctx = SessionContext::new();
+        let catalog = ctx
+            .catalog("datafusion")
+            .expect("default catalog is datafusion");
+        let foo_schema = Arc::new(MemorySchemaProvider::new()) as Arc<dyn SchemaProvider>;
+        catalog
+            .register_schema("foo", Arc::clone(&foo_schema))
+            .expect("to register schema");
+        foo_schema
+            .register_table("df_table".to_string(), get_multipart_test_table_provider())
+            .expect("to register table");
+
+        let public_schema = catalog
+            .schema("public")
+            .expect("public schema should exist");
+        public_schema
+            .register_table("app_table".to_string(), get_multipart_test_table_provider())
+            .expect("to register table");
+
+        ctx
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_multipart_table() -> Result<()> {
+        init_tracing();
+        let ctx = get_multipart_test_df_context();
+
+        let tests = vec![
+            (
+                "SELECT MAX(a) FROM foo.df_table",
+                r#"SELECT max(remote_table.a) FROM "default".remote_table"#,
+            ),
+            (
+                "SELECT foo.df_table.a FROM foo.df_table",
+                r#"SELECT remote_table.a FROM "default".remote_table"#,
+            ),
+            (
+                "SELECT MIN(a) FROM foo.df_table",
+                r#"SELECT min(remote_table.a) FROM "default".remote_table"#,
+            ),
+            (
+                "SELECT AVG(a) FROM foo.df_table",
+                r#"SELECT avg(remote_table.a) FROM "default".remote_table"#,
+            ),
+            (
+                "SELECT COUNT(a) as cnt FROM foo.df_table",
+                r#"SELECT count(remote_table.a) AS cnt FROM "default".remote_table"#,
+            ),
+            (
+                "SELECT app_table from (SELECT a as app_table FROM app_table) b",
+                r#"SELECT b.app_table FROM (SELECT remote_table.a AS app_table FROM "default".remote_table) AS b"#,
+            ),
+            (
+                "SELECT MAX(app_table) from (SELECT a as app_table FROM app_table) b",
+                r#"SELECT max(b.app_table) FROM (SELECT remote_table.a AS app_table FROM "default".remote_table) AS b"#,
+            ),
+            (
+                "SELECT COUNT(app_table_a) FROM (SELECT a as app_table_a FROM app_table)",
+                r#"SELECT count(app_table_a) FROM (SELECT remote_table.a AS app_table_a FROM "default".remote_table)"#,
+            ),
+            (
+                "SELECT app_table_a FROM (SELECT a as app_table_a FROM app_table)",
+                r#"SELECT app_table_a FROM (SELECT remote_table.a AS app_table_a FROM "default".remote_table)"#,
+            ),
+            (
+                "SELECT aapp_table FROM (SELECT a as aapp_table FROM app_table)",
+                r#"SELECT aapp_table FROM (SELECT remote_table.a AS aapp_table FROM "default".remote_table)"#,
+            ),
+        ];
+
+        for test in tests {
+            test_sql(&ctx, test.0, test.1).await?;
+        }
 
         Ok(())
     }

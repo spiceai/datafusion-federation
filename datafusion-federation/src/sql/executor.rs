@@ -1,16 +1,19 @@
 use async_trait::async_trait;
 use core::fmt;
 use datafusion::{
-    arrow::datatypes::SchemaRef, error::Result, logical_expr::LogicalPlan,
-    physical_plan::SendableRecordBatchStream, sql::unparser::dialect::Dialect,
+    arrow::datatypes::SchemaRef,
+    common::Statistics,
+    error::Result,
+    logical_expr::LogicalPlan,
+    physical_plan::{metrics::MetricsSet, PhysicalExpr, SendableRecordBatchStream},
+    sql::{sqlparser::ast, unparser::dialect::Dialect},
 };
 use std::sync::Arc;
 
-use super::ast_analyzer::AstAnalyzer;
-
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
-
+pub type AstAnalyzer = Box<dyn FnMut(ast::Statement) -> Result<ast::Statement>>;
 pub type LogicalOptimizer = Box<dyn FnMut(LogicalPlan) -> Result<LogicalPlan>>;
+pub type SqlQueryRewriter = Box<dyn FnMut(String) -> Result<String>>;
 
 #[async_trait]
 pub trait SQLExecutor: Sync + Send {
@@ -29,14 +32,6 @@ pub trait SQLExecutor: Sync + Send {
     /// The specific SQL dialect (currently supports 'sqlite', 'postgres', 'flight')
     fn dialect(&self) -> Arc<dyn Dialect>;
 
-    /// Returns if this executor can execute the query that would be produced from this logical plan.
-    ///
-    /// This is used to indicate to the federation logic that part of this plan cannot be federated,
-    /// i.e. if there are UDFs that only DataFusion can execute.
-    fn can_execute_plan(&self, _logical_plan: &LogicalPlan) -> bool {
-        true
-    }
-
     /// Returns the analyzer rule specific for this engine to modify the logical plan before execution
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
         None
@@ -47,14 +42,36 @@ pub trait SQLExecutor: Sync + Send {
         None
     }
 
-    /// Execute a SQL query
-    fn execute(&self, query: &str, schema: SchemaRef) -> Result<SendableRecordBatchStream>;
+    /// Execute a SQL query.
+    ///
+    /// `filters` contain physical expressions generated at runtime, like
+    /// `DynamicFilterPhysicalExpr`. Since the concrete expression values only become available when
+    /// the `SendableRecordBatchStream` is executed, they must be manually added to the SQL query,
+    /// if necessary. However, they can be safely ignored.
+    fn execute(
+        &self,
+        query: &str,
+        schema: SchemaRef,
+        filters: &[Arc<dyn PhysicalExpr>],
+    ) -> Result<SendableRecordBatchStream>;
+
+    /// Returns statistics for this `SQLExecutor` node. If statistics are not available, it should
+    /// return [`Statistics::new_unknown`] (the default), not an error. See the `ExecutionPlan`
+    /// trait.
+    async fn statistics(&self, plan: &LogicalPlan) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(plan.schema().as_arrow()))
+    }
 
     /// Returns the tables provided by the remote
     async fn table_names(&self) -> Result<Vec<String>>;
 
     /// Returns the schema of table_name within this [`SQLExecutor`]
     async fn get_table_schema(&self, table_name: &str) -> Result<SchemaRef>;
+
+    /// Returns the execution metrics, if available.
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
 }
 
 impl fmt::Debug for dyn SQLExecutor {
