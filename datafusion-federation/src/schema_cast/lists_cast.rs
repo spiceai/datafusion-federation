@@ -30,7 +30,7 @@ macro_rules! cast_string_to_list_array {
                 None => list_builder.append_null(),
                 Some(string_value) => {
                     decoder.decode(string_value.as_bytes()).map_err(|e| {
-                        ArrowError::CastError(format!("Failed to decode value: {e}"))
+                        ArrowError::CastError(format!("Failed to decode value {string_value}: {e}"))
                     })?;
 
                     if let Some(b) = decoder.flush().map_err(|e| {
