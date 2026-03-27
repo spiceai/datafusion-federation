@@ -238,7 +238,16 @@ impl FederationAnalyzerRule {
 
         // If all sources are federated to the same provider
         if let ScanResult::Distinct(provider) = sole_provider {
-            match (is_root, provider.analyzer(plan)) {
+            // Analyze plans (EXPLAIN ANALYZE) cannot be converted to SQL by the
+            // Unparser, so they must not be federated as a whole. Only the inner
+            // query should be federated; DataFusion's AnalyzeExec will handle
+            // executing it and collecting metrics.
+            let provider_analyzer = if matches!(plan, LogicalPlan::Analyze(_)) {
+                None
+            } else {
+                provider.analyzer(plan)
+            };
+            match (is_root, provider_analyzer) {
                 (false, Some(_)) => {
                     // The largest sub-plan is higher up.
                     return Ok((None, ScanResult::Distinct(provider)));
