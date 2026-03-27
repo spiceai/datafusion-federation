@@ -205,7 +205,21 @@ impl VirtualExecutionPlan {
     }
 
     fn final_sql(&self) -> Result<String> {
-        let plan = self.plan.clone();
+        // Check if this is an EXPLAIN or EXPLAIN ANALYZE query
+        if let LogicalPlan::Explain(explain) = &self.plan {
+            let plan = explain.plan.as_ref().clone();
+            let sql = self.rewrite_plan_to_sql(plan)?;
+            Ok(format!("EXPLAIN {sql}"))
+        } else if let LogicalPlan::Analyze(analyze) = &self.plan {
+            let plan = analyze.input.as_ref().clone();
+            let sql = self.rewrite_plan_to_sql(plan)?;
+            Ok(format!("EXPLAIN ANALYZE {sql}"))
+        } else {
+            self.rewrite_plan_to_sql(self.plan.clone())
+        }
+    }
+
+    fn rewrite_plan_to_sql(&self, plan: LogicalPlan) -> Result<String> {
         let plan = RewriteTableScanAnalyzer::rewrite(plan)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
         let plan = apply_logical_optimizers(plan, logical_optimizers)?;
@@ -456,6 +470,7 @@ mod tests {
     };
     use crate::FederatedTableProviderAdaptor;
     use async_trait::async_trait;
+    use datafusion::arrow::array::Array;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
@@ -813,6 +828,86 @@ mod tests {
 
         assert!(final_query.ends_with("/* rewritten by sql_query_rewriter */"));
         assert_eq!(rewrite_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_federation_test() -> Result<(), DataFusionError> {
+        // Plain EXPLAIN in DataFusion produces string descriptions via
+        // ExplainExec rather than executing the physical plan. Verify
+        // that the EXPLAIN output shows the VirtualExecutionPlan and
+        // its SQL in the stringified plan.
+        let test_executor = TestExecutor {
+            compute_context: "test".into(),
+        };
+
+        let table_ref = "test_table".to_string();
+        let table = get_test_table_provider(table_ref.clone(), test_executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(table_ref, table).unwrap();
+
+        let query = "EXPLAIN SELECT * FROM test_table";
+        let batches = ctx.sql(query).await?.collect().await?;
+        let explain_output: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    .unwrap();
+                (0..col.len()).map(move |i| col.value(i).to_string())
+            })
+            .collect();
+
+        let combined = explain_output.join("\n");
+        assert!(
+            combined.contains("VirtualExecutionPlan"),
+            "Expected VirtualExecutionPlan in EXPLAIN output, got:\n{combined}",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_federation_test() -> Result<(), DataFusionError> {
+        let test_executor = TestExecutor {
+            compute_context: "test".into(),
+        };
+
+        let table_ref = "test_table".to_string();
+        let table = get_test_table_provider(table_ref.clone(), test_executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(table_ref, table).unwrap();
+
+        let query = "EXPLAIN ANALYZE SELECT * FROM test_table";
+        let df = ctx.sql(query).await?;
+        let logical_plan = df.into_optimized_plan()?;
+        let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;
+
+        let mut final_queries = vec![];
+        let _ = physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let vep = node
+                    .as_any()
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .unwrap();
+                final_queries.push(vep.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+
+        assert_eq!(final_queries.len(), 1);
+        assert!(
+            final_queries[0].starts_with("EXPLAIN ANALYZE "),
+            "Expected EXPLAIN ANALYZE prefix, got: {}",
+            final_queries[0]
+        );
 
         Ok(())
     }
