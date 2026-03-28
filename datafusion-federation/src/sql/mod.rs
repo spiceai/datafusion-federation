@@ -1005,6 +1005,38 @@ mod tests {
             "Expected a Federated node inside the Explain plan"
         );
 
+        let annotated_plan = crate::FederatedQueryPlanner::annotate_query_directives(&plan)?;
+        let LogicalPlan::Explain(ref annotated_explain) = annotated_plan else {
+            panic!(
+                "Expected annotated Explain at root, got: {}",
+                annotated_plan.display_indent()
+            );
+        };
+
+        let physical_plan = ctx
+            .state()
+            .create_physical_plan(annotated_explain.plan.as_ref())
+            .await?;
+        let mut final_queries = vec![];
+        physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let node = node
+                    .as_any()
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .unwrap();
+                final_queries.push(node.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert_eq!(
+            final_queries,
+            vec![
+                "EXPLAIN SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) AS table_b1"
+                    .to_string()
+            ]
+        );
+
         let batches = ctx
             .sql("EXPLAIN SELECT * FROM table_local_explain")
             .await?

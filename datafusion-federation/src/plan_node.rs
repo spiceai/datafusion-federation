@@ -149,7 +149,7 @@ impl FederatedQueryPlanner {
         Ok(plan)
     }
 
-    fn annotate_query_directives(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    pub(crate) fn annotate_query_directives(plan: &LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Explain(_) => {
                 let inputs = plan.inputs();
