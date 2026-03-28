@@ -143,7 +143,7 @@ impl TableProvider for FederatedTableProviderAdaptor {
 // to allow grouping of TableScans of the same FederationProvider.
 #[async_trait]
 pub trait FederatedTableSource: TableSource {
-    // Return the FederationProvider associated with this Table
+    /// Return the FederationProvider associated with this Table
     fn federation_provider(&self) -> Arc<dyn FederationProvider>;
 }
 

@@ -21,6 +21,14 @@ pub enum Error {
         source: datafusion::arrow::error::ArrowError,
     },
 
+    UnableToCastColumn {
+        source: datafusion::arrow::error::ArrowError,
+        column_index: usize,
+        column_name: String,
+        from_type: DataType,
+        to_type: DataType,
+    },
+
     UnexpectedNumberOfColumns {
         expected: usize,
         found: usize,
@@ -64,6 +72,12 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
     let actual_schema = record_batch.schema();
 
     if actual_schema.fields().len() != expected_schema.fields().len() {
+        tracing::debug!(
+            actual_schema = ?actual_schema,
+            expected_schema = ?expected_schema,
+            "Schema mismatch in try_cast_to"
+        );
+        tracing::trace!(record_batch = ?record_batch, "Record batch contents");
         return Err(Error::UnexpectedNumberOfColumns {
             expected: expected_schema.fields().len(),
             found: actual_schema.fields().len(),
@@ -76,15 +90,24 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
         .enumerate()
         .map(|(i, expected_field)| {
             let record_batch_col = record_batch.column(i);
+            let from_type = record_batch_col.data_type().clone();
+            let to_type = expected_field.data_type().clone();
+            let make_err = |e| Error::UnableToCastColumn {
+                source: e,
+                column_index: i,
+                column_name: expected_field.name().clone(),
+                from_type: from_type.clone(),
+                to_type: to_type.clone(),
+            };
 
             match (record_batch_col.data_type(), expected_field.data_type()) {
                 (DataType::Utf8, DataType::List(item_type)) => {
                     cast_string_to_list::<i32>(&Arc::clone(record_batch_col), item_type)
-                        .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+                        .map_err(make_err)
                 }
                 (DataType::Utf8, DataType::LargeList(item_type)) => {
                     cast_string_to_large_list::<i32>(&Arc::clone(record_batch_col), item_type)
-                        .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+                        .map_err(make_err)
                 }
                 (DataType::Utf8, DataType::FixedSizeList(item_type, value_length)) => {
                     cast_string_to_fixed_size_list::<i32>(
@@ -92,20 +115,20 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
                         item_type,
                         *value_length,
                     )
-                    .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+                    .map_err(make_err)
                 }
                 (DataType::Utf8, DataType::Struct(_)) => cast_string_to_struct::<i32>(
                     &Arc::clone(record_batch_col),
                     expected_field.clone(),
                 )
-                .map_err(|e| Error::UnableToConvertRecordBatch { source: e }),
+                .map_err(make_err),
                 (DataType::LargeUtf8, DataType::List(item_type)) => {
                     cast_string_to_list::<i64>(&Arc::clone(record_batch_col), item_type)
-                        .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+                        .map_err(make_err)
                 }
                 (DataType::LargeUtf8, DataType::LargeList(item_type)) => {
                     cast_string_to_large_list::<i64>(&Arc::clone(record_batch_col), item_type)
-                        .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+                        .map_err(make_err)
                 }
                 (DataType::LargeUtf8, DataType::FixedSizeList(item_type, value_length)) => {
                     cast_string_to_fixed_size_list::<i64>(
@@ -113,28 +136,36 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
                         item_type,
                         *value_length,
                     )
-                    .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+                    .map_err(make_err)
                 }
                 (DataType::LargeUtf8, DataType::Struct(_)) => cast_string_to_struct::<i64>(
                     &Arc::clone(record_batch_col),
                     expected_field.clone(),
                 )
-                .map_err(|e| Error::UnableToConvertRecordBatch { source: e }),
+                .map_err(make_err),
                 (
                     DataType::Interval(IntervalUnit::MonthDayNano),
                     DataType::Interval(IntervalUnit::YearMonth),
                 ) => cast_interval_monthdaynano_to_yearmonth(&Arc::clone(record_batch_col))
-                    .map_err(|e| Error::UnableToConvertRecordBatch { source: e }),
+                    .map_err(make_err),
                 (
                     DataType::Interval(IntervalUnit::MonthDayNano),
                     DataType::Interval(IntervalUnit::DayTime),
                 ) => cast_interval_monthdaynano_to_daytime(&Arc::clone(record_batch_col))
-                    .map_err(|e| Error::UnableToConvertRecordBatch { source: e }),
+                    .map_err(make_err),
                 _ => cast(&Arc::clone(record_batch_col), expected_field.data_type())
-                    .map_err(|e| Error::UnableToConvertRecordBatch { source: e }),
+                    .map_err(make_err),
             }
         })
-        .collect::<Result<Vec<Arc<dyn Array>>>>()?;
+        .collect::<Result<Vec<Arc<dyn Array>>>>()
+        .inspect_err(|_| {
+            tracing::debug!(
+                actual_schema = ?actual_schema,
+                expected_schema = ?expected_schema,
+                "Cast error in try_cast_to"
+            );
+            tracing::trace!(record_batch = ?record_batch, "Record batch contents");
+        })?;
 
     let options = RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows()));
     RecordBatch::try_new_with_options(expected_schema.clone(), cols, &options).map_err(|e| {

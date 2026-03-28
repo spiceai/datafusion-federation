@@ -1,6 +1,7 @@
 mod analyzer;
 pub mod ast_analyzer;
 mod executor;
+pub mod optimizer;
 mod schema;
 mod table;
 mod table_reference;
@@ -31,6 +32,7 @@ use datafusion::{
     },
     sql::{sqlparser::ast::Statement, unparser::Unparser},
 };
+use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
 pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
 pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef, SqlQueryRewriter};
@@ -39,7 +41,8 @@ pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
 
 use crate::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerForLogicalPlan,
+    FederationAnalyzerRule, FederationPlanner, FederationProvider,
 };
 
 /// Returns a federation analyzer rule that is optimized for SQL federation.
@@ -61,8 +64,8 @@ pub struct SQLFederationProvider {
 impl SQLFederationProvider {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
-            optimizer: Arc::new(Optimizer::with_rules(vec![Arc::new(
-                SQLFederationOptimizerRule::new(executor.clone()),
+            analyzer: Arc::new(Analyzer::with_rules(vec![Arc::new(
+                SQLFederationAnalyzerRule::new(Arc::clone(&executor)),
             )])),
             executor,
         }
@@ -82,17 +85,21 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn optimizer(&self) -> Option<Arc<Optimizer>> {
-        Some(self.optimizer.clone())
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+        if self.executor.can_execute_plan(plan) {
+            Some(Arc::clone(&self.analyzer).into())
+        } else {
+            Some(FederationAnalyzerForLogicalPlan::Unable)
+        }
     }
 }
 
 #[derive(Debug)]
-struct SQLFederationOptimizerRule {
+struct SQLFederationAnalyzerRule {
     planner: Arc<SQLFederationPlanner>,
 }
 
-impl SQLFederationOptimizerRule {
+impl SQLFederationAnalyzerRule {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
             planner: Arc::new(SQLFederationPlanner::new(Arc::clone(&executor))),
@@ -100,45 +107,29 @@ impl SQLFederationOptimizerRule {
     }
 }
 
-impl OptimizerRule for SQLFederationOptimizerRule {
-    /// Try to rewrite `plan` to an optimized form, returning `Transformed::yes`
-    /// if the plan was rewritten and `Transformed::no` if it was not.
-    ///
-    /// Note: this function is only called if [`Self::supports_rewrite`] returns
-    /// true. Otherwise the Optimizer calls  [`Self::try_optimize`]
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
+impl AnalyzerRule for SQLFederationAnalyzerRule {
+    /// Try to rewrite `plan` to an optimized form.
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         if let LogicalPlan::Extension(Extension { ref node }) = plan {
             if node.name() == "Federated" {
                 // Avoid attempting double federation
-                return Ok(Transformed::no(plan));
+                return Ok(plan);
             }
         }
 
-        let fed_plan = FederatedPlanNode::new(plan.clone(), self.planner.clone());
-        let ext_node = Extension {
-            node: Arc::new(fed_plan),
-        };
-
-        let mut plan = LogicalPlan::Extension(ext_node);
+        let mut plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(FederatedPlanNode::new(plan.clone(), self.planner.clone())),
+        });
         if let Some(mut rewriter) = self.planner.executor.logical_optimizer() {
             plan = rewriter(plan)?;
         }
 
-        Ok(Transformed::yes(plan))
+        Ok(plan)
     }
 
     /// A human readable name for this analyzer rule
     fn name(&self) -> &str {
         "federate_sql"
-    }
-
-    /// Does this rule support rewriting owned plans (rather than by reference)?
-    fn supports_rewrite(&self) -> bool {
-        true
     }
 }
 
@@ -239,7 +230,7 @@ impl VirtualExecutionPlan {
         ast: Statement,
     ) -> Result<Statement, datafusion::error::DataFusionError> {
         if let Some(mut analyzer) = self.executor.ast_analyzer() {
-            Ok(analyzer(ast)?)
+            Ok(analyzer.analyze(ast)?)
         } else {
             Ok(ast)
         }
@@ -294,8 +285,7 @@ fn apply_logical_optimizers(
         let new_schema = plan.schema();
         if &old_schema != new_schema {
             return Err(DataFusionError::Execution(format!(
-                "Schema altered during logical analysis, expected: {}, found: {}",
-                old_schema, new_schema
+                "Schema altered during logical analysis, expected: {old_schema}, found: {new_schema}",
             )));
         }
     }
@@ -304,7 +294,7 @@ fn apply_logical_optimizers(
 
 fn apply_ast_analyzers(mut statement: Statement, analyzers: Vec<AstAnalyzer>) -> Result<Statement> {
     for mut analyzer in analyzers {
-        statement = analyzer(statement)?;
+        statement = analyzer.analyze(statement)?;
     }
     Ok(statement)
 }
@@ -465,6 +455,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
     }
 }
 
+#[allow(clippy::type_complexity)]
 #[cfg(test)]
 mod tests {
     use std::any::Any;
@@ -481,6 +472,9 @@ mod tests {
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::expr::Alias;
+    use datafusion::logical_expr::Projection;
+    use datafusion::prelude::Expr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::{self};
     use datafusion::{
@@ -492,9 +486,21 @@ mod tests {
     use super::table::RemoteTable;
     use super::*;
 
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     struct TestExecutor {
         compute_context: String,
+
+        // Return true if this subtree of a logicalplan cannot be federated
+        cannot_federate: Option<Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync>>,
+    }
+
+    impl std::fmt::Debug for TestExecutor {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TestExecutor")
+                .field("compute_context", &self.compute_context)
+                .field("cannot_federate_fn", &self.cannot_federate.is_some())
+                .finish_non_exhaustive()
+        }
     }
 
     #[async_trait]
@@ -505,6 +511,13 @@ mod tests {
 
         fn compute_context(&self) -> Option<String> {
             Some(self.compute_context.clone())
+        }
+
+        fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
+            let Some(ref fnc) = self.cannot_federate else {
+                return true;
+            };
+            !logical_plan.exists(|p| Ok(fnc(p))).unwrap_or(false)
         }
 
         fn dialect(&self) -> Arc<dyn Dialect> {
@@ -600,10 +613,12 @@ mod tests {
     async fn basic_sql_federation_test() -> Result<(), DataFusionError> {
         let test_executor_a = TestExecutor {
             compute_context: "a".into(),
+            cannot_federate: None,
         };
 
         let test_executor_b = TestExecutor {
             compute_context: "b".into(),
+            cannot_federate: None,
         };
 
         let table_a1_ref = "table_a1".to_string();
@@ -700,9 +715,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn basic_sql_federation_analyzer_rule_test() -> Result<(), DataFusionError> {
+        let alias_non_federate: Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync> =
+            Arc::new(|plan| match plan {
+                LogicalPlan::Projection(Projection { expr, .. }) => expr.iter().any(|e| match e {
+                    Expr::Alias(Alias { name, .. }) => name == "non_federate",
+                    _ => false,
+                }),
+                _ => false,
+            });
+
+        let test_executor_a = TestExecutor {
+            compute_context: "a".into(),
+            cannot_federate: Some(Arc::clone(&alias_non_federate)),
+        };
+
+        let test_executor_b = TestExecutor {
+            compute_context: "b".into(),
+            cannot_federate: None,
+        };
+
+        let table_a1_ref = "table_a1".to_string();
+        let table_a1 = get_test_table_provider(table_a1_ref.clone(), test_executor_a.clone());
+
+        let table_b1_ref = "table_b1".to_string();
+        let table_b1 = get_test_table_provider(table_b1_ref.clone(), test_executor_b.clone());
+
+        let table_b2_ref = "table_b2".to_string();
+        let table_b2 = get_test_table_provider(table_b2_ref.clone(), test_executor_b);
+
+        // Create a new SessionState with the optimizer rule we created above
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::default()));
+
+        ctx.register_table(table_a1_ref.clone(), table_a1).unwrap();
+        ctx.register_table(table_b1_ref.clone(), table_b1).unwrap();
+        ctx.register_table(table_b2_ref.clone(), table_b2).unwrap();
+
+        // Basic unsupported federation of `AS 'non_federate'`. Note filter non_federate > 0 can be
+        // pushed down since it will be optimised into `Filter: table_a1.a > Int64(0)`.
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT a as non_federate, b, c FROM (SELECT a, b, c FROM table_a1) WHERE a > 0"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Projection: table_a1.a AS non_federate, table_a1.b, table_a1.c
+          Federated
+         Projection: table_a1.a, table_a1.b, table_a1.c
+          Filter: table_a1.a > Int64(0)
+            TableScan: table_a1
+        ");
+
+        // Basic join of two different context tables.
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT b.a, b.b, a.b, a.c FROM table_a1 a JOIN table_b1 b ON a.a=b.a"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Projection: b.a, b.b, a.b, a.c
+          Inner Join: a.a = b.a
+            Federated
+         Projection: a.a, a.b, a.c
+          SubqueryAlias: a
+            TableScan: table_a1
+            Projection: b.a, b.b
+              Federated
+         Projection: b.a, b.b, b.c
+          SubqueryAlias: b
+            TableScan: table_b1
+        "
+        );
+
+        // Basic join of two same-context tables.
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT b.a, b.b, a.b, a.c FROM table_b1 a JOIN table_b2 b ON a.a=b.a"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Federated
+         Projection: b.a, b.b, a.b, a.c
+          Inner Join:  Filter: a.a = b.a
+            SubqueryAlias: a
+              TableScan: table_b1
+            SubqueryAlias: b
+              TableScan: table_b2
+        "
+        );
+
+        // JOIN ON different contexts, one child has non-federateable [`LogicalPlan`].
+        insta::assert_snapshot!(ctx
+            .sql(
+                r#"SELECT a.*, j.non_federate FROM (SELECT b.a AS a, b.b as 'non_federate', a.b as b, a.c as c FROM table_b1 a JOIN table_b2 b ON a.a=b.a) j JOIN table_a1 a ON j.a = a.a"#,
+            )
+            .await?
+            .into_optimized_plan()?
+            .display_indent(), @r"
+        Projection: a.a, a.b, a.c, j.non_federate
+          Inner Join: j.a = a.a
+            Projection: j.a, j.non_federate
+              Federated
+         Projection: j.a, j.non_federate, j.b, j.c
+          SubqueryAlias: j
+            Projection: b.a, b.b AS non_federate, a.b, a.c
+              Inner Join:  Filter: a.a = b.a
+                SubqueryAlias: a
+                  TableScan: table_b1
+                SubqueryAlias: b
+                  TableScan: table_b2
+            Federated
+         Projection: a.a, a.b, a.c
+          SubqueryAlias: a
+            TableScan: table_a1
+        "
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn multi_reference_sql_federation_test() -> Result<(), DataFusionError> {
         let test_executor_a = TestExecutor {
             compute_context: "test".into(),
+            cannot_federate: None,
         };
 
         let lowercase_table_ref = "default.table".to_string();
@@ -782,6 +923,73 @@ mod tests {
         assert_eq!(
             HashSet::<&str>::from_iter(final_queries.iter().map(|x| x.as_str())),
             HashSet::from_iter(expected)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explain_federation_test() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "test".into(),
+            cannot_federate: None,
+        };
+
+        let local_table_ref = "table_local_explain".to_string();
+        let remote_table_ref = "table_b1(1)".to_string();
+        let table = get_test_table_provider(remote_table_ref, executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(local_table_ref, table).unwrap();
+
+        let plan = ctx
+            .sql("EXPLAIN SELECT * FROM table_local_explain")
+            .await?
+            .into_optimized_plan()?;
+
+        let LogicalPlan::Explain(explain) = plan else {
+            panic!("Expected Explain at root, got: {}", plan.display_indent());
+        };
+
+        let mut found_federated = false;
+        explain.plan.apply(|node| {
+            if let LogicalPlan::Extension(extension) = node {
+                if extension.node.name() == "Federated" {
+                    found_federated = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert!(
+            found_federated,
+            "Expected a Federated node inside the Explain plan"
+        );
+
+        let batches = ctx
+            .sql("EXPLAIN SELECT * FROM table_local_explain")
+            .await?
+            .collect()
+            .await?;
+
+        let explain_output: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    .unwrap();
+                (0..col.len()).map(move |index| col.value(index).to_string())
+            })
+            .collect();
+
+        let combined = explain_output.join("\n");
+        assert!(
+            combined.contains("VirtualExecutionPlan"),
+            "Expected VirtualExecutionPlan in EXPLAIN output, got:\n{combined}",
         );
 
         Ok(())
@@ -889,86 +1097,6 @@ mod tests {
 
         assert!(final_query.ends_with("/* rewritten by sql_query_rewriter */"));
         assert_eq!(rewrite_calls.load(Ordering::SeqCst), 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn explain_federation_test() -> Result<(), DataFusionError> {
-        // Plain EXPLAIN in DataFusion produces string descriptions via
-        // ExplainExec rather than executing the physical plan. Verify
-        // that the EXPLAIN output shows the VirtualExecutionPlan and
-        // its SQL in the stringified plan.
-        let test_executor = TestExecutor {
-            compute_context: "test".into(),
-        };
-
-        let table_ref = "test_table".to_string();
-        let table = get_test_table_provider(table_ref.clone(), test_executor);
-
-        let state = crate::default_session_state();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref, table).unwrap();
-
-        let query = "EXPLAIN SELECT * FROM test_table";
-        let batches = ctx.sql(query).await?.collect().await?;
-        let explain_output: Vec<String> = batches
-            .iter()
-            .flat_map(|b| {
-                let col = b
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    .unwrap();
-                (0..col.len()).map(move |i| col.value(i).to_string())
-            })
-            .collect();
-
-        let combined = explain_output.join("\n");
-        assert!(
-            combined.contains("VirtualExecutionPlan"),
-            "Expected VirtualExecutionPlan in EXPLAIN output, got:\n{combined}",
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn explain_analyze_federation_test() -> Result<(), DataFusionError> {
-        let test_executor = TestExecutor {
-            compute_context: "test".into(),
-        };
-
-        let table_ref = "test_table".to_string();
-        let table = get_test_table_provider(table_ref.clone(), test_executor);
-
-        let state = crate::default_session_state();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref, table).unwrap();
-
-        let query = "EXPLAIN ANALYZE SELECT * FROM test_table";
-        let df = ctx.sql(query).await?;
-        let logical_plan = df.into_optimized_plan()?;
-        let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;
-
-        let mut final_queries = vec![];
-        let _ = physical_plan.apply(|node| {
-            if node.name() == "sql_federation_exec" {
-                let vep = node
-                    .as_any()
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
-                final_queries.push(vep.final_sql()?);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-
-        assert_eq!(final_queries.len(), 1);
-        assert!(
-            final_queries[0].starts_with("EXPLAIN ANALYZE "),
-            "Expected EXPLAIN ANALYZE prefix, got: {}",
-            final_queries[0]
-        );
 
         Ok(())
     }

@@ -6,12 +6,12 @@ use datafusion::{
     execution::{
         context::SessionContext, options::CsvReadOptions, session_state::SessionStateBuilder,
     },
-    optimizer::Optimizer,
+    optimizer::Analyzer,
 };
 
 use datafusion_federation::{
     sql::{MultiSchemaProvider, SQLFederationProvider, SQLSchemaProvider},
-    FederatedQueryPlanner, FederationOptimizerRule,
+    FederatedQueryPlanner, FederationAnalyzerRule,
 };
 
 use shared::{overwrite_default_schema, MockPostgresExecutor, MockSqliteExecutor};
@@ -115,15 +115,15 @@ async fn main() {
     /////////////////////
     //  Main(local)  DB
     /////////////////////
-    // Get the default optimizer rules
-    let mut rules = Optimizer::new().rules;
+    // Get the default analyzer rules
+    let mut rules = Analyzer::new().rules;
 
-    // Create a new federation optimizer rule and add it to the default rules
-    rules.push(Arc::new(FederationOptimizerRule::new()));
+    // Create a new federation analyzer rule and add it to the default rules
+    rules.push(Arc::new(FederationAnalyzerRule::new()));
 
-    // Create a new SessionState with the optimizer rule we created above
+    // Create a new SessionState with the analyzer rule we created above
     let state = SessionStateBuilder::new()
-        .with_optimizer_rules(rules)
+        .with_analyzer_rules(rules)
         .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
         .build();
 

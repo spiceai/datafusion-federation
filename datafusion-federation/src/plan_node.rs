@@ -71,7 +71,7 @@ impl UserDefinedLogicalNodeCore for FederatedPlanNode {
 
         Ok(Self {
             plan: self.plan.clone(),
-            planner: self.planner.clone(),
+            planner: Arc::clone(&self.planner),
         })
     }
 }

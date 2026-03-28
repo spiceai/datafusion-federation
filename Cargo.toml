@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["datafusion-federation"]
+members = ["datafusion-federation", "integration-test"]
 
 [workspace.package]
 version = "0.4.2"
