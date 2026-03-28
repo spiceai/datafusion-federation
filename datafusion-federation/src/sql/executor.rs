@@ -6,7 +6,7 @@ use datafusion::{
     error::Result,
     logical_expr::LogicalPlan,
     physical_plan::{metrics::MetricsSet, PhysicalExpr, SendableRecordBatchStream},
-    sql::{sqlparser::ast, unparser::dialect::Dialect},
+    sql::unparser::dialect::Dialect,
 };
 use std::sync::Arc;
 

@@ -13,7 +13,6 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use std::any::Any;
-use std::clone::Clone;
 use std::fmt;
 use std::sync::Arc;
 

@@ -35,6 +35,18 @@ impl std::fmt::Display for Error {
             Error::UnableToConvertRecordBatch { source } => {
                 write!(f, "Unable to convert record batch: {source}")
             }
+            Error::UnableToCastColumn {
+                source,
+                column_index,
+                column_name,
+                from_type,
+                to_type,
+            } => {
+                write!(
+                    f,
+                    "Unable to cast column {column_index} '{column_name}' from {from_type} to {to_type}: {source}"
+                )
+            }
             Error::UnexpectedNumberOfColumns { expected, found } => {
                 write!(
                     f,
@@ -125,8 +137,15 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
         .collect::<Result<Vec<Arc<dyn Array>>>>()?;
 
     let options = RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows()));
-    RecordBatch::try_new_with_options(expected_schema, cols, &options)
-        .map_err(|e| Error::UnableToConvertRecordBatch { source: e })
+    RecordBatch::try_new_with_options(expected_schema.clone(), cols, &options).map_err(|e| {
+        tracing::debug!(
+            actual_schema = ?actual_schema,
+            expected_schema = ?expected_schema,
+            "RecordBatch creation error in try_cast_to"
+        );
+        tracing::trace!(record_batch = ?record_batch, "Record batch contents");
+        Error::UnableToConvertRecordBatch { source: e }
+    })
 }
 
 #[cfg(test)]
