@@ -327,15 +327,20 @@ mod test {
 
         let err =
             try_cast_to(batch, target_schema).expect_err("Decimal overflow should return an error");
-        assert!(
-            matches!(err, Error::UnableToCastColumn { .. }),
-            "Expected UnableToCastColumn, got: {err:?}"
-        );
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("is too large to store in a Decimal128"),
-            "Expected overflow message, got: {err_msg}"
-        );
+        match &err {
+            Error::UnableToCastColumn {
+                source: arrow_err, ..
+            } => {
+                assert!(
+                    matches!(
+                        arrow_err,
+                        datafusion::arrow::error::ArrowError::InvalidArgumentError(_)
+                    ),
+                    "Expected InvalidArgumentError, got: {arrow_err:?}"
+                );
+            }
+            other => panic!("Expected UnableToCastColumn, got: {other:?}"),
+        }
     }
 
     /// Casting Decimal128 with values that fit should succeed.
