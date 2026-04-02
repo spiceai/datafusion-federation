@@ -1,6 +1,6 @@
 use datafusion::arrow::{
     array::{Array, RecordBatch, RecordBatchOptions},
-    compute::cast,
+    compute::{cast_with_options, CastOptions},
     datatypes::{DataType, IntervalUnit, SchemaRef},
 };
 use std::sync::Arc;
@@ -84,6 +84,11 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
         });
     }
 
+    let cast_options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+
     let cols = expected_schema
         .fields()
         .iter()
@@ -102,59 +107,55 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
 
             match (record_batch_col.data_type(), expected_field.data_type()) {
                 (DataType::Utf8, DataType::List(item_type)) => {
-                    cast_string_to_list::<i32>(&Arc::clone(record_batch_col), item_type)
-                        .map_err(make_err)
+                    cast_string_to_list::<i32>(record_batch_col, item_type).map_err(make_err)
                 }
                 (DataType::Utf8, DataType::LargeList(item_type)) => {
-                    cast_string_to_large_list::<i32>(&Arc::clone(record_batch_col), item_type)
-                        .map_err(make_err)
+                    cast_string_to_large_list::<i32>(record_batch_col, item_type).map_err(make_err)
                 }
                 (DataType::Utf8, DataType::FixedSizeList(item_type, value_length)) => {
                     cast_string_to_fixed_size_list::<i32>(
-                        &Arc::clone(record_batch_col),
+                        record_batch_col,
                         item_type,
                         *value_length,
                     )
                     .map_err(make_err)
                 }
-                (DataType::Utf8, DataType::Struct(_)) => cast_string_to_struct::<i32>(
-                    &Arc::clone(record_batch_col),
-                    expected_field.clone(),
-                )
-                .map_err(make_err),
-                (DataType::LargeUtf8, DataType::List(item_type)) => {
-                    cast_string_to_list::<i64>(&Arc::clone(record_batch_col), item_type)
+                (DataType::Utf8, DataType::Struct(_)) => {
+                    cast_string_to_struct::<i32>(record_batch_col, expected_field.clone())
                         .map_err(make_err)
                 }
+                (DataType::LargeUtf8, DataType::List(item_type)) => {
+                    cast_string_to_list::<i64>(record_batch_col, item_type).map_err(make_err)
+                }
                 (DataType::LargeUtf8, DataType::LargeList(item_type)) => {
-                    cast_string_to_large_list::<i64>(&Arc::clone(record_batch_col), item_type)
-                        .map_err(make_err)
+                    cast_string_to_large_list::<i64>(record_batch_col, item_type).map_err(make_err)
                 }
                 (DataType::LargeUtf8, DataType::FixedSizeList(item_type, value_length)) => {
                     cast_string_to_fixed_size_list::<i64>(
-                        &Arc::clone(record_batch_col),
+                        record_batch_col,
                         item_type,
                         *value_length,
                     )
                     .map_err(make_err)
                 }
-                (DataType::LargeUtf8, DataType::Struct(_)) => cast_string_to_struct::<i64>(
-                    &Arc::clone(record_batch_col),
-                    expected_field.clone(),
-                )
-                .map_err(make_err),
+                (DataType::LargeUtf8, DataType::Struct(_)) => {
+                    cast_string_to_struct::<i64>(record_batch_col, expected_field.clone())
+                        .map_err(make_err)
+                }
                 (
                     DataType::Interval(IntervalUnit::MonthDayNano),
                     DataType::Interval(IntervalUnit::YearMonth),
-                ) => cast_interval_monthdaynano_to_yearmonth(&Arc::clone(record_batch_col))
-                    .map_err(make_err),
+                ) => cast_interval_monthdaynano_to_yearmonth(record_batch_col).map_err(make_err),
                 (
                     DataType::Interval(IntervalUnit::MonthDayNano),
                     DataType::Interval(IntervalUnit::DayTime),
-                ) => cast_interval_monthdaynano_to_daytime(&Arc::clone(record_batch_col))
-                    .map_err(make_err),
-                _ => cast(&Arc::clone(record_batch_col), expected_field.data_type())
-                    .map_err(make_err),
+                ) => cast_interval_monthdaynano_to_daytime(record_batch_col).map_err(make_err),
+                _ => cast_with_options(
+                    record_batch_col.as_ref(),
+                    expected_field.data_type(),
+                    &cast_options,
+                )
+                .map_err(make_err),
             }
         })
         .collect::<Result<Vec<Arc<dyn Array>>>>()
@@ -182,7 +183,7 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
 #[cfg(test)]
 mod test {
     use super::*;
-    use datafusion::arrow::array::{LargeStringArray, RecordBatchOptions};
+    use datafusion::arrow::array::{Decimal128Array, LargeStringArray, RecordBatchOptions};
     use datafusion::arrow::{
         array::{Int32Array, StringArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
@@ -294,5 +295,78 @@ mod test {
         let result = try_cast_to(batch, schema).expect("converted");
         let expected = ["++", "++", "++"];
         assert_batches_eq!(expected, &[result]);
+    }
+
+    /// Casting Decimal128(38,9) → Decimal128(38,27) must return an error when
+    /// the upscale would overflow, instead of silently producing NULL.
+    #[test]
+    fn test_try_cast_to_decimal_overflow_returns_error() {
+        // Value with 12 integer digits: 110_367_043_872.497010000
+        // Internal i128 at scale 9 = 110367043872497010000
+        let value_i128: i128 = 110_367_043_872_497_010_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_charge",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value_i128)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid Decimal128(38,9)");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        // Target schema with wider scale (38,27) — only allows 11 integer digits
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_charge",
+            DataType::Decimal128(38, 27),
+            true,
+        )]));
+
+        let err =
+            try_cast_to(batch, target_schema).expect_err("Decimal overflow should return an error");
+        assert!(
+            matches!(err, Error::UnableToCastColumn { .. }),
+            "Expected UnableToCastColumn, got: {err:?}"
+        );
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("is too large to store in a Decimal128"),
+            "Expected overflow message, got: {err_msg}"
+        );
+    }
+
+    /// Casting Decimal128 with values that fit should succeed.
+    #[test]
+    fn test_try_cast_to_decimal_no_overflow_succeeds() {
+        // Value with 11 integer digits: 99_999_999_999.000000000 (fits in 38-27=11 digits)
+        let value_i128: i128 = 99_999_999_999_000_000_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value_i128)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid Decimal128(38,9)");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 27),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(
+            result.is_ok(),
+            "Decimal cast should succeed when value fits: {result:?}"
+        );
     }
 }
