@@ -14,7 +14,7 @@ repository = "https://github.com/datafusion-contrib/datafusion-federation"
 arrow-json = "57"
 async-stream = "0.3"
 async-trait = "0.1"
-datafusion = "52.3"
+datafusion = "52"
 datafusion-federation = { path = "./datafusion-federation", version = "0.4.2" }
 futures = "0.3"
 tokio = { version = "1.41", features = ["full"] }
@@ -22,10 +22,10 @@ tokio = { version = "1.41", features = ["full"] }
 [patch.crates-io]
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-52
 
-datafusion = { git = "https://github.com/apache/datafusion.git", rev = "28d012a41a3017b5f682ef6b01468a7ff9a48fb7" }               # upstream:v52.3.0
-datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "28d012a41a3017b5f682ef6b01468a7ff9a48fb7" }          # upstream:v52.3.0
-datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "28d012a41a3017b5f682ef6b01468a7ff9a48fb7" } # upstream:v52.3.0
-datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", rev = "28d012a41a3017b5f682ef6b01468a7ff9a48fb7" } # upstream:v52.3.0
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "31d2bd3a7226f1c6d848429b282949c5b8403076" }               # upstream:v52.5.0-rc1
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "31d2bd3a7226f1c6d848429b282949c5b8403076" }          # upstream:v52.5.0-rc1
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "31d2bd3a7226f1c6d848429b282949c5b8403076" } # upstream:v52.5.0-rc1
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", rev = "31d2bd3a7226f1c6d848429b282949c5b8403076" } # upstream:v52.5.0-rc1
 
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ca671dd37d73b730938f77f7a7ad76545280a4a8" }        # spiceai-57.2-patches
 arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ca671dd37d73b730938f77f7a7ad76545280a4a8" }  # spiceai-57.2-patches
