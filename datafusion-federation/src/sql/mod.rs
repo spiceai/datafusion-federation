@@ -18,15 +18,16 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{Extension, LogicalPlan},
+    logical_expr::{Extension, LogicalPlan, Projection, Sort, SubqueryAlias},
     optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
-    physical_expr::EquivalenceProperties,
+    physical_expr::{EquivalenceProperties, LexOrdering, create_physical_sort_expr},
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
         filter_pushdown::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
         metrics::MetricsSet,
+        sorts::sort::SortExec,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
     },
@@ -153,18 +154,67 @@ impl FederationPlanner for SQLFederationPlanner {
     async fn plan_federation(
         &self,
         node: &FederatedPlanNode,
-        _session_state: &SessionState,
+        session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = Arc::new(node.plan().schema().as_arrow().clone());
         let plan = node.plan().clone();
         let statistics = self.executor.statistics(&plan).await?;
         let input = Arc::new(VirtualExecutionPlan::new(
-            plan,
+            plan.clone(),
             Arc::clone(&self.executor),
             statistics,
         ));
-        let schema_cast_exec = schema_cast::SchemaCastScanExec::new(input, schema);
-        Ok(Arc::new(schema_cast_exec))
+        let schema_cast_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(schema_cast::SchemaCastScanExec::new(input, schema));
+
+        // When a `Sort` node is present at the top of the federated logical plan
+        // (possibly behind a `Projection` or `SubqueryAlias`), the SQL Unparser
+        // may push the `ORDER BY` inside a subquery:
+        //
+        //   SELECT ... FROM (SELECT ... ORDER BY col)   -- outer has no ORDER BY!
+        //
+        // SQL does not guarantee that ordering from a subquery is preserved by
+        // the outer query.  When the remote engine returns data across multiple
+        // batches the rows can arrive in arbitrary order, silently violating the
+        // sort contract.
+        //
+        // Fix: detect the sort and add a local `SortExec` so DataFusion enforces
+        // the required ordering regardless of what the remote engine returns.
+        if let Some(sort) = find_top_sort(&plan) {
+            // Resolve sort expressions against the federation output schema so
+            // that fully-qualified column references (e.g. `t.schema.tbl.id`)
+            // are correctly mapped to the output columns (e.g. `id`).
+            let output_schema = plan.schema();
+            let execution_props = session_state.execution_props();
+            match sort
+                .expr
+                .iter()
+                .map(|e| create_physical_sort_expr(e, output_schema.as_ref(), execution_props))
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(physical_sort_exprs) if !physical_sort_exprs.is_empty() => {
+                    if let Some(lex_ordering) = LexOrdering::new(physical_sort_exprs) {
+                        return Ok(Arc::new(SortExec::new(lex_ordering, schema_cast_exec)));
+                    }
+                }
+                _ => {} // fall through if resolution fails
+            }
+        }
+
+        Ok(schema_cast_exec)
+    }
+}
+
+/// Walk the top of a logical plan through transparent wrapper nodes
+/// (`Projection`, `SubqueryAlias`) to find the first `Sort` node, if any.
+///
+/// Returns `None` if no `Sort` is encountered before a non-transparent node.
+fn find_top_sort(plan: &LogicalPlan) -> Option<&Sort> {
+    match plan {
+        LogicalPlan::Sort(sort) => Some(sort),
+        LogicalPlan::Projection(Projection { input, .. }) => find_top_sort(input),
+        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => find_top_sort(input),
+        _ => None,
     }
 }
 
@@ -1029,6 +1079,188 @@ mod tests {
 
         assert!(final_query.ends_with("/* rewritten by sql_query_rewriter */"));
         assert_eq!(rewrite_calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for sort-ordering correctness (issue: federation does not preserve
+    // sort ordering across multiple output batches).
+    // -------------------------------------------------------------------------
+
+    /// Verify that `find_top_sort` traverses through `Projection` and
+    /// `SubqueryAlias` wrappers to locate a `Sort` node.
+    #[test]
+    fn find_top_sort_walks_projections() -> Result<(), DataFusionError> {
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{
+            LogicalPlan, Projection, Sort, SubqueryAlias,
+            SortExpr,
+        };
+        use datafusion::prelude::col;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+
+        // Build a minimal Leaf plan (empty values) as the sort input.
+        let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
+            datafusion::logical_expr::EmptyRelation {
+                produce_one_row: false,
+                schema: df_schema.clone(),
+            },
+        );
+
+        let sort_expr = SortExpr {
+            expr: col("id"),
+            asc: true,
+            nulls_first: false,
+        };
+        let sort_node = LogicalPlan::Sort(Sort {
+            expr: vec![sort_expr],
+            input: Arc::new(empty),
+            fetch: None,
+        });
+
+        // find_top_sort on a bare Sort returns Some.
+        assert!(find_top_sort(&sort_node).is_some(), "bare Sort");
+
+        // Wrap in a Projection — find_top_sort should still find the Sort.
+        let wrapped_in_proj = LogicalPlan::Projection(Projection::try_new(
+            df_schema
+                .columns()
+                .iter()
+                .map(|c| datafusion::prelude::Expr::Column(c.clone()))
+                .collect(),
+            Arc::new(sort_node.clone()),
+        )?);
+        assert!(
+            find_top_sort(&wrapped_in_proj).is_some(),
+            "Sort under Projection"
+        );
+
+        // Wrap in SubqueryAlias — find_top_sort should still find the Sort.
+        let wrapped_in_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            Arc::new(sort_node.clone()),
+            "alias",
+        )?);
+        assert!(
+            find_top_sort(&wrapped_in_alias).is_some(),
+            "Sort under SubqueryAlias"
+        );
+
+        // A plan without any Sort at the top returns None.
+        let empty2 = datafusion::logical_expr::LogicalPlan::EmptyRelation(
+            datafusion::logical_expr::EmptyRelation {
+                produce_one_row: false,
+                schema: df_schema.clone(),
+            },
+        );
+        assert!(find_top_sort(&empty2).is_none(), "no Sort");
+
+        Ok(())
+    }
+
+    /// When a federated plan contains a top-level `Sort`, `plan_federation`
+    /// must wrap the result in a `SortExec` to guarantee correct row ordering
+    /// even when the remote engine returns data in multiple batches.
+    ///
+    /// Without this fix the SQL Unparser emits `ORDER BY` only inside a
+    /// subquery, which SQL engines are not required to propagate to the outer
+    /// query.
+    #[tokio::test]
+    async fn sort_exec_wraps_virtual_plan_for_ordered_query() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "sort_exec_test".into(),
+            cannot_federate: None,
+        };
+        let table_ref = "t".to_string();
+        let table = get_test_table_provider(table_ref.clone(), executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(table_ref.clone(), table).unwrap();
+
+        // `ORDER BY a` at the top level: the whole plan (Sort → TableScan) is
+        // federated.  Our fix should add a SortExec on top so that multi-batch
+        // results arrive in the correct order.
+        let plan = ctx
+            .sql("SELECT a, b FROM t ORDER BY a ASC")
+            .await?
+            .into_optimized_plan()?;
+
+        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
+
+        // Walk the physical plan: there must be a SortExec that wraps the
+        // VirtualExecutionPlan (possibly through SchemaCastScanExec).
+        let mut found_sort_over_virtual = false;
+        physical_plan.apply(|node| {
+            if node.name() == "SortExec" {
+                node.apply(|child| {
+                    if child.name() == "sql_federation_exec" {
+                        found_sort_over_virtual = true;
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                if found_sort_over_virtual {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert!(
+            found_sort_over_virtual,
+            "Expected a SortExec wrapping VirtualExecutionPlan to enforce sort \
+             ordering across multiple batches."
+        );
+
+        Ok(())
+    }
+
+    /// A query without `ORDER BY` must NOT get a spurious `SortExec` wrapping
+    /// the `VirtualExecutionPlan`.
+    #[tokio::test]
+    async fn no_sort_exec_for_unordered_query() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "no_sort_exec_test".into(),
+            cannot_federate: None,
+        };
+        let table_ref = "t".to_string();
+        let table = get_test_table_provider(table_ref.clone(), executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(table_ref.clone(), table).unwrap();
+
+        let plan = ctx
+            .sql("SELECT a, b FROM t")
+            .await?
+            .into_optimized_plan()?;
+
+        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
+
+        let mut sort_over_virtual = false;
+        physical_plan.apply(|node| {
+            if node.name() == "SortExec" {
+                node.apply(|child| {
+                    if child.name() == "sql_federation_exec" {
+                        sort_over_virtual = true;
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert!(
+            !sort_over_virtual,
+            "Did not expect a SortExec wrapping VirtualExecutionPlan for an \
+             unordered query."
+        );
 
         Ok(())
     }
