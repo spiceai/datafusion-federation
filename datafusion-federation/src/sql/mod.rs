@@ -18,7 +18,7 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{Extension, LogicalPlan, Projection, Sort, SubqueryAlias},
+    logical_expr::{Distinct, DistinctOn, Expr, Extension, Limit, LogicalPlan, Projection, Sort, SubqueryAlias},
     optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
     physical_expr::{EquivalenceProperties, LexOrdering, create_physical_sort_expr},
     physical_plan::{
@@ -194,7 +194,9 @@ impl FederationPlanner for SQLFederationPlanner {
             {
                 Ok(physical_sort_exprs) if !physical_sort_exprs.is_empty() => {
                     if let Some(lex_ordering) = LexOrdering::new(physical_sort_exprs) {
-                        return Ok(Arc::new(SortExec::new(lex_ordering, schema_cast_exec)));
+                        let sort_exec = SortExec::new(lex_ordering, schema_cast_exec)
+                            .with_fetch(sort.fetch);
+                        return Ok(Arc::new(sort_exec));
                     }
                 }
                 _ => {} // fall through if resolution fails
@@ -205,8 +207,28 @@ impl FederationPlanner for SQLFederationPlanner {
     }
 }
 
-/// Walk the top of a logical plan through transparent wrapper nodes
-/// (`Projection`, `SubqueryAlias`) to find the first `Sort` node, if any.
+/// Walk the top of a logical plan through transparent wrapper nodes to find
+/// the first `Sort` node, if any.
+///
+/// A node is "transparent" here if the DataFusion SQL Unparser wraps it — and
+/// everything below it — in a derived-table subquery when `already_projected`
+/// is set (i.e. an outer `Projection` was already processed).  That wrapping
+/// buries any `ORDER BY` from an inner `Sort` inside the subquery, so the
+/// outer query has no ordering guarantee.  The nodes that exhibit this
+/// behaviour are exactly those that call `derive_with_dialect_alias` when
+/// `select.already_projected()` is true:
+///
+/// | Node         | subquery alias         |
+/// |--------------|------------------------|
+/// | `Projection` | `derived_projection`   |
+/// | `Limit`      | `derived_limit`        |
+/// | `Distinct`   | `derived_distinct`     |
+///
+/// (`Union` also triggers it but is multi-input, so a `Sort` below a `Union`
+/// does not represent a total order and is excluded.)
+///
+/// `SubqueryAlias` is added as a safety net: it can wrap plans in contexts
+/// that behave like subqueries.
 ///
 /// Returns `None` if no `Sort` is encountered before a non-transparent node.
 fn find_top_sort(plan: &LogicalPlan) -> Option<&Sort> {
@@ -214,6 +236,9 @@ fn find_top_sort(plan: &LogicalPlan) -> Option<&Sort> {
         LogicalPlan::Sort(sort) => Some(sort),
         LogicalPlan::Projection(Projection { input, .. }) => find_top_sort(input),
         LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => find_top_sort(input),
+        LogicalPlan::Limit(limit) => find_top_sort(&limit.input),
+        LogicalPlan::Distinct(Distinct::On(on)) => find_top_sort(&on.input),
+        LogicalPlan::Distinct(Distinct::All(input)) => find_top_sort(input),
         _ => None,
     }
 }
@@ -266,6 +291,10 @@ impl VirtualExecutionPlan {
         let plan = self.plan.clone();
         let known_rewrites = collect_known_rewrites(&plan)?;
         let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+        // Sink any outer Projection past Limit/Distinct/Sort wrapper nodes so
+        // the SQL Unparser emits ORDER BY and LIMIT at the top query level
+        // rather than burying them inside a derived-table subquery.
+        let plan = sink_projection_below_sort(plan)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
         let plan = apply_logical_optimizers(plan, logical_optimizers)?;
         let ast = self.plan_to_statement(&plan)?;
@@ -288,6 +317,96 @@ impl VirtualExecutionPlan {
 
     fn plan_to_statement(&self, plan: &LogicalPlan) -> Result<Statement> {
         Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(plan)
+    }
+}
+
+/// Before handing the federated logical plan to the SQL Unparser, sink any
+/// top-level `Projection` that sits above `Limit` / `Distinct` nodes leading
+/// to a `Sort` so that those wrapper nodes appear *above* the `Projection`
+/// instead.
+///
+/// Without this the DataFusion SQL Unparser generates a subquery whenever it
+/// encounters `Limit` or `Distinct` with `already_projected = true` (i.e.
+/// after an outer `Projection` has been processed).  That wrapping buries
+/// `ORDER BY` and `LIMIT` inside the subquery:
+///
+/// ```sql
+/// -- wrong: ORDER BY / LIMIT inside subquery
+/// SELECT id, CAST(name AS TEXT) FROM
+///   (SELECT id, name FROM t ORDER BY id LIMIT 30)
+/// ```
+///
+/// After the rewrite the Unparser sees the wrapper nodes first, so it emits
+/// them at the top level:
+///
+/// ```sql
+/// -- correct: ORDER BY / LIMIT at the outer query level
+/// SELECT id, CAST(name AS TEXT) FROM
+///   (SELECT id, name FROM t)
+/// ORDER BY id LIMIT 30
+/// ```
+///
+/// The transparent nodes that trigger this problem in the Unparser are exactly
+/// `Limit` and `Distinct` (they call `derive_with_dialect_alias` when
+/// `already_projected` is true). `SubqueryAlias` is included for safety.
+fn sink_projection_below_sort(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let LogicalPlan::Projection(proj) = plan else {
+        return Ok(plan);
+    };
+    sink_exprs_below_sort(proj.expr, Arc::unwrap_or_clone(proj.input))
+}
+
+/// Recursive helper for [`sink_projection_below_sort`].
+///
+/// Walks down through `Limit`, `Distinct`, and `SubqueryAlias` nodes until it
+/// reaches a `Sort`, then inserts a new `Projection(exprs)` just below that
+/// `Sort`. Rebuilds the wrapper nodes on the way back up.
+fn sink_exprs_below_sort(exprs: Vec<Expr>, plan: LogicalPlan) -> Result<LogicalPlan> {
+    match plan {
+        // Base case: found the Sort — place the Projection just below it.
+        LogicalPlan::Sort(sort) => {
+            let new_proj = LogicalPlan::Projection(Projection::try_new(exprs, sort.input)?);
+            Ok(LogicalPlan::Sort(Sort {
+                expr: sort.expr,
+                input: Arc::new(new_proj),
+                fetch: sort.fetch,
+            }))
+        }
+        // Transparent wrappers — recurse and rebuild.
+        LogicalPlan::Limit(limit) => {
+            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(limit.input))?;
+            Ok(LogicalPlan::Limit(Limit {
+                skip: limit.skip,
+                fetch: limit.fetch,
+                input: Arc::new(inner),
+            }))
+        }
+        LogicalPlan::Distinct(Distinct::All(input)) => {
+            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(input))?;
+            Ok(LogicalPlan::Distinct(Distinct::All(Arc::new(inner))))
+        }
+        LogicalPlan::Distinct(Distinct::On(on)) => {
+            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(on.input))?;
+            Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn {
+                on_expr: on.on_expr,
+                select_expr: on.select_expr,
+                sort_expr: on.sort_expr,
+                input: Arc::new(inner),
+                schema: on.schema,
+            })))
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(alias.input))?;
+            Ok(LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                Arc::new(inner),
+                alias.alias,
+            )?))
+        }
+        // Not a transparent node leading to a Sort — reconstruct the Projection.
+        other => Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs,
+            Arc::new(other),
+        )?)),
     }
 }
 
@@ -1088,14 +1207,13 @@ mod tests {
     // sort ordering across multiple output batches).
     // -------------------------------------------------------------------------
 
-    /// Verify that `find_top_sort` traverses through `Projection` and
-    /// `SubqueryAlias` wrappers to locate a `Sort` node.
+    /// Verify that `find_top_sort` traverses through `Projection`,
+    /// `SubqueryAlias`, and `Limit` wrappers to locate a `Sort` node.
     #[test]
     fn find_top_sort_walks_projections() -> Result<(), DataFusionError> {
         use datafusion::common::DFSchema;
         use datafusion::logical_expr::{
-            LogicalPlan, Projection, Sort, SubqueryAlias,
-            SortExpr,
+            Limit, LogicalPlan, Projection, Sort, SubqueryAlias, SortExpr,
         };
         use datafusion::prelude::col;
         use std::sync::Arc;
@@ -1106,7 +1224,7 @@ mod tests {
         ]));
         let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
 
-        // Build a minimal Leaf plan (empty values) as the sort input.
+        // Build a minimal leaf plan (empty relation) as the sort input.
         let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
             datafusion::logical_expr::EmptyRelation {
                 produce_one_row: false,
@@ -1150,6 +1268,33 @@ mod tests {
         assert!(
             find_top_sort(&wrapped_in_alias).is_some(),
             "Sort under SubqueryAlias"
+        );
+
+        // Wrap in Limit — find_top_sort should still find the Sort.
+        // This is the Projection → Limit → Sort pattern produced when DataFusion's
+        // TypeCoercion adds a CAST projection above a Limit+Sort.
+        let wrapped_in_limit = LogicalPlan::Limit(Limit {
+            skip: None,
+            fetch: Some(Box::new(datafusion::prelude::lit(30i64))),
+            input: Arc::new(sort_node.clone()),
+        });
+        assert!(
+            find_top_sort(&wrapped_in_limit).is_some(),
+            "Sort under Limit"
+        );
+
+        // Wrap Projection → Limit → Sort (the exact pattern from the bug).
+        let proj_over_limit = LogicalPlan::Projection(Projection::try_new(
+            df_schema
+                .columns()
+                .iter()
+                .map(|c| datafusion::prelude::Expr::Column(c.clone()))
+                .collect(),
+            Arc::new(wrapped_in_limit),
+        )?);
+        assert!(
+            find_top_sort(&proj_over_limit).is_some(),
+            "Sort under Projection → Limit"
         );
 
         // A plan without any Sort at the top returns None.
@@ -1261,6 +1406,77 @@ mod tests {
             "Did not expect a SortExec wrapping VirtualExecutionPlan for an \
              unordered query."
         );
+
+        Ok(())
+    }
+
+    /// `sink_projection_below_sort` must rewrite `Projection → Limit → Sort`
+    /// into `Limit → Sort → Projection` so the SQL Unparser emits ORDER BY
+    /// and LIMIT at the outer query level.
+    ///
+    /// This is the fix for the exact pattern the user observed:
+    ///   WRONG:   SELECT id, CAST(name) FROM (SELECT id, name FROM t ORDER BY id LIMIT 30)
+    ///   CORRECT: SELECT id, CAST(name) FROM (SELECT id, name FROM t) ORDER BY id LIMIT 30
+    #[tokio::test]
+    async fn order_by_limit_not_buried_in_subquery() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "sql_shape_test".into(),
+            cannot_federate: None,
+        };
+        let table_ref = "t".to_string();
+        let table = get_test_table_provider(table_ref.clone(), executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(table_ref.clone(), table).unwrap();
+
+        // CAST forces a schema-coercion Projection above the Limit+Sort, which
+        // is exactly the pattern that used to bury ORDER BY in a subquery.
+        let plan = ctx
+            .sql("SELECT a, CAST(b AS TEXT) AS b FROM t ORDER BY a ASC LIMIT 10")
+            .await?
+            .into_optimized_plan()?;
+
+        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
+
+        // Extract the SQL that would be sent to the remote engine.
+        let mut final_queries: Vec<String> = Vec::new();
+        physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let vep = node.as_any().downcast_ref::<VirtualExecutionPlan>().unwrap();
+                final_queries.push(vep.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        let [sql] = final_queries.as_slice() else {
+            panic!("expected exactly one federated SQL query, got: {final_queries:?}");
+        };
+
+        // ORDER BY and LIMIT must appear at the outer level, not inside a subquery.
+        let sql_upper = sql.to_uppercase();
+        // Find the last ORDER BY (outer level comes after any subquery's)
+        let outer_order_by_pos = sql_upper.rfind("ORDER BY");
+        let outer_limit_pos = sql_upper.rfind("LIMIT");
+        let last_subquery_close = sql_upper.rfind(')');
+
+        assert!(
+            outer_order_by_pos.is_some(),
+            "SQL must contain ORDER BY: {sql}"
+        );
+        assert!(outer_limit_pos.is_some(), "SQL must contain LIMIT: {sql}");
+
+        // If there's a subquery, ORDER BY and LIMIT must come AFTER the closing ')'
+        if let Some(close_paren) = last_subquery_close {
+            assert!(
+                outer_order_by_pos.unwrap() > close_paren,
+                "ORDER BY must be at the outer level, not inside the subquery.\nSQL: {sql}"
+            );
+            assert!(
+                outer_limit_pos.unwrap() > close_paren,
+                "LIMIT must be at the outer level, not inside the subquery.\nSQL: {sql}"
+            );
+        }
 
         Ok(())
     }
