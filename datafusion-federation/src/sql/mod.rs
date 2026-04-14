@@ -194,15 +194,23 @@ impl FederationPlanner for SQLFederationPlanner {
                 .map(|e| create_physical_sort_expr(e, output_schema.as_ref(), execution_props))
                 .collect::<Result<Vec<_>>>()
             {
-                Ok(physical_sort_exprs) if !physical_sort_exprs.is_empty() => {
+                Ok(physical_sort_exprs) if physical_sort_exprs.is_empty() => {
+                    return Err(DataFusionError::Plan("Top-level Sort was detected, but no physical sort expressions could be created".to_string()));
+                }
+                Ok(physical_sort_exprs) => {
                     if let Some(lex_ordering) = LexOrdering::new(physical_sort_exprs) {
-                        let sort_exec =
-                            SortExec::new(lex_ordering, schema_cast_exec).with_fetch(sort.fetch);
-                        return Ok(Arc::new(sort_exec));
+                        return Ok(Arc::new(
+                            SortExec::new(lex_ordering, schema_cast_exec).with_fetch(sort.fetch),
+                        ));
                     }
                 }
-                _ => {} // fall through if resolution fails
-            }
+                Err(e) => {
+                    return Err(DataFusionError::Context(
+                        "Failed to create `PhysicalSortExpr`".to_string(),
+                        Box::new(e),
+                    ))
+                }
+            };
         }
 
         Ok(schema_cast_exec)
@@ -367,12 +375,50 @@ fn sink_exprs_below_sort(exprs: Vec<Expr>, plan: LogicalPlan) -> Result<LogicalP
     match plan {
         // Base case: found the Sort — place the Projection just below it.
         LogicalPlan::Sort(sort) => {
-            let new_proj = LogicalPlan::Projection(Projection::try_new(exprs, sort.input)?);
-            Ok(LogicalPlan::Sort(Sort {
-                expr: sort.expr,
-                input: Arc::new(new_proj),
-                fetch: sort.fetch,
-            }))
+            // Build a tentative inner projection to inspect its output schema.
+            let inner_proj = Projection::try_new(exprs.clone(), Arc::clone(&sort.input))?;
+
+            // Find sort columns not produced by the projection.
+            let missing: Vec<Expr> = sort
+                .expr
+                .iter()
+                .flat_map(|se| se.expr.column_refs())
+                .filter(|col| !inner_proj.schema.has_column(col))
+                .map(|col| Expr::Column((*col).clone()))
+                .collect();
+
+            if missing.is_empty() {
+                // All sort columns are in the projection — simple case.
+                Ok(LogicalPlan::Sort(Sort {
+                    expr: sort.expr,
+                    input: Arc::new(LogicalPlan::Projection(inner_proj)),
+                    fetch: sort.fetch,
+                }))
+            } else {
+                // Sort references columns the projection doesn't emit.
+                // Build: Projection(original_cols) → Sort → Projection(exprs + missing)
+                let outer_exprs: Vec<Expr> = inner_proj
+                    .schema
+                    .columns()
+                    .into_iter()
+                    .map(Expr::Column)
+                    .collect();
+                drop(inner_proj);
+
+                let mut inner_exprs = exprs;
+                inner_exprs.extend(missing);
+                let extended_proj =
+                    LogicalPlan::Projection(Projection::try_new(inner_exprs, sort.input)?);
+                let sort_node = LogicalPlan::Sort(Sort {
+                    expr: sort.expr,
+                    input: Arc::new(extended_proj),
+                    fetch: sort.fetch,
+                });
+                Ok(LogicalPlan::Projection(Projection::try_new(
+                    outer_exprs,
+                    Arc::new(sort_node),
+                )?))
+            }
         }
         // Transparent wrappers — recurse and rebuild.
         LogicalPlan::Limit(limit) => {
@@ -1479,6 +1525,115 @@ mod tests {
                 "LIMIT must be at the outer level, not inside the subquery.\nSQL: {sql}"
             );
         }
+
+        Ok(())
+    }
+
+    /// When a `Projection` doesn't include the sort column, `sink_exprs_below_sort`
+    /// must produce `Projection → Sort → Projection` so the sort can see the column
+    /// while the outer projection restores the original output schema.
+    #[test]
+    fn sink_exprs_below_sort_adds_missing_sort_col() -> Result<(), DataFusionError> {
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{LogicalPlan, Sort, SortExpr};
+        use datafusion::prelude::col;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+        ]));
+        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+
+        let empty = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: df_schema,
+        });
+
+        // Sort by "age", but project only "id" and "name".
+        let sort_node = LogicalPlan::Sort(Sort {
+            expr: vec![SortExpr {
+                expr: col("age"),
+                asc: true,
+                nulls_first: false,
+            }],
+            input: Arc::new(empty),
+            fetch: None,
+        });
+
+        let proj_exprs = vec![col("id"), col("name")];
+        let result = sink_exprs_below_sort(proj_exprs, sort_node)?;
+
+        // Expected shape: Projection(id, name) → Sort(age) → Projection(id, name, age)
+        let LogicalPlan::Projection(outer) = &result else {
+            panic!("expected outer Projection, got: {result:?}");
+        };
+        assert_eq!(outer.expr.len(), 2, "outer projection should have 2 exprs");
+
+        let LogicalPlan::Sort(sort) = outer.input.as_ref() else {
+            panic!("expected Sort under outer Projection");
+        };
+
+        let LogicalPlan::Projection(inner) = sort.input.as_ref() else {
+            panic!("expected inner Projection under Sort");
+        };
+        assert_eq!(
+            inner.expr.len(),
+            3,
+            "inner projection should have 3 exprs (id, name, age)"
+        );
+
+        // The final output schema should only contain "id" and "name".
+        let output_fields: Vec<&str> = outer
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(output_fields, vec!["id", "name"]);
+
+        Ok(())
+    }
+
+    /// When the sort column is already in the projection, no outer Projection
+    /// wrapper is needed — the result is simply `Sort → Projection`.
+    #[test]
+    fn sink_exprs_below_sort_no_wrapper_when_sort_col_present() -> Result<(), DataFusionError> {
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{LogicalPlan, Sort, SortExpr};
+        use datafusion::prelude::col;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+
+        let empty = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: df_schema,
+        });
+
+        // Sort by "id", project "id" and "name" — sort col is present.
+        let sort_node = LogicalPlan::Sort(Sort {
+            expr: vec![SortExpr {
+                expr: col("id"),
+                asc: true,
+                nulls_first: false,
+            }],
+            input: Arc::new(empty),
+            fetch: None,
+        });
+
+        let proj_exprs = vec![col("id"), col("name")];
+        let result = sink_exprs_below_sort(proj_exprs, sort_node)?;
+
+        // Expected shape: Sort(id) → Projection(id, name) — no outer Projection.
+        let LogicalPlan::Sort(_) = &result else {
+            panic!("expected Sort at the top, got: {result:?}");
+        };
 
         Ok(())
     }
