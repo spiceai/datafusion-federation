@@ -11,7 +11,9 @@ use datafusion::{
     config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
-    logical_expr::{Distinct, Expr, Extension, LogicalPlan, Projection, Sort, TableScan, TableSource},
+    logical_expr::{
+        Distinct, Expr, Extension, LogicalPlan, Projection, Sort, TableScan, TableSource,
+    },
     optimizer::analyzer::AnalyzerRule,
     sql::TableReference,
 };

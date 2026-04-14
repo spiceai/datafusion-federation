@@ -18,9 +18,11 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{Distinct, DistinctOn, Expr, Extension, Limit, LogicalPlan, Projection, Sort, SubqueryAlias},
+    logical_expr::{
+        Distinct, DistinctOn, Expr, Extension, Limit, LogicalPlan, Projection, Sort, SubqueryAlias,
+    },
     optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
-    physical_expr::{EquivalenceProperties, LexOrdering, create_physical_sort_expr},
+    physical_expr::{create_physical_sort_expr, EquivalenceProperties, LexOrdering},
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
         filter_pushdown::{
@@ -194,8 +196,8 @@ impl FederationPlanner for SQLFederationPlanner {
             {
                 Ok(physical_sort_exprs) if !physical_sort_exprs.is_empty() => {
                     if let Some(lex_ordering) = LexOrdering::new(physical_sort_exprs) {
-                        let sort_exec = SortExec::new(lex_ordering, schema_cast_exec)
-                            .with_fetch(sort.fetch);
+                        let sort_exec =
+                            SortExec::new(lex_ordering, schema_cast_exec).with_fetch(sort.fetch);
                         return Ok(Arc::new(sort_exec));
                     }
                 }
@@ -1213,7 +1215,7 @@ mod tests {
     fn find_top_sort_walks_projections() -> Result<(), DataFusionError> {
         use datafusion::common::DFSchema;
         use datafusion::logical_expr::{
-            Limit, LogicalPlan, Projection, Sort, SubqueryAlias, SortExpr,
+            Limit, LogicalPlan, Projection, Sort, SortExpr, SubqueryAlias,
         };
         use datafusion::prelude::col;
         use std::sync::Arc;
@@ -1381,10 +1383,7 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(table_ref.clone(), table).unwrap();
 
-        let plan = ctx
-            .sql("SELECT a, b FROM t")
-            .await?
-            .into_optimized_plan()?;
+        let plan = ctx.sql("SELECT a, b FROM t").await?.into_optimized_plan()?;
 
         let physical_plan = ctx.state().create_physical_plan(&plan).await?;
 
@@ -1443,7 +1442,10 @@ mod tests {
         let mut final_queries: Vec<String> = Vec::new();
         physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let vep = node.as_any().downcast_ref::<VirtualExecutionPlan>().unwrap();
+                let vep = node
+                    .as_any()
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .unwrap();
                 final_queries.push(vep.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
