@@ -360,6 +360,9 @@ impl VirtualExecutionPlan {
 /// `Limit` and `Distinct` (they call `derive_with_dialect_alias` when
 /// `already_projected` is true). `SubqueryAlias` is included for safety.
 fn sink_projection_below_sort(plan: LogicalPlan) -> Result<LogicalPlan> {
+    if find_top_sort(&plan).is_none() {
+        return Ok(plan);
+    }
     let LogicalPlan::Projection(proj) = plan else {
         return Ok(plan);
     };
@@ -1525,6 +1528,55 @@ mod tests {
                 "LIMIT must be at the outer level, not inside the subquery.\nSQL: {sql}"
             );
         }
+
+        Ok(())
+    }
+
+    /// If there is no reachable `Sort` under the transparent wrappers,
+    /// `sink_projection_below_sort` must leave the plan unchanged.
+    ///
+    /// This guards against accidentally changing semantics for expressions
+    /// that can error or have side effects (and against changing DISTINCT
+    /// behaviour) in plans that are not actually ORDER BY queries.
+    #[test]
+    fn sink_projection_below_sort_without_sort_leaves_plan_unchanged() -> Result<(), DataFusionError>
+    {
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{Distinct, Limit, LogicalPlan, Projection, SubqueryAlias};
+        use datafusion::prelude::{col, lit};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+
+        let leaf = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: df_schema,
+        });
+
+        // Projection → Limit → Distinct → SubqueryAlias → EmptyRelation
+        // (no Sort anywhere).
+        let aliased = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(leaf), "t")?);
+        let distinct = LogicalPlan::Distinct(Distinct::All(Arc::new(aliased)));
+        let limited = LogicalPlan::Limit(Limit {
+            skip: None,
+            fetch: Some(Box::new(lit(5i64))),
+            input: Arc::new(distinct),
+        });
+        let original = LogicalPlan::Projection(Projection::try_new(
+            vec![col("id"), col("name")],
+            Arc::new(limited),
+        )?);
+
+        let rewritten = sink_projection_below_sort(original.clone())?;
+
+        assert_eq!(
+            rewritten, original,
+            "plan without reachable Sort should remain unchanged"
+        );
 
         Ok(())
     }
