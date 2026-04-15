@@ -6,20 +6,23 @@ mod schema;
 mod table;
 mod table_reference;
 
-use std::{any::Any, fmt, sync::Arc, vec};
+use std::{any::Any, fmt, ops::ControlFlow, sync::Arc, vec};
 
 use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
 use ast_analyzer::RewriteMultiTableReference;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
-    common::DFSchema,
-    common::{tree_node::TreeNode, Statistics},
+    common::{
+        tree_node::{TreeNode, TreeNodeRecursion},
+        Column, DFSchema, HashMap, Statistics,
+    },
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
     logical_expr::{
-        Distinct, DistinctOn, Expr, Extension, Limit, LogicalPlan, Projection, Sort, SubqueryAlias,
+        Distinct, DistinctOn, Expr, Extension, Limit, LogicalPlan, Projection, Sort, SortExpr,
+        SubqueryAlias,
     },
     optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
     physical_expr::{create_physical_sort_expr, EquivalenceProperties, LexOrdering},
@@ -33,7 +36,11 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
     },
-    sql::{sqlparser::ast::Statement, unparser::Unparser},
+    sql::{
+        sqlparser::ast::{self, Statement, VisitMut, VisitorMut},
+        unparser::Unparser,
+        TableReference,
+    },
 };
 use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
@@ -184,12 +191,14 @@ impl FederationPlanner for SQLFederationPlanner {
         // the required ordering regardless of what the remote engine returns.
         if let Some(sort) = find_top_sort(&plan) {
             // Resolve sort expressions against the federation output schema so
-            // that fully-qualified column references (e.g. `t.schema.tbl.id`)
-            // are correctly mapped to the output columns (e.g. `id`).
+            // that fully-qualified column references (e.g. `p.name`) can still
+            // be resolved when the output schema only exposes unqualified fields
+            // (e.g. `name`) after projection/aggregation.
             let output_schema = plan.schema();
+            let normalized_sort_exprs =
+                normalize_sort_exprs_for_output_schema(&sort.expr, output_schema);
             let execution_props = session_state.execution_props();
-            match sort
-                .expr
+            match normalized_sort_exprs
                 .iter()
                 .map(|e| create_physical_sort_expr(e, output_schema.as_ref(), execution_props))
                 .collect::<Result<Vec<_>>>()
@@ -253,6 +262,128 @@ fn find_top_sort(plan: &LogicalPlan) -> Option<&Sort> {
     }
 }
 
+/// A federated plan can legitimately carry a qualified sort expression
+/// (e.g. `p.name`) while its final output schema exposes an unqualified field
+/// (e.g. `name`) after projection/aggregation. Normalize only this precise,
+/// unambiguous case so we can build physical sort expressions against the
+/// output schema.
+fn normalize_sort_expr_for_output_schema(
+    sort_expr: &SortExpr,
+    output_schema: &DFSchema,
+) -> SortExpr {
+    let Expr::Column(column) = &sort_expr.expr else {
+        return sort_expr.clone();
+    };
+
+    // Preserve exact matches and unqualified columns.
+    if column.relation.is_none() || output_schema.has_column(column) {
+        return sort_expr.clone();
+    }
+
+    // Only rewrite when the unqualified name resolves uniquely.
+    if output_schema
+        .field_with_unqualified_name(&column.name)
+        .is_err()
+    {
+        return sort_expr.clone();
+    }
+
+    let mut normalized = sort_expr.clone();
+    normalized.expr = Expr::Column(Column::new_unqualified(column.name.clone()));
+    normalized
+}
+
+fn normalize_sort_exprs_for_output_schema(
+    sort_exprs: &[SortExpr],
+    output_schema: &DFSchema,
+) -> Vec<SortExpr> {
+    sort_exprs
+        .iter()
+        .map(|sort_expr| normalize_sort_expr_for_output_schema(sort_expr, output_schema))
+        .collect()
+}
+
+fn collect_alias_identifier_rewrites(plan: &LogicalPlan) -> Result<HashMap<String, String>> {
+    let mut alias_rewrites = HashMap::new();
+
+    plan.apply_with_subqueries(|node| {
+        let LogicalPlan::SubqueryAlias(alias) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+
+        let TableReference::Bare {
+            table: source_alias,
+        } = &alias.alias
+        else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+
+        let Some(target_alias) = alias_rewrite_target(alias.input.as_ref()) else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+
+        if source_alias.as_ref() != target_alias {
+            alias_rewrites.insert(source_alias.to_string(), target_alias.to_string());
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    Ok(alias_rewrites)
+}
+
+fn alias_rewrite_target(plan: &LogicalPlan) -> Option<&str> {
+    match plan {
+        LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.table()),
+        LogicalPlan::Projection(proj) => alias_rewrite_target(proj.input.as_ref()),
+        LogicalPlan::Sort(sort) => alias_rewrite_target(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => alias_rewrite_target(limit.input.as_ref()),
+        LogicalPlan::Distinct(Distinct::All(input)) => alias_rewrite_target(input.as_ref()),
+        LogicalPlan::Distinct(Distinct::On(on)) => alias_rewrite_target(on.input.as_ref()),
+        _ => None,
+    }
+}
+
+fn rewrite_compound_identifier_aliases(
+    statement: &mut Statement,
+    alias_rewrites: &HashMap<String, String>,
+) {
+    if alias_rewrites.is_empty() {
+        return;
+    }
+
+    let mut visitor = RewriteCompoundIdentifierAliasVisitor { alias_rewrites };
+    let _ = VisitMut::visit(statement, &mut visitor);
+}
+
+struct RewriteCompoundIdentifierAliasVisitor<'a> {
+    alias_rewrites: &'a HashMap<String, String>,
+}
+
+impl VisitorMut for RewriteCompoundIdentifierAliasVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> ControlFlow<Self::Break> {
+        let ast::Expr::CompoundIdentifier(idents) = expr else {
+            return ControlFlow::Continue(());
+        };
+
+        if idents.len() < 2 {
+            return ControlFlow::Continue(());
+        }
+
+        let Some(rewrite) = self.alias_rewrites.get(&idents[0].value) else {
+            return ControlFlow::Continue(());
+        };
+
+        let mut rewritten = idents[0].clone();
+        rewritten.value = rewrite.clone();
+        idents[0] = rewritten;
+
+        ControlFlow::Continue(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VirtualExecutionPlan {
     plan: LogicalPlan,
@@ -300,6 +431,7 @@ impl VirtualExecutionPlan {
     fn final_sql(&self) -> Result<String> {
         let plan = self.plan.clone();
         let known_rewrites = collect_known_rewrites(&plan)?;
+        let alias_rewrites = collect_alias_identifier_rewrites(&plan)?;
         let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
         // Sink any outer Projection past Limit/Distinct/Sort wrapper nodes so
         // the SQL Unparser emits ORDER BY and LIMIT at the top query level
@@ -311,6 +443,7 @@ impl VirtualExecutionPlan {
         let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
         let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
         RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
+        rewrite_compound_identifier_aliases(&mut ast, &alias_rewrites);
         apply_sql_query_rewriters(ast.to_string(), sql_query_rewriters)
     }
 
@@ -380,20 +513,29 @@ fn sink_exprs_below_sort(exprs: Vec<Expr>, plan: LogicalPlan) -> Result<LogicalP
         LogicalPlan::Sort(sort) => {
             // Build a tentative inner projection to inspect its output schema.
             let inner_proj = Projection::try_new(exprs.clone(), Arc::clone(&sort.input))?;
+            let normalized_sort_exprs =
+                normalize_sort_exprs_for_output_schema(&sort.expr, inner_proj.schema.as_ref());
 
             // Find sort columns not produced by the projection.
-            let missing: Vec<Expr> = sort
-                .expr
+            let mut missing: Vec<Expr> = Vec::new();
+            for col in normalized_sort_exprs
                 .iter()
                 .flat_map(|se| se.expr.column_refs())
-                .filter(|col| !inner_proj.schema.has_column(col))
-                .map(|col| Expr::Column((*col).clone()))
-                .collect();
+            {
+                if inner_proj.schema.has_column(col)
+                    || missing
+                        .iter()
+                        .any(|expr| matches!(expr, Expr::Column(existing) if existing == col))
+                {
+                    continue;
+                }
+                missing.push(Expr::Column((*col).clone()));
+            }
 
             if missing.is_empty() {
                 // All sort columns are in the projection — simple case.
                 Ok(LogicalPlan::Sort(Sort {
-                    expr: sort.expr,
+                    expr: normalized_sort_exprs,
                     input: Arc::new(LogicalPlan::Projection(inner_proj)),
                     fetch: sort.fetch,
                 }))
@@ -413,7 +555,7 @@ fn sink_exprs_below_sort(exprs: Vec<Expr>, plan: LogicalPlan) -> Result<LogicalP
                 let extended_proj =
                     LogicalPlan::Projection(Projection::try_new(inner_exprs, sort.input)?);
                 let sort_node = LogicalPlan::Sort(Sort {
-                    expr: sort.expr,
+                    expr: normalized_sort_exprs,
                     input: Arc::new(extended_proj),
                     fetch: sort.fetch,
                 });
@@ -767,6 +909,14 @@ mod tests {
             Field::new("b", DataType::Utf8, false),
             Field::new("c", DataType::Date32, false),
         ]));
+        get_test_table_provider_with_schema(name, schema, executor)
+    }
+
+    fn get_test_table_provider_with_schema(
+        name: String,
+        schema: SchemaRef,
+        executor: TestExecutor,
+    ) -> Arc<dyn TableProvider> {
         let table_ref = RemoteTableRef::try_from(name).unwrap();
         let table = Arc::new(RemoteTable::new(table_ref, schema));
         let provider = Arc::new(SQLFederationProvider::new(Arc::new(executor)));
@@ -1686,6 +1836,252 @@ mod tests {
         let LogicalPlan::Sort(_) = &result else {
             panic!("expected Sort at the top, got: {result:?}");
         };
+
+        Ok(())
+    }
+
+    #[test]
+    fn sink_exprs_below_sort_normalizes_qualified_sort_column() -> Result<(), DataFusionError> {
+        use datafusion::common::{DFSchema, TableReference};
+        use std::collections::HashMap;
+
+        let input_schema = Arc::new(DFSchema::new_with_metadata(
+            vec![
+                (
+                    Some(TableReference::bare("p")),
+                    Arc::new(Field::new("name", DataType::Utf8, false)),
+                ),
+                (
+                    None,
+                    Arc::new(Field::new("total_qty", DataType::Int64, false)),
+                ),
+            ],
+            HashMap::new(),
+        )?);
+
+        let input = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: input_schema,
+        });
+
+        let sort_node = LogicalPlan::Sort(Sort {
+            expr: vec![SortExpr {
+                expr: Expr::Column(Column::new(Some("p"), "name")),
+                asc: true,
+                nulls_first: false,
+            }],
+            input: Arc::new(input),
+            fetch: None,
+        });
+
+        let result = sink_exprs_below_sort(
+            vec![
+                Expr::Column(Column::new(Some("p"), "name")).alias("name"),
+                Expr::Column(Column::new_unqualified("total_qty")),
+            ],
+            sort_node,
+        )?;
+
+        let LogicalPlan::Sort(sort) = &result else {
+            panic!("expected Sort at the top, got: {result:?}");
+        };
+
+        let Expr::Column(column) = &sort.expr[0].expr else {
+            panic!("expected sort expression to be a column");
+        };
+        assert_eq!(column.relation, None);
+        assert_eq!(column.name, "name");
+
+        let LogicalPlan::Projection(proj) = sort.input.as_ref() else {
+            panic!("expected Projection under Sort");
+        };
+        assert!(
+            !proj.schema.has_column(&Column::new(Some("p"), "name")),
+            "projection schema should not contain a qualified p.name alongside unqualified name"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_sql_for_join_group_order_by_qualified_name_succeeds(
+    ) -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "join_group_order_by_qualified_name".into(),
+            cannot_federate: None,
+        };
+
+        let products_schema = Arc::new(Schema::new(vec![
+            Field::new("product_id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let orders_schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("product_id", DataType::Int64, false),
+            Field::new("quantity", DataType::Int64, false),
+        ]));
+
+        let orders = get_test_table_provider_with_schema(
+            "orders".to_string(),
+            orders_schema,
+            executor.clone(),
+        );
+        let products =
+            get_test_table_provider_with_schema("products".to_string(), products_schema, executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("orders", orders).unwrap();
+        ctx.register_table("products", products).unwrap();
+
+        let plan = ctx
+            .sql(
+                "SELECT p.name, SUM(o.quantity) as total_qty FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.name ORDER BY p.name",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
+
+        let mut final_sqls = Vec::new();
+        physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let exec = node
+                    .as_any()
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .unwrap();
+                final_sqls.push(exec.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        let [sql] = final_sqls.as_slice() else {
+            panic!("expected one federated SQL query, got: {final_sqls:?}");
+        };
+        assert!(
+            sql.to_uppercase().contains("ORDER BY"),
+            "expected generated SQL to include ORDER BY; sql={sql}"
+        );
+        assert!(
+            sql.contains(" AS o") && sql.contains(" AS p"),
+            "generated SQL should preserve join aliases used by expressions; sql={sql}"
+        );
+        assert!(
+            sql.contains("o.product_id") && sql.contains("p.product_id"),
+            "generated SQL should reference join columns through defined aliases; sql={sql}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_sort_expr_strips_qualifier_when_output_is_unqualified(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::common::DFSchema;
+
+        let output_schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("total_qty", DataType::Int64, false),
+        ]))?;
+
+        let qualified_sort = SortExpr {
+            expr: Expr::Column(Column::new(Some("p"), "name")),
+            asc: true,
+            nulls_first: false,
+        };
+
+        let normalized = normalize_sort_expr_for_output_schema(&qualified_sort, &output_schema);
+
+        let Expr::Column(column) = normalized.expr else {
+            panic!("expected a column sort expression");
+        };
+        assert_eq!(column.relation, None);
+        assert_eq!(column.name, "name");
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_sort_expr_keeps_qualified_column_when_unqualified_is_ambiguous(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::common::{DFSchema, TableReference};
+        use std::collections::HashMap;
+
+        let output_schema = DFSchema::new_with_metadata(
+            vec![
+                (
+                    Some(TableReference::bare("left")),
+                    Arc::new(Field::new("name", DataType::Utf8, false)),
+                ),
+                (
+                    Some(TableReference::bare("right")),
+                    Arc::new(Field::new("name", DataType::Utf8, false)),
+                ),
+            ],
+            HashMap::new(),
+        )?;
+
+        let qualified_sort = SortExpr {
+            expr: Expr::Column(Column::new(Some("missing"), "name")),
+            asc: true,
+            nulls_first: false,
+        };
+
+        let normalized = normalize_sort_expr_for_output_schema(&qualified_sort, &output_schema);
+
+        let Expr::Column(column) = normalized.expr else {
+            panic!("expected a column sort expression");
+        };
+        assert_eq!(column.relation, Some(TableReference::bare("missing")));
+        assert_eq!(column.name, "name");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qualified_order_by_join_aggregation_builds_sort_exec() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "join_order_by_qualified".into(),
+            cannot_federate: None,
+        };
+
+        let orders_ref = "orders".to_string();
+        let products_ref = "products".to_string();
+        let orders = get_test_table_provider(orders_ref.clone(), executor.clone());
+        let products = get_test_table_provider(products_ref.clone(), executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(orders_ref, orders).unwrap();
+        ctx.register_table(products_ref, products).unwrap();
+
+        let plan = ctx
+            .sql(
+                "SELECT p.b, SUM(o.a) AS total_qty FROM orders o JOIN products p ON o.a = p.a GROUP BY p.b ORDER BY p.b",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
+
+        let mut found_sort_over_virtual = false;
+        physical_plan.apply(|node| {
+            if node.name() == "SortExec" {
+                node.apply(|child| {
+                    if child.name() == "sql_federation_exec" {
+                        found_sort_over_virtual = true;
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert!(
+            found_sort_over_virtual,
+            "Expected SortExec over VirtualExecutionPlan for qualified ORDER BY in federated join aggregation"
+        );
 
         Ok(())
     }
