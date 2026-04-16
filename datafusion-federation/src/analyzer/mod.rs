@@ -11,7 +11,7 @@ use datafusion::{
     config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
-    logical_expr::{Expr, Extension, LogicalPlan, Projection, Sort, TableScan, TableSource},
+    logical_expr::{Expr, Extension, LogicalPlan, Projection, TableScan, TableSource},
     optimizer::analyzer::AnalyzerRule,
     sql::TableReference,
 };
@@ -460,27 +460,6 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     // TODO: minimize requested columns
     match plan {
         LogicalPlan::Projection(_) => Ok(plan),
-        // Do NOT put a Projection on top of a Sort.  The SQL Unparser
-        // translates a Projection-over-Sort into a subquery:
-        //
-        //   SELECT col1, col2 FROM (SELECT col1, col2 FROM t ORDER BY col1)
-        //
-        // which buries the ORDER BY inside the subquery.  SQL does not
-        // guarantee that subquery ordering propagates to the outer query, so
-        // multi-batch results can arrive in the wrong order.
-        //
-        // Instead, push the Projection below the Sort so the Unparser
-        // generates a top-level ORDER BY:
-        //
-        //   SELECT col1, col2 FROM t ORDER BY col1
-        LogicalPlan::Sort(sort) => {
-            let wrapped_input = wrap_projection(Arc::unwrap_or_clone(sort.input))?;
-            Ok(LogicalPlan::Sort(Sort {
-                expr: sort.expr,
-                input: Arc::new(wrapped_input),
-                fetch: sort.fetch,
-            }))
-        }
         _ => {
             let expr = plan
                 .schema()
@@ -549,75 +528,4 @@ pub fn get_table_source(
 
     // Return original FederatedTableSource
     Ok(Some(Arc::clone(&wrapper.source)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::common::DFSchema;
-    use datafusion::logical_expr::{EmptyRelation, LogicalPlan, Sort, SortExpr};
-    use datafusion::prelude::col;
-
-    fn make_empty_plan(fields: Vec<Field>) -> LogicalPlan {
-        let schema = Arc::new(Schema::new(fields));
-        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone()).unwrap());
-        LogicalPlan::EmptyRelation(EmptyRelation {
-            produce_one_row: false,
-            schema: df_schema,
-        })
-    }
-
-    /// `wrap_projection` on a plain non-Sort plan adds a Projection at the top.
-    #[test]
-    fn wrap_projection_adds_projection_over_non_sort() {
-        let plan = make_empty_plan(vec![Field::new("a", DataType::Int64, false)]);
-        let wrapped = wrap_projection(plan).unwrap();
-        assert!(
-            matches!(wrapped, LogicalPlan::Projection(_)),
-            "expected Projection at top, got: {}",
-            wrapped.display_indent()
-        );
-    }
-
-    /// `wrap_projection` on a Sort must NOT put a Projection on top of the
-    /// Sort — that would push ORDER BY into a SQL subquery and break ordering
-    /// when the remote engine returns multiple batches.
-    ///
-    /// Instead the Projection must be pushed *below* the Sort, so the SQL
-    /// Unparser can emit a top-level ORDER BY.
-    #[test]
-    fn wrap_projection_does_not_bury_sort_in_subquery() {
-        let leaf = make_empty_plan(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]);
-        let sort_node = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr {
-                expr: col("id"),
-                asc: true,
-                nulls_first: false,
-            }],
-            input: Arc::new(leaf),
-            fetch: None,
-        });
-
-        let wrapped = wrap_projection(sort_node).unwrap();
-
-        // The top-level node must still be a Sort, not a Projection.
-        assert!(
-            matches!(wrapped, LogicalPlan::Sort(_)),
-            "wrap_projection must not bury Sort under Projection; got: {}",
-            wrapped.display_indent()
-        );
-
-        // The Sort's direct input must now be a Projection.
-        if let LogicalPlan::Sort(Sort { input, .. }) = &wrapped {
-            assert!(
-                matches!(input.as_ref(), LogicalPlan::Projection(_)),
-                "expected Projection as Sort's input after wrap_projection; got: {}",
-                input.display_indent()
-            );
-        }
-    }
 }
