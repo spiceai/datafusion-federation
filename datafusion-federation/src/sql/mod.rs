@@ -195,7 +195,8 @@ impl FederationPlanner for SQLFederationPlanner {
                 .collect::<Result<Vec<_>>>()
             {
                 Ok(physical_sort_exprs) if physical_sort_exprs.is_empty() => {
-                    return Err(DataFusionError::Plan("Top-level Sort was detected, but no physical sort expressions could be created".to_string()));
+                    // No sort expressions could be created — skip the local
+                    // SortExec and rely on the remote database for ordering.
                 }
                 Ok(physical_sort_exprs) => {
                     if let Some(lex_ordering) = LexOrdering::new(physical_sort_exprs) {
@@ -204,11 +205,11 @@ impl FederationPlanner for SQLFederationPlanner {
                         ));
                     }
                 }
-                Err(e) => {
-                    return Err(DataFusionError::Context(
-                        "Failed to create `PhysicalSortExpr`".to_string(),
-                        Box::new(e),
-                    ))
+                Err(_) => {
+                    // Sort columns are not in the output schema (e.g.
+                    // `SELECT name FROM t ORDER BY id`). The remote database
+                    // will handle sorting via the generated SQL; skip the
+                    // local SortExec.
                 }
             };
         }
