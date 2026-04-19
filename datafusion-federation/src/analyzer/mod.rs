@@ -2,7 +2,7 @@ mod scan_result;
 
 use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
 use crate::{FederationAnalyzerForLogicalPlan, FederationProvider};
-use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
+use datafusion::logical_expr::{col, expr::Exists, expr::InSubquery, LogicalPlanBuilder};
 use datafusion::optimizer::optimize_unions::OptimizeUnions;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
@@ -159,6 +159,13 @@ impl FederationAnalyzerRule {
                 Expr::InSubquery(ref insubquery) => {
                     let plan_result =
                         self.scan_plan_recursively(&insubquery.subquery.subquery, providers)?;
+
+                    sole_provider.merge(plan_result);
+                    Ok(sole_provider.check_recursion())
+                }
+                Expr::Exists(ref exists) => {
+                    let plan_result =
+                        self.scan_plan_recursively(&exists.subquery.subquery, providers)?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
@@ -422,6 +429,43 @@ impl FederationAnalyzerRule {
                     in_subquery.subquery.with_plan(new_subquery.into()),
                     in_subquery.negated,
                 ))))
+            }
+            Expr::Exists(ref exists) => {
+                let (new_subquery, _) = self.analyze_plan_recursively(
+                    &exists.subquery.subquery,
+                    true,
+                    _config,
+                    providers,
+                )?;
+                let Some(new_subquery) = new_subquery else {
+                    return Ok(Transformed::no(expr));
+                };
+
+                // DecorrelatePredicateSubquery optimizer rule doesn't support federated node
+                // (LogicalPlan::Extension(_)) as subquery.
+                // Wrap a no-op Projection outside the federated node to facilitate optimization.
+                if matches!(new_subquery, LogicalPlan::Extension(_)) {
+                    let all_columns = new_subquery
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| col(field.name()))
+                        .collect::<Vec<_>>();
+
+                    let projection_plan = LogicalPlanBuilder::from(new_subquery)
+                        .project(all_columns)?
+                        .build()?;
+
+                    return Ok(Transformed::yes(Expr::Exists(Exists {
+                        subquery: exists.subquery.with_plan(projection_plan.into()),
+                        negated: exists.negated,
+                    })));
+                }
+
+                Ok(Transformed::yes(Expr::Exists(Exists {
+                    subquery: exists.subquery.with_plan(new_subquery.into()),
+                    negated: exists.negated,
+                })))
             }
             _ => Ok(Transformed::no(expr)),
         }
