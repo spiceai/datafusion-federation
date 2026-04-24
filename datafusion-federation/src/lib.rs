@@ -24,7 +24,8 @@ use datafusion::{
 
 pub use analyzer::{get_table_source, FederationAnalyzerRule};
 pub use plan_node::{
-    FederatedPlanNode, FederatedPlanner, FederatedQueryPlanner, FederationPlanner,
+    FederatedPlanNode, FederatedPlanner, FederatedQueryPlanner, FederatedQueryType,
+    FederationPlanner,
 };
 pub use table_provider::{FederatedTableProviderAdaptor, FederatedTableSource};
 
