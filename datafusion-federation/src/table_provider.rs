@@ -137,6 +137,218 @@ impl TableProvider for FederatedTableProviderAdaptor {
             "FederatedTableProviderAdaptor cannot insert_into".to_string(),
         ))
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Some(table_provider) = &self.table_provider {
+            return table_provider.delete_from(state, filters).await;
+        }
+
+        Err(DataFusionError::NotImplemented(
+            "FederatedTableProviderAdaptor cannot delete_from".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Some(table_provider) = &self.table_provider {
+            return table_provider.update(state, assignments, filters).await;
+        }
+
+        Err(DataFusionError::NotImplemented(
+            "FederatedTableProviderAdaptor cannot update".to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::catalog::Session;
+    use datafusion::error::DataFusionError;
+    use datafusion::logical_expr::{dml::InsertOp, Expr, TableType};
+    use datafusion::physical_plan::ExecutionPlan;
+    use std::any::Any;
+
+    // Minimal FederatedTableSource implementation for tests that don't need DML.
+    #[derive(Debug)]
+    struct NoOpSource {
+        schema: SchemaRef,
+    }
+
+    impl NoOpSource {
+        fn new() -> Self {
+            Self {
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            }
+        }
+    }
+
+    impl datafusion::logical_expr::TableSource for NoOpSource {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    impl crate::FederatedTableSource for NoOpSource {
+        fn federation_provider(&self) -> Arc<dyn crate::FederationProvider> {
+            Arc::new(crate::analyzer::NopFederationProvider {})
+        }
+    }
+
+    // A TableProvider that records which DML methods were called.
+    #[derive(Debug)]
+    struct RecordingProvider {
+        schema: SchemaRef,
+    }
+
+    impl RecordingProvider {
+        fn new() -> Self {
+            Self {
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for RecordingProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented("scan".to_string()))
+        }
+        async fn delete_from(
+            &self,
+            _state: &dyn Session,
+            _filters: Vec<Expr>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented(
+                "recording_delete_from".to_string(),
+            ))
+        }
+        async fn update(
+            &self,
+            _state: &dyn Session,
+            _assignments: Vec<(String, Expr)>,
+            _filters: Vec<Expr>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented(
+                "recording_update".to_string(),
+            ))
+        }
+        async fn insert_into(
+            &self,
+            _state: &dyn Session,
+            _input: Arc<dyn ExecutionPlan>,
+            _insert_op: InsertOp,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented("insert_into".to_string()))
+        }
+    }
+
+    // Helper: build a session state suitable for calling TableProvider methods.
+    fn make_session() -> datafusion::execution::session_state::SessionState {
+        crate::default_session_state()
+    }
+
+    #[tokio::test]
+    async fn delete_from_delegates_to_inner_provider() {
+        let source = Arc::new(NoOpSource::new());
+        let provider = Arc::new(RecordingProvider::new());
+        let adaptor = FederatedTableProviderAdaptor::new_with_provider(source, provider);
+        let state = make_session();
+
+        let err = adaptor
+            .delete_from(&state, vec![])
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("recording_delete_from"),
+            "expected inner provider error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_from_errors_without_inner_provider() {
+        let source = Arc::new(NoOpSource::new());
+        let adaptor = FederatedTableProviderAdaptor::new(source);
+        let state = make_session();
+
+        let err = adaptor
+            .delete_from(&state, vec![])
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("FederatedTableProviderAdaptor cannot delete_from"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_delegates_to_inner_provider() {
+        let source = Arc::new(NoOpSource::new());
+        let provider = Arc::new(RecordingProvider::new());
+        let adaptor = FederatedTableProviderAdaptor::new_with_provider(source, provider);
+        let state = make_session();
+
+        let err = adaptor
+            .update(&state, vec![], vec![])
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("recording_update"),
+            "expected inner provider error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_errors_without_inner_provider() {
+        let source = Arc::new(NoOpSource::new());
+        let adaptor = FederatedTableProviderAdaptor::new(source);
+        let state = make_session();
+
+        let err = adaptor
+            .update(&state, vec![], vec![])
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("FederatedTableProviderAdaptor cannot update"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 // FederatedTableProvider extends DataFusion's TableProvider trait

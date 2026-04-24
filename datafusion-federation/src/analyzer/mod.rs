@@ -35,6 +35,15 @@ impl AnalyzerRule for FederationAnalyzerRule {
     // TableScans from the same FederationProvider.
     // There 'largest sub-trees' are passed to their respective FederationProvider.optimizer.
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+        // DML plans must not be federated: the SQL unparser's dml_to_sql is
+        // unimplemented, and wrapping DML in a FederatedPlanNode hides the Dml
+        // node from write-permission validators (security bypass). Leave DML
+        // plans unwrapped so validators see them and DataFusion's physical
+        // planner can dispatch delete_from/update to the table provider.
+        if matches!(plan, LogicalPlan::Dml(_)) {
+            return Ok(plan);
+        }
+
         if !contains_federated_table(&plan)? {
             return Ok(plan);
         }
@@ -508,6 +517,66 @@ fn get_leaf_provider(
             Ok((Some(provider), Some(table_reference)))
         }
         _ => Ok((None, None)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::config::ConfigOptions;
+    use datafusion::logical_expr::{DmlStatement, EmptyRelation, WriteOp};
+    use datafusion::optimizer::analyzer::AnalyzerRule;
+    use datafusion::sql::TableReference;
+    use std::sync::Arc;
+
+    // Minimal TableSource needed to construct a DmlStatement.
+    #[derive(Debug)]
+    struct MockTableSource {
+        schema: SchemaRef,
+    }
+
+    impl MockTableSource {
+        fn new() -> Self {
+            Self {
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            }
+        }
+    }
+
+    impl datafusion::logical_expr::TableSource for MockTableSource {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    #[test]
+    fn dml_plan_is_returned_unchanged() {
+        let rule = FederationAnalyzerRule::new();
+        let config = ConfigOptions::default();
+
+        let empty = Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(datafusion::common::DFSchema::empty()),
+        }));
+        let source = Arc::new(MockTableSource::new());
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            TableReference::bare("t"),
+            source,
+            WriteOp::Delete,
+            empty,
+        ));
+
+        let result = rule.analyze(dml.clone(), &config).unwrap();
+
+        // The plan must come back as-is — Dml, not wrapped in a FederatedPlanNode.
+        assert!(
+            matches!(result, LogicalPlan::Dml(_)),
+            "expected Dml plan, got {result:?}"
+        );
     }
 }
 
