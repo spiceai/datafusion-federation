@@ -209,6 +209,17 @@ impl FederationAnalyzerRule {
 
         // Return early if this is a leaf and there is no ambiguity with the expressions.
         if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
+            // Before returning this leaf as federatable, ask the provider whether it can
+            // actually handle the plan as-is (e.g. the TableScan may have filter expressions
+            // containing functions the remote engine doesn't support, pushed down by
+            // PushDownFilter before federation analysis runs).  If the provider says it
+            // cannot federate this plan, treat the leaf as ambiguous so the parent plan
+            // is not federated either.
+            if let ScanResult::Distinct(ref provider) = leaf_provider.clone().into() {
+                if provider.analyzer(plan).is_none() {
+                    return Ok((None, ScanResult::Ambiguous));
+                }
+            }
             return Ok((None, leaf_provider.into()));
         }
         // Aggregate leaf & expression providers
