@@ -499,6 +499,25 @@ fn get_plan_provider_recursively(
     let mut providers: HashMap<TableReference, Arc<dyn FederationProvider>> = HashMap::new();
 
     plan.apply_with_subqueries(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
+        // Register SubqueryAlias names (e.g. `lineitem l1`) so that OuterReferenceColumn resolved
+        // against the alias (e.g. `l1.l_orderkey`) can find the correct provider. Without this,
+        // correlated subqueries that reference an aliased outer table mark the scan as Ambiguous,
+        // breaking same-provider federation.
+        if let LogicalPlan::SubqueryAlias(subquery_alias) = p {
+            let alias_ref = TableReference::bare(subquery_alias.alias.table().to_string());
+            subquery_alias
+                .input
+                .apply(&mut |child| -> Result<TreeNodeRecursion> {
+                    if let (Some(provider), Some(table_reference)) = get_leaf_provider(child)? {
+                        providers.insert(alias_ref.clone(), Arc::clone(&provider));
+                        providers.insert(table_reference, provider);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+            return Ok(TreeNodeRecursion::Continue);
+        }
+
         if let (Some(federation_provider), Some(table_reference)) = get_leaf_provider(p)? {
             providers.insert(table_reference, federation_provider);
         }
