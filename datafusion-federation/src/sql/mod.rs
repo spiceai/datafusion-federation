@@ -471,6 +471,7 @@ mod tests {
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::Alias;
     use datafusion::logical_expr::Projection;
     use datafusion::prelude::Expr;
@@ -479,11 +480,13 @@ mod tests {
     use datafusion::{
         arrow::datatypes::{DataType, Field},
         datasource::TableProvider,
+        execution::config::SessionConfig,
         execution::context::SessionContext,
     };
 
     use super::table::RemoteTable;
     use super::*;
+    use crate::FederatedQueryPlanner;
 
     #[derive(Clone)]
     struct TestExecutor {
@@ -1031,5 +1034,364 @@ mod tests {
         assert_eq!(rewrite_calls.load(Ordering::SeqCst), 1);
 
         Ok(())
+    }
+
+    // --- EXISTS / NOT EXISTS federation tests ---
+
+    fn make_table_with_schema(
+        name: &str,
+        schema: SchemaRef,
+        executor: &TestExecutor,
+    ) -> Arc<dyn TableProvider> {
+        let table_ref = RemoteTableRef::try_from(name.to_string()).unwrap();
+        let table = Arc::new(RemoteTable::new(table_ref, schema));
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(executor.clone())));
+        let table_source = Arc::new(SQLTableSource { provider, table });
+        Arc::new(FederatedTableProviderAdaptor::new(table_source))
+    }
+
+    fn orders_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_custkey", DataType::Int64, false),
+            Field::new("o_orderstatus", DataType::Utf8, false),
+            Field::new("o_orderdate", DataType::Date32, true),
+        ]))
+    }
+
+    fn lineitem_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_suppkey", DataType::Int64, false),
+            Field::new("l_commitdate", DataType::Date32, true),
+            Field::new("l_receiptdate", DataType::Date32, true),
+        ]))
+    }
+
+    fn supplier_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_name", DataType::Utf8, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]))
+    }
+
+    /// Creates a session state with a fixed `target_partitions` count so that
+    /// snapshot tests produce deterministic physical plans regardless of the
+    /// number of CPU cores on the host.
+    fn deterministic_session_state() -> SessionState {
+        let rules = crate::default_analyzer_rules();
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::default().with_target_partitions(4))
+            .with_analyzer_rules(rules)
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_default_features()
+            .build()
+    }
+
+    /// Runs `EXPLAIN <query>`, collects the output, and returns a formatted
+    /// string containing both logical and physical plans.
+    async fn explain_query(ctx: &SessionContext, query: &str) -> String {
+        let explain_sql = format!("EXPLAIN {query}");
+        let batches = ctx
+            .sql(&explain_sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let formatted = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap();
+        formatted.to_string()
+    }
+
+    /// Same-provider EXISTS: both tables from the same compute context.
+    /// The entire plan should be federated as a single unit so the backend
+    /// can decorrelate EXISTS into a semi-join.
+    #[tokio::test]
+    async fn same_provider_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "same_provider_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// Same-provider NOT EXISTS: mirrors TPC-H Q21 structure.
+    /// Must be federated as one unit so the backend can decorrelate to anti-join.
+    #[tokio::test]
+    async fn same_provider_not_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "same_provider_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name FROM supplier WHERE NOT EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_suppkey = s_suppkey \
+                  AND l_receiptdate > l_commitdate)",
+            )
+            .await
+        );
+    }
+
+    /// Cross-provider EXISTS: outer table on provider A, subquery table on provider B.
+    /// Each side must be independently federated (multiple Federated nodes).
+    #[tokio::test]
+    async fn cross_provider_exists_separately_federated() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "cross_provider_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// Cross-provider NOT EXISTS: outer table on provider A, subquery table on provider B.
+    #[tokio::test]
+    async fn cross_provider_not_exists_separately_federated() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "cross_provider_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE NOT EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// TPC-H Q21 pattern: same-provider JOIN + NOT EXISTS + EXISTS.
+    /// All tables on the same provider. The entire plan must be federated
+    /// as a single unit so the backend handles decorrelation.
+    #[tokio::test]
+    async fn same_provider_join_with_not_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "same_provider_join_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name \
+                 FROM supplier \
+                 JOIN lineitem ON s_suppkey = l_suppkey \
+                 JOIN orders ON o_orderkey = l_orderkey \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM lineitem AS l2 \
+                     WHERE l2.l_orderkey = lineitem.l_orderkey \
+                     AND l2.l_suppkey <> lineitem.l_suppkey \
+                 )",
+            )
+            .await
+        );
+    }
+
+    /// Mixed providers: JOIN across providers + EXISTS subquery on a different provider.
+    /// supplier(ctx_a) JOIN lineitem(ctx_b) WHERE EXISTS on orders(ctx_a).
+    #[tokio::test]
+    async fn mixed_provider_join_with_exists() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "mixed_provider_join_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name \
+                 FROM supplier \
+                 JOIN lineitem ON l_suppkey = s_suppkey \
+                 WHERE EXISTS ( \
+                     SELECT 1 FROM orders \
+                     WHERE o_custkey = s_suppkey \
+                 )",
+            )
+            .await
+        );
+    }
+
+    /// Same-provider NOT EXISTS with aliased outer table.
+    /// The outer query uses `lineitem l1` (alias). The NOT EXISTS subquery
+    /// references the alias: `l1.l_orderkey`. All tables are same provider.
+    #[tokio::test]
+    async fn same_provider_aliased_table_not_exists() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        // TPC-H Q21 pattern: aliased lineitem l1, NOT EXISTS references l1.*
+        insta::assert_snapshot!(
+            "same_provider_aliased_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name, count(*) AS numwait \
+                 FROM supplier, lineitem l1, orders \
+                 WHERE s_suppkey = l1.l_suppkey \
+                   AND l1.l_orderkey = o_orderkey \
+                   AND l1.l_receiptdate > l1.l_commitdate \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM lineitem l2 \
+                       WHERE l2.l_orderkey = l1.l_orderkey \
+                         AND l2.l_suppkey <> l1.l_suppkey \
+                   ) \
+                 GROUP BY s_name \
+                 ORDER BY numwait DESC, s_name",
+            )
+            .await
+        );
     }
 }
