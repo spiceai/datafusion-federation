@@ -1,81 +1,62 @@
 mod analyzer;
 pub mod ast_analyzer;
 mod executor;
-pub mod optimizer;
 mod schema;
 mod table;
 mod table_reference;
 
 use std::{any::Any, fmt, sync::Arc, vec};
 
-use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
-use ast_analyzer::RewriteMultiTableReference;
+use analyzer::RewriteTableScanAnalyzer;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
-    common::DFSchema,
-    common::{tree_node::TreeNode, Statistics},
+    common::{
+        tree_node::{Transformed, TreeNode},
+        Statistics,
+    },
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{
-        Distinct, DistinctOn, Expr, Extension, Limit, LogicalPlan, Projection, Sort, SubqueryAlias,
-    },
-    optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
-    physical_expr::{create_physical_sort_expr, EquivalenceProperties, LexOrdering},
+    logical_expr::{Extension, LogicalPlan},
+    optimizer::{optimizer::Optimizer, OptimizerConfig, OptimizerRule},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
         filter_pushdown::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
         metrics::MetricsSet,
-        sorts::sort::SortExec,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
     },
     sql::{sqlparser::ast::Statement, unparser::Unparser},
 };
-use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
-pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
-pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef, SqlQueryRewriter};
+pub use executor::{AstAnalyzer, LogicalOptimizer, SQLExecutor, SQLExecutorRef, SqlQueryRewriter};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTable, SQLTableSource};
-pub use table_reference::{MultiPartTableReference, RemoteTableRef};
+pub use table_reference::RemoteTableRef;
 
 use crate::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerForLogicalPlan,
-    FederationAnalyzerRule, FederationPlanner, FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederationPlanner, FederationProvider,
 };
-
-/// Returns a federation analyzer rule that is optimized for SQL federation.
-pub fn federation_analyzer_rule() -> FederationAnalyzerRule {
-    FederationAnalyzerRule::new().with_optimizer(Optimizer::with_rules(vec![
-        Arc::new(OptimizeUnions::new()),
-        Arc::new(PushDownFilterFederation::new()),
-        Arc::new(OptimizeProjectionsFederation::new()),
-    ]))
-}
 
 // SQLFederationProvider provides federation to SQL DMBSs.
 #[derive(Debug)]
 pub struct SQLFederationProvider {
-    analyzer: Arc<Analyzer>,
-    pub(crate) executor: Arc<dyn SQLExecutor>,
+    pub optimizer: Arc<Optimizer>,
+    pub executor: Arc<dyn SQLExecutor>,
 }
 
 impl SQLFederationProvider {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
-            analyzer: Arc::new(Analyzer::with_rules(vec![Arc::new(
-                SQLFederationAnalyzerRule::new(Arc::clone(&executor)),
+            optimizer: Arc::new(Optimizer::with_rules(vec![Arc::new(
+                SQLFederationOptimizerRule::new(executor.clone()),
             )])),
             executor,
         }
-    }
-
-    pub fn executor(&self) -> &Arc<dyn SQLExecutor> {
-        &self.executor
     }
 }
 
@@ -88,21 +69,17 @@ impl FederationProvider for SQLFederationProvider {
         self.executor.compute_context()
     }
 
-    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
-        if self.executor.can_execute_plan(plan) {
-            Some(Arc::clone(&self.analyzer).into())
-        } else {
-            Some(FederationAnalyzerForLogicalPlan::Unable)
-        }
+    fn optimizer(&self) -> Option<Arc<Optimizer>> {
+        Some(self.optimizer.clone())
     }
 }
 
 #[derive(Debug)]
-struct SQLFederationAnalyzerRule {
+struct SQLFederationOptimizerRule {
     planner: Arc<SQLFederationPlanner>,
 }
 
-impl SQLFederationAnalyzerRule {
+impl SQLFederationOptimizerRule {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self {
             planner: Arc::new(SQLFederationPlanner::new(Arc::clone(&executor))),
@@ -110,44 +87,56 @@ impl SQLFederationAnalyzerRule {
     }
 }
 
-impl AnalyzerRule for SQLFederationAnalyzerRule {
-    /// Try to rewrite `plan` to an optimized form.
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+impl OptimizerRule for SQLFederationOptimizerRule {
+    /// Try to rewrite `plan` to an optimized form, returning `Transformed::yes`
+    /// if the plan was rewritten and `Transformed::no` if it was not.
+    ///
+    /// Note: this function is only called if [`Self::supports_rewrite`] returns
+    /// true. Otherwise the Optimizer calls  [`Self::try_optimize`]
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
         if let LogicalPlan::Extension(Extension { ref node }) = plan {
             if node.name() == "Federated" {
                 // Avoid attempting double federation
-                return Ok(plan);
+                return Ok(Transformed::no(plan));
             }
         }
 
-        let mut plan = LogicalPlan::Extension(Extension {
-            node: Arc::new(FederatedPlanNode::new(plan.clone(), self.planner.clone())),
-        });
+        let fed_plan = FederatedPlanNode::new(plan.clone(), self.planner.clone());
+        let ext_node = Extension {
+            node: Arc::new(fed_plan),
+        };
+
+        let mut plan = LogicalPlan::Extension(ext_node);
         if let Some(mut rewriter) = self.planner.executor.logical_optimizer() {
             plan = rewriter(plan)?;
         }
 
-        Ok(plan)
+        Ok(Transformed::yes(plan))
     }
 
     /// A human readable name for this analyzer rule
     fn name(&self) -> &str {
         "federate_sql"
     }
+
+    /// Does this rule support rewriting owned plans (rather than by reference)?
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]
 pub struct SQLFederationPlanner {
-    pub(crate) executor: Arc<dyn SQLExecutor>,
+    pub executor: Arc<dyn SQLExecutor>,
 }
 
 impl SQLFederationPlanner {
     pub fn new(executor: Arc<dyn SQLExecutor>) -> Self {
         Self { executor }
-    }
-
-    pub fn executor(&self) -> &Arc<dyn SQLExecutor> {
-        &self.executor
     }
 }
 
@@ -156,100 +145,18 @@ impl FederationPlanner for SQLFederationPlanner {
     async fn plan_federation(
         &self,
         node: &FederatedPlanNode,
-        session_state: &SessionState,
+        _session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = Arc::new(node.plan().schema().as_arrow().clone());
         let plan = node.plan().clone();
         let statistics = self.executor.statistics(&plan).await?;
         let input = Arc::new(VirtualExecutionPlan::new(
-            plan.clone(),
+            plan,
             Arc::clone(&self.executor),
             statistics,
         ));
-        let schema_cast_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(schema_cast::SchemaCastScanExec::new(input, schema));
-
-        // When a `Sort` node is present at the top of the federated logical plan
-        // (possibly behind a `Projection` or `SubqueryAlias`), the SQL Unparser
-        // may push the `ORDER BY` inside a subquery:
-        //
-        //   SELECT ... FROM (SELECT ... ORDER BY col)   -- outer has no ORDER BY!
-        //
-        // SQL does not guarantee that ordering from a subquery is preserved by
-        // the outer query.  When the remote engine returns data across multiple
-        // batches the rows can arrive in arbitrary order, silently violating the
-        // sort contract.
-        //
-        // Fix: detect the sort and add a local `SortExec` so DataFusion enforces
-        // the required ordering regardless of what the remote engine returns.
-        if let Some(sort) = find_top_sort(&plan) {
-            // Resolve sort expressions against the federation output schema so
-            // that fully-qualified column references (e.g. `t.schema.tbl.id`)
-            // are correctly mapped to the output columns (e.g. `id`).
-            let output_schema = plan.schema();
-            let execution_props = session_state.execution_props();
-            match sort
-                .expr
-                .iter()
-                .map(|e| create_physical_sort_expr(e, output_schema.as_ref(), execution_props))
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(physical_sort_exprs) if physical_sort_exprs.is_empty() => {
-                    return Err(DataFusionError::Plan("Top-level Sort was detected, but no physical sort expressions could be created".to_string()));
-                }
-                Ok(physical_sort_exprs) => {
-                    if let Some(lex_ordering) = LexOrdering::new(physical_sort_exprs) {
-                        return Ok(Arc::new(
-                            SortExec::new(lex_ordering, schema_cast_exec).with_fetch(sort.fetch),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return Err(DataFusionError::Context(
-                        "Failed to create `PhysicalSortExpr`".to_string(),
-                        Box::new(e),
-                    ))
-                }
-            };
-        }
-
-        Ok(schema_cast_exec)
-    }
-}
-
-/// Walk the top of a logical plan through transparent wrapper nodes to find
-/// the first `Sort` node, if any.
-///
-/// A node is "transparent" here if the DataFusion SQL Unparser wraps it — and
-/// everything below it — in a derived-table subquery when `already_projected`
-/// is set (i.e. an outer `Projection` was already processed).  That wrapping
-/// buries any `ORDER BY` from an inner `Sort` inside the subquery, so the
-/// outer query has no ordering guarantee.  The nodes that exhibit this
-/// behaviour are exactly those that call `derive_with_dialect_alias` when
-/// `select.already_projected()` is true:
-///
-/// | Node         | subquery alias         |
-/// |--------------|------------------------|
-/// | `Projection` | `derived_projection`   |
-/// | `Limit`      | `derived_limit`        |
-/// | `Distinct`   | `derived_distinct`     |
-///
-/// (`Union` also triggers it but is multi-input, so a `Sort` below a `Union`
-/// does not represent a total order and is excluded.)
-///
-/// `SubqueryAlias` is added as a safety net: it can wrap plans in contexts
-/// that behave like subqueries.
-///
-/// Returns `None` if no `Sort` is encountered before a non-transparent node.
-fn find_top_sort(plan: &LogicalPlan) -> Option<&Sort> {
-    match plan {
-        LogicalPlan::Sort(sort) => Some(sort),
-        LogicalPlan::Projection(Projection { input, .. }) => find_top_sort(input),
-        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => find_top_sort(input),
-        LogicalPlan::Limit(limit) => find_top_sort(&limit.input),
-        LogicalPlan::Distinct(Distinct::On(on)) => find_top_sort(&on.input),
-        LogicalPlan::Distinct(Distinct::All(input)) => find_top_sort(input),
-        _ => None,
+        let schema_cast_exec = schema_cast::SchemaCastScanExec::new(input, schema);
+        Ok(Arc::new(schema_cast_exec))
     }
 }
 
@@ -257,20 +164,20 @@ fn find_top_sort(plan: &LogicalPlan) -> Option<&Sort> {
 pub struct VirtualExecutionPlan {
     plan: LogicalPlan,
     executor: Arc<dyn SQLExecutor>,
-    props: PlanProperties,
+    props: Arc<PlanProperties>,
     statistics: Statistics,
     filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl VirtualExecutionPlan {
     pub fn new(plan: LogicalPlan, executor: Arc<dyn SQLExecutor>, statistics: Statistics) -> Self {
-        let schema: Schema = <DFSchema as AsRef<Schema>>::as_ref(plan.schema().as_ref()).clone();
-        let props = PlanProperties::new(
+        let schema: Schema = plan.schema().as_arrow().clone();
+        let props = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::new(schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             plan,
             executor,
@@ -293,24 +200,18 @@ impl VirtualExecutionPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        let df_schema = self.plan.schema().as_ref();
-        Arc::new(<DFSchema as AsRef<Schema>>::as_ref(df_schema).clone())
+        let df_schema = self.plan.schema().as_arrow().clone();
+        Arc::new(df_schema)
     }
 
     fn final_sql(&self) -> Result<String> {
         let plan = self.plan.clone();
-        let known_rewrites = collect_known_rewrites(&plan)?;
-        let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
-        // Sink any outer Projection past Limit/Distinct/Sort wrapper nodes so
-        // the SQL Unparser emits ORDER BY and LIMIT at the top query level
-        // rather than burying them inside a derived-table subquery.
-        let plan = sink_projection_below_sort(plan)?;
+        let plan = RewriteTableScanAnalyzer::rewrite(plan)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
         let plan = apply_logical_optimizers(plan, logical_optimizers)?;
         let ast = self.plan_to_statement(&plan)?;
         let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
-        let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
-        RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
+        let ast = apply_ast_analyzers(ast, ast_analyzers)?;
         apply_sql_query_rewriters(ast.to_string(), sql_query_rewriters)
     }
 
@@ -319,7 +220,7 @@ impl VirtualExecutionPlan {
         ast: Statement,
     ) -> Result<Statement, datafusion::error::DataFusionError> {
         if let Some(mut analyzer) = self.executor.ast_analyzer() {
-            Ok(analyzer.analyze(ast)?)
+            Ok(analyzer(ast)?)
         } else {
             Ok(ast)
         }
@@ -327,134 +228,6 @@ impl VirtualExecutionPlan {
 
     fn plan_to_statement(&self, plan: &LogicalPlan) -> Result<Statement> {
         Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(plan)
-    }
-}
-
-/// Before handing the federated logical plan to the SQL Unparser, sink any
-/// top-level `Projection` that sits above `Limit` / `Distinct` nodes leading
-/// to a `Sort` so that those wrapper nodes appear *above* the `Projection`
-/// instead.
-///
-/// Without this the DataFusion SQL Unparser generates a subquery whenever it
-/// encounters `Limit` or `Distinct` with `already_projected = true` (i.e.
-/// after an outer `Projection` has been processed).  That wrapping buries
-/// `ORDER BY` and `LIMIT` inside the subquery:
-///
-/// ```sql
-/// -- wrong: ORDER BY / LIMIT inside subquery
-/// SELECT id, CAST(name AS TEXT) FROM
-///   (SELECT id, name FROM t ORDER BY id LIMIT 30)
-/// ```
-///
-/// After the rewrite the Unparser sees the wrapper nodes first, so it emits
-/// them at the top level:
-///
-/// ```sql
-/// -- correct: ORDER BY / LIMIT at the outer query level
-/// SELECT id, CAST(name AS TEXT) FROM
-///   (SELECT id, name FROM t)
-/// ORDER BY id LIMIT 30
-/// ```
-///
-/// The transparent nodes that trigger this problem in the Unparser are exactly
-/// `Limit` and `Distinct` (they call `derive_with_dialect_alias` when
-/// `already_projected` is true). `SubqueryAlias` is included for safety.
-fn sink_projection_below_sort(plan: LogicalPlan) -> Result<LogicalPlan> {
-    let LogicalPlan::Projection(proj) = plan else {
-        return Ok(plan);
-    };
-    sink_exprs_below_sort(proj.expr, Arc::unwrap_or_clone(proj.input))
-}
-
-/// Recursive helper for [`sink_projection_below_sort`].
-///
-/// Walks down through `Limit`, `Distinct`, and `SubqueryAlias` nodes until it
-/// reaches a `Sort`, then inserts a new `Projection(exprs)` just below that
-/// `Sort`. Rebuilds the wrapper nodes on the way back up.
-fn sink_exprs_below_sort(exprs: Vec<Expr>, plan: LogicalPlan) -> Result<LogicalPlan> {
-    match plan {
-        // Base case: found the Sort — place the Projection just below it.
-        LogicalPlan::Sort(sort) => {
-            // Build a tentative inner projection to inspect its output schema.
-            let inner_proj = Projection::try_new(exprs.clone(), Arc::clone(&sort.input))?;
-
-            // Find sort columns not produced by the projection.
-            let missing: Vec<Expr> = sort
-                .expr
-                .iter()
-                .flat_map(|se| se.expr.column_refs())
-                .filter(|col| !inner_proj.schema.has_column(col))
-                .map(|col| Expr::Column((*col).clone()))
-                .collect();
-
-            if missing.is_empty() {
-                // All sort columns are in the projection — simple case.
-                Ok(LogicalPlan::Sort(Sort {
-                    expr: sort.expr,
-                    input: Arc::new(LogicalPlan::Projection(inner_proj)),
-                    fetch: sort.fetch,
-                }))
-            } else {
-                // Sort references columns the projection doesn't emit.
-                // Build: Projection(original_cols) → Sort → Projection(exprs + missing)
-                let outer_exprs: Vec<Expr> = inner_proj
-                    .schema
-                    .columns()
-                    .into_iter()
-                    .map(Expr::Column)
-                    .collect();
-                drop(inner_proj);
-
-                let mut inner_exprs = exprs;
-                inner_exprs.extend(missing);
-                let extended_proj =
-                    LogicalPlan::Projection(Projection::try_new(inner_exprs, sort.input)?);
-                let sort_node = LogicalPlan::Sort(Sort {
-                    expr: sort.expr,
-                    input: Arc::new(extended_proj),
-                    fetch: sort.fetch,
-                });
-                Ok(LogicalPlan::Projection(Projection::try_new(
-                    outer_exprs,
-                    Arc::new(sort_node),
-                )?))
-            }
-        }
-        // Transparent wrappers — recurse and rebuild.
-        LogicalPlan::Limit(limit) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(limit.input))?;
-            Ok(LogicalPlan::Limit(Limit {
-                skip: limit.skip,
-                fetch: limit.fetch,
-                input: Arc::new(inner),
-            }))
-        }
-        LogicalPlan::Distinct(Distinct::All(input)) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(input))?;
-            Ok(LogicalPlan::Distinct(Distinct::All(Arc::new(inner))))
-        }
-        LogicalPlan::Distinct(Distinct::On(on)) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(on.input))?;
-            Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn {
-                on_expr: on.on_expr,
-                select_expr: on.select_expr,
-                sort_expr: on.sort_expr,
-                input: Arc::new(inner),
-                schema: on.schema,
-            })))
-        }
-        LogicalPlan::SubqueryAlias(alias) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(alias.input))?;
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                Arc::new(inner),
-                alias.alias,
-            )?))
-        }
-        // Not a transparent node leading to a Sort — reconstruct the Projection.
-        other => Ok(LogicalPlan::Projection(Projection::try_new(
-            exprs,
-            Arc::new(other),
-        )?)),
     }
 }
 
@@ -502,7 +275,8 @@ fn apply_logical_optimizers(
         let new_schema = plan.schema();
         if &old_schema != new_schema {
             return Err(DataFusionError::Execution(format!(
-                "Schema altered during logical analysis, expected: {old_schema}, found: {new_schema}",
+                "Schema altered during logical analysis, expected: {}, found: {}",
+                old_schema, new_schema
             )));
         }
     }
@@ -511,7 +285,7 @@ fn apply_logical_optimizers(
 
 fn apply_ast_analyzers(mut statement: Statement, analyzers: Vec<AstAnalyzer>) -> Result<Statement> {
     for mut analyzer in analyzers {
-        statement = analyzer.analyze(statement)?;
+        statement = analyzer(statement)?;
     }
     Ok(statement)
 }
@@ -533,11 +307,7 @@ impl DisplayAs for VirtualExecutionPlan {
         if let Some(ctx) = self.executor.compute_context() {
             write!(f, " compute_context={ctx}")?;
         };
-        let known_rewrites = match collect_known_rewrites(&self.plan) {
-            Ok(rewrites) => rewrites,
-            Err(_) => return Ok(()),
-        };
-        let mut plan = match RewriteTableScanAnalyzer::rewrite(self.plan.clone(), &known_rewrites) {
+        let mut plan = match RewriteTableScanAnalyzer::rewrite(self.plan.clone()) {
             Ok(plan) => plan,
             Err(_) => self.plan.clone(),
         };
@@ -545,11 +315,11 @@ impl DisplayAs for VirtualExecutionPlan {
             write!(f, " base_sql={statement}")?;
         }
 
-        let (logical_optimizers, ast_analyzers, _sql_query_rewriters) =
-            match gather_analyzers(&plan) {
-                Ok(analyzers) => analyzers,
-                Err(_) => return Ok(()),
-            };
+        let (logical_optimizers, ast_analyzers, sql_query_rewriters) = match gather_analyzers(&plan)
+        {
+            Ok(analyzers) => analyzers,
+            Err(_) => return Ok(()),
+        };
 
         let old_plan = plan.clone();
 
@@ -585,12 +355,13 @@ impl DisplayAs for VirtualExecutionPlan {
             write!(f, " rewritten_ast_analyzer={statement}")?;
         }
 
-        let final_sql = match self.final_sql() {
+        let sql = statement.to_string();
+        let rewritten_sql = match apply_sql_query_rewriters(sql.clone(), sql_query_rewriters) {
             Ok(sql) => sql,
             _ => return Ok(()),
         };
-        if old_statement.to_string() != final_sql {
-            write!(f, " rewritten_sql={final_sql}")?;
+        if sql != rewritten_sql {
+            write!(f, " rewritten_sql_query={rewritten_sql}")?;
         }
 
         Ok(())
@@ -630,7 +401,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
             .execute(&self.final_sql()?, self.schema(), &self.filters)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.props
     }
 
@@ -649,6 +420,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         let parent_filters: Vec<_> = child_pushdown_result
+            .clone()
             .parent_filters
             .into_iter()
             .map(|f| f.filter)
@@ -672,7 +444,6 @@ impl ExecutionPlan for VirtualExecutionPlan {
     }
 }
 
-#[allow(clippy::type_complexity)]
 #[cfg(test)]
 mod tests {
     use std::any::Any;
@@ -688,11 +459,9 @@ mod tests {
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::logical_expr::expr::Alias;
-    use datafusion::logical_expr::Projection;
-    use datafusion::prelude::Expr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::{self};
+    use datafusion::sql::TableReference;
     use datafusion::{
         arrow::datatypes::{DataType, Field},
         datasource::TableProvider,
@@ -702,21 +471,9 @@ mod tests {
     use super::table::RemoteTable;
     use super::*;
 
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     struct TestExecutor {
         compute_context: String,
-
-        // Return true if this subtree of a logicalplan cannot be federated
-        cannot_federate: Option<Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync>>,
-    }
-
-    impl std::fmt::Debug for TestExecutor {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("TestExecutor")
-                .field("compute_context", &self.compute_context)
-                .field("cannot_federate_fn", &self.cannot_federate.is_some())
-                .finish_non_exhaustive()
-        }
     }
 
     #[async_trait]
@@ -727,13 +484,6 @@ mod tests {
 
         fn compute_context(&self) -> Option<String> {
             Some(self.compute_context.clone())
-        }
-
-        fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
-            let Some(ref fnc) = self.cannot_federate else {
-                return true;
-            };
-            !logical_plan.exists(|p| Ok(fnc(p))).unwrap_or(false)
         }
 
         fn dialect(&self) -> Arc<dyn Dialect> {
@@ -807,7 +557,7 @@ mod tests {
             self
         }
 
-        fn table_reference(&self) -> MultiPartTableReference {
+        fn table_reference(&self) -> TableReference {
             self.table.table_reference().clone()
         }
 
@@ -829,12 +579,10 @@ mod tests {
     async fn basic_sql_federation_test() -> Result<(), DataFusionError> {
         let test_executor_a = TestExecutor {
             compute_context: "a".into(),
-            cannot_federate: None,
         };
 
         let test_executor_b = TestExecutor {
             compute_context: "b".into(),
-            cannot_federate: None,
         };
 
         let table_a1_ref = "table_a1".to_string();
@@ -931,135 +679,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_sql_federation_analyzer_rule_test() -> Result<(), DataFusionError> {
-        let alias_non_federate: Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync> =
-            Arc::new(|plan| match plan {
-                LogicalPlan::Projection(Projection { expr, .. }) => expr.iter().any(|e| match e {
-                    Expr::Alias(Alias { name, .. }) => name == "non_federate",
-                    _ => false,
-                }),
-                _ => false,
-            });
-
-        let test_executor_a = TestExecutor {
-            compute_context: "a".into(),
-            cannot_federate: Some(Arc::clone(&alias_non_federate)),
-        };
-
-        let test_executor_b = TestExecutor {
-            compute_context: "b".into(),
-            cannot_federate: None,
-        };
-
-        let table_a1_ref = "table_a1".to_string();
-        let table_a1 = get_test_table_provider(table_a1_ref.clone(), test_executor_a.clone());
-
-        let table_b1_ref = "table_b1".to_string();
-        let table_b1 = get_test_table_provider(table_b1_ref.clone(), test_executor_b.clone());
-
-        let table_b2_ref = "table_b2".to_string();
-        let table_b2 = get_test_table_provider(table_b2_ref.clone(), test_executor_b);
-
-        // Create a new SessionState with the optimizer rule we created above
-        let state = crate::default_session_state();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::default()));
-
-        ctx.register_table(table_a1_ref.clone(), table_a1).unwrap();
-        ctx.register_table(table_b1_ref.clone(), table_b1).unwrap();
-        ctx.register_table(table_b2_ref.clone(), table_b2).unwrap();
-
-        // Basic unsupported federation of `AS 'non_federate'`. Note filter non_federate > 0 can be
-        // pushed down since it will be optimised into `Filter: table_a1.a > Int64(0)`.
-        insta::assert_snapshot!(ctx
-            .sql(
-                r#"SELECT a as non_federate, b, c FROM (SELECT a, b, c FROM table_a1) WHERE a > 0"#,
-            )
-            .await?
-            .into_optimized_plan()?
-            .display_indent(), @r"
-        Projection: table_a1.a AS non_federate, table_a1.b, table_a1.c
-          Federated
-         Projection: table_a1.a, table_a1.b, table_a1.c
-          Filter: table_a1.a > Int64(0)
-            TableScan: table_a1
-        ");
-
-        // Basic join of two different context tables.
-        insta::assert_snapshot!(ctx
-            .sql(
-                r#"SELECT b.a, b.b, a.b, a.c FROM table_a1 a JOIN table_b1 b ON a.a=b.a"#,
-            )
-            .await?
-            .into_optimized_plan()?
-            .display_indent(), @r"
-        Projection: b.a, b.b, a.b, a.c
-          Inner Join: a.a = b.a
-            Federated
-         Projection: a.a, a.b, a.c
-          SubqueryAlias: a
-            TableScan: table_a1
-            Projection: b.a, b.b
-              Federated
-         Projection: b.a, b.b, b.c
-          SubqueryAlias: b
-            TableScan: table_b1
-        "
-        );
-
-        // Basic join of two same-context tables.
-        insta::assert_snapshot!(ctx
-            .sql(
-                r#"SELECT b.a, b.b, a.b, a.c FROM table_b1 a JOIN table_b2 b ON a.a=b.a"#,
-            )
-            .await?
-            .into_optimized_plan()?
-            .display_indent(), @r"
-        Federated
-         Projection: b.a, b.b, a.b, a.c
-          Inner Join:  Filter: a.a = b.a
-            SubqueryAlias: a
-              TableScan: table_b1
-            SubqueryAlias: b
-              TableScan: table_b2
-        "
-        );
-
-        // JOIN ON different contexts, one child has non-federateable [`LogicalPlan`].
-        insta::assert_snapshot!(ctx
-            .sql(
-                r#"SELECT a.*, j.non_federate FROM (SELECT b.a AS a, b.b as 'non_federate', a.b as b, a.c as c FROM table_b1 a JOIN table_b2 b ON a.a=b.a) j JOIN table_a1 a ON j.a = a.a"#,
-            )
-            .await?
-            .into_optimized_plan()?
-            .display_indent(), @r"
-        Projection: a.a, a.b, a.c, j.non_federate
-          Inner Join: j.a = a.a
-            Projection: j.a, j.non_federate
-              Federated
-         Projection: j.a, j.non_federate, j.b, j.c
-          SubqueryAlias: j
-            Projection: b.a, b.b AS non_federate, a.b, a.c
-              Inner Join:  Filter: a.a = b.a
-                SubqueryAlias: a
-                  TableScan: table_b1
-                SubqueryAlias: b
-                  TableScan: table_b2
-            Federated
-         Projection: a.a, a.b, a.c
-          SubqueryAlias: a
-            TableScan: table_a1
-        "
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn multi_reference_sql_federation_test() -> Result<(), DataFusionError> {
         let test_executor_a = TestExecutor {
             compute_context: "test".into(),
-            cannot_federate: None,
         };
 
         let lowercase_table_ref = "default.table".to_string();
@@ -1151,7 +773,6 @@ mod tests {
     async fn explain_analyze_not_federated() -> Result<(), DataFusionError> {
         let executor = TestExecutor {
             compute_context: "a".into(),
-            cannot_federate: None,
         };
 
         let table_ref = "test_table".to_string();
@@ -1161,8 +782,6 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(table_ref, table).unwrap();
 
-        // EXPLAIN ANALYZE wraps the query in LogicalPlan::Analyze.
-        // The federation analyzer must NOT wrap the Analyze node itself.
         let plan = ctx
             .sql("EXPLAIN ANALYZE SELECT * FROM test_table")
             .await?
@@ -1202,7 +821,6 @@ mod tests {
     async fn sql_query_rewriter_hook_invoked_and_rewrites_sql() -> Result<(), DataFusionError> {
         let executor = TestExecutor {
             compute_context: "rewrite".into(),
-            cannot_federate: None,
         };
         let rewrite_calls = Arc::new(AtomicUsize::new(0));
         let table_ref = "table_with_rewriter".to_string();
@@ -1229,7 +847,7 @@ mod tests {
         let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;
 
         let mut final_queries = vec![];
-        physical_plan.apply(|node| {
+        let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
                     .as_any()
@@ -1238,7 +856,7 @@ mod tests {
                 final_queries.push(node.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
-        })?;
+        });
 
         let [final_query] = final_queries.as_slice() else {
             panic!("expected a single federated SQL query");
@@ -1246,394 +864,6 @@ mod tests {
 
         assert!(final_query.ends_with("/* rewritten by sql_query_rewriter */"));
         assert_eq!(rewrite_calls.load(Ordering::SeqCst), 1);
-
-        Ok(())
-    }
-
-    // -------------------------------------------------------------------------
-    // Tests for sort-ordering correctness (issue: federation does not preserve
-    // sort ordering across multiple output batches).
-    // -------------------------------------------------------------------------
-
-    /// Verify that `find_top_sort` traverses through `Projection`,
-    /// `SubqueryAlias`, and `Limit` wrappers to locate a `Sort` node.
-    #[test]
-    fn find_top_sort_walks_projections() -> Result<(), DataFusionError> {
-        use datafusion::common::DFSchema;
-        use datafusion::logical_expr::{
-            Limit, LogicalPlan, Projection, Sort, SortExpr, SubqueryAlias,
-        };
-        use datafusion::prelude::col;
-        use std::sync::Arc;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
-
-        // Build a minimal leaf plan (empty relation) as the sort input.
-        let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: df_schema.clone(),
-            },
-        );
-
-        let sort_expr = SortExpr {
-            expr: col("id"),
-            asc: true,
-            nulls_first: false,
-        };
-        let sort_node = LogicalPlan::Sort(Sort {
-            expr: vec![sort_expr],
-            input: Arc::new(empty),
-            fetch: None,
-        });
-
-        // find_top_sort on a bare Sort returns Some.
-        assert!(find_top_sort(&sort_node).is_some(), "bare Sort");
-
-        // Wrap in a Projection — find_top_sort should still find the Sort.
-        let wrapped_in_proj = LogicalPlan::Projection(Projection::try_new(
-            df_schema
-                .columns()
-                .iter()
-                .map(|c| datafusion::prelude::Expr::Column(c.clone()))
-                .collect(),
-            Arc::new(sort_node.clone()),
-        )?);
-        assert!(
-            find_top_sort(&wrapped_in_proj).is_some(),
-            "Sort under Projection"
-        );
-
-        // Wrap in SubqueryAlias — find_top_sort should still find the Sort.
-        let wrapped_in_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-            Arc::new(sort_node.clone()),
-            "alias",
-        )?);
-        assert!(
-            find_top_sort(&wrapped_in_alias).is_some(),
-            "Sort under SubqueryAlias"
-        );
-
-        // Wrap in Limit — find_top_sort should still find the Sort.
-        // This is the Projection → Limit → Sort pattern produced when DataFusion's
-        // TypeCoercion adds a CAST projection above a Limit+Sort.
-        let wrapped_in_limit = LogicalPlan::Limit(Limit {
-            skip: None,
-            fetch: Some(Box::new(datafusion::prelude::lit(30i64))),
-            input: Arc::new(sort_node.clone()),
-        });
-        assert!(
-            find_top_sort(&wrapped_in_limit).is_some(),
-            "Sort under Limit"
-        );
-
-        // Wrap Projection → Limit → Sort (the exact pattern from the bug).
-        let proj_over_limit = LogicalPlan::Projection(Projection::try_new(
-            df_schema
-                .columns()
-                .iter()
-                .map(|c| datafusion::prelude::Expr::Column(c.clone()))
-                .collect(),
-            Arc::new(wrapped_in_limit),
-        )?);
-        assert!(
-            find_top_sort(&proj_over_limit).is_some(),
-            "Sort under Projection → Limit"
-        );
-
-        // A plan without any Sort at the top returns None.
-        let empty2 = datafusion::logical_expr::LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: df_schema.clone(),
-            },
-        );
-        assert!(find_top_sort(&empty2).is_none(), "no Sort");
-
-        Ok(())
-    }
-
-    /// When a federated plan contains a top-level `Sort`, `plan_federation`
-    /// must wrap the result in a `SortExec` to guarantee correct row ordering
-    /// even when the remote engine returns data in multiple batches.
-    ///
-    /// Without this fix the SQL Unparser emits `ORDER BY` only inside a
-    /// subquery, which SQL engines are not required to propagate to the outer
-    /// query.
-    #[tokio::test]
-    async fn sort_exec_wraps_virtual_plan_for_ordered_query() -> Result<(), DataFusionError> {
-        let executor = TestExecutor {
-            compute_context: "sort_exec_test".into(),
-            cannot_federate: None,
-        };
-        let table_ref = "t".to_string();
-        let table = get_test_table_provider(table_ref.clone(), executor);
-
-        let state = crate::default_session_state();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref.clone(), table).unwrap();
-
-        // `ORDER BY a` at the top level: the whole plan (Sort → TableScan) is
-        // federated.  Our fix should add a SortExec on top so that multi-batch
-        // results arrive in the correct order.
-        let plan = ctx
-            .sql("SELECT a, b FROM t ORDER BY a ASC")
-            .await?
-            .into_optimized_plan()?;
-
-        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
-
-        // Walk the physical plan: there must be a SortExec that wraps the
-        // VirtualExecutionPlan (possibly through SchemaCastScanExec).
-        let mut found_sort_over_virtual = false;
-        physical_plan.apply(|node| {
-            if node.name() == "SortExec" {
-                node.apply(|child| {
-                    if child.name() == "sql_federation_exec" {
-                        found_sort_over_virtual = true;
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })?;
-                if found_sort_over_virtual {
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        assert!(
-            found_sort_over_virtual,
-            "Expected a SortExec wrapping VirtualExecutionPlan to enforce sort \
-             ordering across multiple batches."
-        );
-
-        Ok(())
-    }
-
-    /// A query without `ORDER BY` must NOT get a spurious `SortExec` wrapping
-    /// the `VirtualExecutionPlan`.
-    #[tokio::test]
-    async fn no_sort_exec_for_unordered_query() -> Result<(), DataFusionError> {
-        let executor = TestExecutor {
-            compute_context: "no_sort_exec_test".into(),
-            cannot_federate: None,
-        };
-        let table_ref = "t".to_string();
-        let table = get_test_table_provider(table_ref.clone(), executor);
-
-        let state = crate::default_session_state();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref.clone(), table).unwrap();
-
-        let plan = ctx.sql("SELECT a, b FROM t").await?.into_optimized_plan()?;
-
-        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
-
-        let mut sort_over_virtual = false;
-        physical_plan.apply(|node| {
-            if node.name() == "SortExec" {
-                node.apply(|child| {
-                    if child.name() == "sql_federation_exec" {
-                        sort_over_virtual = true;
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })?;
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        assert!(
-            !sort_over_virtual,
-            "Did not expect a SortExec wrapping VirtualExecutionPlan for an \
-             unordered query."
-        );
-
-        Ok(())
-    }
-
-    /// `sink_projection_below_sort` must rewrite `Projection → Limit → Sort`
-    /// into `Limit → Sort → Projection` so the SQL Unparser emits ORDER BY
-    /// and LIMIT at the outer query level.
-    ///
-    /// This is the fix for the exact pattern the user observed:
-    ///   WRONG:   SELECT id, CAST(name) FROM (SELECT id, name FROM t ORDER BY id LIMIT 30)
-    ///   CORRECT: SELECT id, CAST(name) FROM (SELECT id, name FROM t) ORDER BY id LIMIT 30
-    #[tokio::test]
-    async fn order_by_limit_not_buried_in_subquery() -> Result<(), DataFusionError> {
-        let executor = TestExecutor {
-            compute_context: "sql_shape_test".into(),
-            cannot_federate: None,
-        };
-        let table_ref = "t".to_string();
-        let table = get_test_table_provider(table_ref.clone(), executor);
-
-        let state = crate::default_session_state();
-        let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref.clone(), table).unwrap();
-
-        // CAST forces a schema-coercion Projection above the Limit+Sort, which
-        // is exactly the pattern that used to bury ORDER BY in a subquery.
-        let plan = ctx
-            .sql("SELECT a, CAST(b AS TEXT) AS b FROM t ORDER BY a ASC LIMIT 10")
-            .await?
-            .into_optimized_plan()?;
-
-        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
-
-        // Extract the SQL that would be sent to the remote engine.
-        let mut final_queries: Vec<String> = Vec::new();
-        physical_plan.apply(|node| {
-            if node.name() == "sql_federation_exec" {
-                let vep = node
-                    .as_any()
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
-                final_queries.push(vep.final_sql()?);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        let [sql] = final_queries.as_slice() else {
-            panic!("expected exactly one federated SQL query, got: {final_queries:?}");
-        };
-
-        // ORDER BY and LIMIT must appear at the outer level, not inside a subquery.
-        let sql_upper = sql.to_uppercase();
-        // Find the last ORDER BY (outer level comes after any subquery's)
-        let outer_order_by_pos = sql_upper.rfind("ORDER BY");
-        let outer_limit_pos = sql_upper.rfind("LIMIT");
-        let last_subquery_close = sql_upper.rfind(')');
-
-        assert!(
-            outer_order_by_pos.is_some(),
-            "SQL must contain ORDER BY: {sql}"
-        );
-        assert!(outer_limit_pos.is_some(), "SQL must contain LIMIT: {sql}");
-
-        // If there's a subquery, ORDER BY and LIMIT must come AFTER the closing ')'
-        if let Some(close_paren) = last_subquery_close {
-            assert!(
-                outer_order_by_pos.unwrap() > close_paren,
-                "ORDER BY must be at the outer level, not inside the subquery.\nSQL: {sql}"
-            );
-            assert!(
-                outer_limit_pos.unwrap() > close_paren,
-                "LIMIT must be at the outer level, not inside the subquery.\nSQL: {sql}"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// When a `Projection` doesn't include the sort column, `sink_exprs_below_sort`
-    /// must produce `Projection → Sort → Projection` so the sort can see the column
-    /// while the outer projection restores the original output schema.
-    #[test]
-    fn sink_exprs_below_sort_adds_missing_sort_col() -> Result<(), DataFusionError> {
-        use datafusion::common::DFSchema;
-        use datafusion::logical_expr::{LogicalPlan, Sort, SortExpr};
-        use datafusion::prelude::col;
-        use std::sync::Arc;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("age", DataType::Int64, false),
-        ]));
-        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
-
-        let empty = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
-            produce_one_row: false,
-            schema: df_schema,
-        });
-
-        // Sort by "age", but project only "id" and "name".
-        let sort_node = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr {
-                expr: col("age"),
-                asc: true,
-                nulls_first: false,
-            }],
-            input: Arc::new(empty),
-            fetch: None,
-        });
-
-        let proj_exprs = vec![col("id"), col("name")];
-        let result = sink_exprs_below_sort(proj_exprs, sort_node)?;
-
-        // Expected shape: Projection(id, name) → Sort(age) → Projection(id, name, age)
-        let LogicalPlan::Projection(outer) = &result else {
-            panic!("expected outer Projection, got: {result:?}");
-        };
-        assert_eq!(outer.expr.len(), 2, "outer projection should have 2 exprs");
-
-        let LogicalPlan::Sort(sort) = outer.input.as_ref() else {
-            panic!("expected Sort under outer Projection");
-        };
-
-        let LogicalPlan::Projection(inner) = sort.input.as_ref() else {
-            panic!("expected inner Projection under Sort");
-        };
-        assert_eq!(
-            inner.expr.len(),
-            3,
-            "inner projection should have 3 exprs (id, name, age)"
-        );
-
-        // The final output schema should only contain "id" and "name".
-        let output_fields: Vec<&str> = outer
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert_eq!(output_fields, vec!["id", "name"]);
-
-        Ok(())
-    }
-
-    /// When the sort column is already in the projection, no outer Projection
-    /// wrapper is needed — the result is simply `Sort → Projection`.
-    #[test]
-    fn sink_exprs_below_sort_no_wrapper_when_sort_col_present() -> Result<(), DataFusionError> {
-        use datafusion::common::DFSchema;
-        use datafusion::logical_expr::{LogicalPlan, Sort, SortExpr};
-        use datafusion::prelude::col;
-        use std::sync::Arc;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
-
-        let empty = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
-            produce_one_row: false,
-            schema: df_schema,
-        });
-
-        // Sort by "id", project "id" and "name" — sort col is present.
-        let sort_node = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr {
-                expr: col("id"),
-                asc: true,
-                nulls_first: false,
-            }],
-            input: Arc::new(empty),
-            fetch: None,
-        });
-
-        let proj_exprs = vec![col("id"), col("name")];
-        let result = sink_exprs_below_sort(proj_exprs, sort_node)?;
-
-        // Expected shape: Sort(id) → Projection(id, name) — no outer Projection.
-        let LogicalPlan::Sort(_) = &result else {
-            panic!("expected Sort at the top, got: {result:?}");
-        };
 
         Ok(())
     }
