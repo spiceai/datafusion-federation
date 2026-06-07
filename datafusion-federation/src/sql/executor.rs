@@ -6,14 +6,12 @@ use datafusion::{
     error::Result,
     logical_expr::LogicalPlan,
     physical_plan::{metrics::MetricsSet, PhysicalExpr, SendableRecordBatchStream},
-    sql::unparser::dialect::Dialect,
+    sql::{sqlparser::ast, unparser::dialect::Dialect},
 };
 use std::sync::Arc;
 
-use super::ast_analyzer::AstAnalyzer;
-
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
-
+pub type AstAnalyzer = Box<dyn FnMut(ast::Statement) -> Result<ast::Statement>>;
 pub type LogicalOptimizer = Box<dyn FnMut(LogicalPlan) -> Result<LogicalPlan>>;
 pub type SqlQueryRewriter = Box<dyn FnMut(String) -> Result<String>>;
 
@@ -33,14 +31,6 @@ pub trait SQLExecutor: Sync + Send {
 
     /// The specific SQL dialect (currently supports 'sqlite', 'postgres', 'flight')
     fn dialect(&self) -> Arc<dyn Dialect>;
-
-    /// Returns if this executor can execute the query that would be produced from this logical plan.
-    ///
-    /// This is used to indicate to the federation logic that part of this plan cannot be federated,
-    /// i.e. if there are UDFs that only DataFusion can execute.
-    fn can_execute_plan(&self, _logical_plan: &LogicalPlan) -> bool {
-        true
-    }
 
     /// Returns the analyzer rule specific for this engine to modify the logical plan before execution
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
