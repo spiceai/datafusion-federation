@@ -18,18 +18,15 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{
-        Distinct, DistinctOn, Expr, Extension, Limit, LogicalPlan, Projection, Sort, SubqueryAlias,
-    },
+    logical_expr::{Extension, LogicalPlan},
     optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
-    physical_expr::{create_physical_sort_expr, EquivalenceProperties, LexOrdering},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
         filter_pushdown::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
         metrics::MetricsSet,
-        sorts::sort::SortExec,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
     },
@@ -156,100 +153,18 @@ impl FederationPlanner for SQLFederationPlanner {
     async fn plan_federation(
         &self,
         node: &FederatedPlanNode,
-        session_state: &SessionState,
+        _session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = Arc::new(node.plan().schema().as_arrow().clone());
         let plan = node.plan().clone();
         let statistics = self.executor.statistics(&plan).await?;
         let input = Arc::new(VirtualExecutionPlan::new(
-            plan.clone(),
+            plan,
             Arc::clone(&self.executor),
             statistics,
         ));
-        let schema_cast_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(schema_cast::SchemaCastScanExec::new(input, schema));
-
-        // When a `Sort` node is present at the top of the federated logical plan
-        // (possibly behind a `Projection` or `SubqueryAlias`), the SQL Unparser
-        // may push the `ORDER BY` inside a subquery:
-        //
-        //   SELECT ... FROM (SELECT ... ORDER BY col)   -- outer has no ORDER BY!
-        //
-        // SQL does not guarantee that ordering from a subquery is preserved by
-        // the outer query.  When the remote engine returns data across multiple
-        // batches the rows can arrive in arbitrary order, silently violating the
-        // sort contract.
-        //
-        // Fix: detect the sort and add a local `SortExec` so DataFusion enforces
-        // the required ordering regardless of what the remote engine returns.
-        if let Some(sort) = find_top_sort(&plan) {
-            // Resolve sort expressions against the federation output schema so
-            // that fully-qualified column references (e.g. `t.schema.tbl.id`)
-            // are correctly mapped to the output columns (e.g. `id`).
-            let output_schema = plan.schema();
-            let execution_props = session_state.execution_props();
-            match sort
-                .expr
-                .iter()
-                .map(|e| create_physical_sort_expr(e, output_schema.as_ref(), execution_props))
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(physical_sort_exprs) if physical_sort_exprs.is_empty() => {
-                    return Err(DataFusionError::Plan("Top-level Sort was detected, but no physical sort expressions could be created".to_string()));
-                }
-                Ok(physical_sort_exprs) => {
-                    if let Some(lex_ordering) = LexOrdering::new(physical_sort_exprs) {
-                        return Ok(Arc::new(
-                            SortExec::new(lex_ordering, schema_cast_exec).with_fetch(sort.fetch),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return Err(DataFusionError::Context(
-                        "Failed to create `PhysicalSortExpr`".to_string(),
-                        Box::new(e),
-                    ))
-                }
-            };
-        }
-
-        Ok(schema_cast_exec)
-    }
-}
-
-/// Walk the top of a logical plan through transparent wrapper nodes to find
-/// the first `Sort` node, if any.
-///
-/// A node is "transparent" here if the DataFusion SQL Unparser wraps it — and
-/// everything below it — in a derived-table subquery when `already_projected`
-/// is set (i.e. an outer `Projection` was already processed).  That wrapping
-/// buries any `ORDER BY` from an inner `Sort` inside the subquery, so the
-/// outer query has no ordering guarantee.  The nodes that exhibit this
-/// behaviour are exactly those that call `derive_with_dialect_alias` when
-/// `select.already_projected()` is true:
-///
-/// | Node         | subquery alias         |
-/// |--------------|------------------------|
-/// | `Projection` | `derived_projection`   |
-/// | `Limit`      | `derived_limit`        |
-/// | `Distinct`   | `derived_distinct`     |
-///
-/// (`Union` also triggers it but is multi-input, so a `Sort` below a `Union`
-/// does not represent a total order and is excluded.)
-///
-/// `SubqueryAlias` is added as a safety net: it can wrap plans in contexts
-/// that behave like subqueries.
-///
-/// Returns `None` if no `Sort` is encountered before a non-transparent node.
-fn find_top_sort(plan: &LogicalPlan) -> Option<&Sort> {
-    match plan {
-        LogicalPlan::Sort(sort) => Some(sort),
-        LogicalPlan::Projection(Projection { input, .. }) => find_top_sort(input),
-        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => find_top_sort(input),
-        LogicalPlan::Limit(limit) => find_top_sort(&limit.input),
-        LogicalPlan::Distinct(Distinct::On(on)) => find_top_sort(&on.input),
-        LogicalPlan::Distinct(Distinct::All(input)) => find_top_sort(input),
-        _ => None,
+        let schema_cast_exec = schema_cast::SchemaCastScanExec::new(input, schema);
+        Ok(Arc::new(schema_cast_exec))
     }
 }
 
@@ -301,10 +216,6 @@ impl VirtualExecutionPlan {
         let plan = self.plan.clone();
         let known_rewrites = collect_known_rewrites(&plan)?;
         let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
-        // Sink any outer Projection past Limit/Distinct/Sort wrapper nodes so
-        // the SQL Unparser emits ORDER BY and LIMIT at the top query level
-        // rather than burying them inside a derived-table subquery.
-        let plan = sink_projection_below_sort(plan)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
         let plan = apply_logical_optimizers(plan, logical_optimizers)?;
         let ast = self.plan_to_statement(&plan)?;
@@ -327,134 +238,6 @@ impl VirtualExecutionPlan {
 
     fn plan_to_statement(&self, plan: &LogicalPlan) -> Result<Statement> {
         Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(plan)
-    }
-}
-
-/// Before handing the federated logical plan to the SQL Unparser, sink any
-/// top-level `Projection` that sits above `Limit` / `Distinct` nodes leading
-/// to a `Sort` so that those wrapper nodes appear *above* the `Projection`
-/// instead.
-///
-/// Without this the DataFusion SQL Unparser generates a subquery whenever it
-/// encounters `Limit` or `Distinct` with `already_projected = true` (i.e.
-/// after an outer `Projection` has been processed).  That wrapping buries
-/// `ORDER BY` and `LIMIT` inside the subquery:
-///
-/// ```sql
-/// -- wrong: ORDER BY / LIMIT inside subquery
-/// SELECT id, CAST(name AS TEXT) FROM
-///   (SELECT id, name FROM t ORDER BY id LIMIT 30)
-/// ```
-///
-/// After the rewrite the Unparser sees the wrapper nodes first, so it emits
-/// them at the top level:
-///
-/// ```sql
-/// -- correct: ORDER BY / LIMIT at the outer query level
-/// SELECT id, CAST(name AS TEXT) FROM
-///   (SELECT id, name FROM t)
-/// ORDER BY id LIMIT 30
-/// ```
-///
-/// The transparent nodes that trigger this problem in the Unparser are exactly
-/// `Limit` and `Distinct` (they call `derive_with_dialect_alias` when
-/// `already_projected` is true). `SubqueryAlias` is included for safety.
-fn sink_projection_below_sort(plan: LogicalPlan) -> Result<LogicalPlan> {
-    let LogicalPlan::Projection(proj) = plan else {
-        return Ok(plan);
-    };
-    sink_exprs_below_sort(proj.expr, Arc::unwrap_or_clone(proj.input))
-}
-
-/// Recursive helper for [`sink_projection_below_sort`].
-///
-/// Walks down through `Limit`, `Distinct`, and `SubqueryAlias` nodes until it
-/// reaches a `Sort`, then inserts a new `Projection(exprs)` just below that
-/// `Sort`. Rebuilds the wrapper nodes on the way back up.
-fn sink_exprs_below_sort(exprs: Vec<Expr>, plan: LogicalPlan) -> Result<LogicalPlan> {
-    match plan {
-        // Base case: found the Sort — place the Projection just below it.
-        LogicalPlan::Sort(sort) => {
-            // Build a tentative inner projection to inspect its output schema.
-            let inner_proj = Projection::try_new(exprs.clone(), Arc::clone(&sort.input))?;
-
-            // Find sort columns not produced by the projection.
-            let missing: Vec<Expr> = sort
-                .expr
-                .iter()
-                .flat_map(|se| se.expr.column_refs())
-                .filter(|col| !inner_proj.schema.has_column(col))
-                .map(|col| Expr::Column((*col).clone()))
-                .collect();
-
-            if missing.is_empty() {
-                // All sort columns are in the projection — simple case.
-                Ok(LogicalPlan::Sort(Sort {
-                    expr: sort.expr,
-                    input: Arc::new(LogicalPlan::Projection(inner_proj)),
-                    fetch: sort.fetch,
-                }))
-            } else {
-                // Sort references columns the projection doesn't emit.
-                // Build: Projection(original_cols) → Sort → Projection(exprs + missing)
-                let outer_exprs: Vec<Expr> = inner_proj
-                    .schema
-                    .columns()
-                    .into_iter()
-                    .map(Expr::Column)
-                    .collect();
-                drop(inner_proj);
-
-                let mut inner_exprs = exprs;
-                inner_exprs.extend(missing);
-                let extended_proj =
-                    LogicalPlan::Projection(Projection::try_new(inner_exprs, sort.input)?);
-                let sort_node = LogicalPlan::Sort(Sort {
-                    expr: sort.expr,
-                    input: Arc::new(extended_proj),
-                    fetch: sort.fetch,
-                });
-                Ok(LogicalPlan::Projection(Projection::try_new(
-                    outer_exprs,
-                    Arc::new(sort_node),
-                )?))
-            }
-        }
-        // Transparent wrappers — recurse and rebuild.
-        LogicalPlan::Limit(limit) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(limit.input))?;
-            Ok(LogicalPlan::Limit(Limit {
-                skip: limit.skip,
-                fetch: limit.fetch,
-                input: Arc::new(inner),
-            }))
-        }
-        LogicalPlan::Distinct(Distinct::All(input)) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(input))?;
-            Ok(LogicalPlan::Distinct(Distinct::All(Arc::new(inner))))
-        }
-        LogicalPlan::Distinct(Distinct::On(on)) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(on.input))?;
-            Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn {
-                on_expr: on.on_expr,
-                select_expr: on.select_expr,
-                sort_expr: on.sort_expr,
-                input: Arc::new(inner),
-                schema: on.schema,
-            })))
-        }
-        LogicalPlan::SubqueryAlias(alias) => {
-            let inner = sink_exprs_below_sort(exprs, Arc::unwrap_or_clone(alias.input))?;
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                Arc::new(inner),
-                alias.alias,
-            )?))
-        }
-        // Not a transparent node leading to a Sort — reconstruct the Projection.
-        other => Ok(LogicalPlan::Projection(Projection::try_new(
-            exprs,
-            Arc::new(other),
-        )?)),
     }
 }
 
@@ -688,6 +471,7 @@ mod tests {
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::Alias;
     use datafusion::logical_expr::Projection;
     use datafusion::prelude::Expr;
@@ -696,11 +480,13 @@ mod tests {
     use datafusion::{
         arrow::datatypes::{DataType, Field},
         datasource::TableProvider,
+        execution::config::SessionConfig,
         execution::context::SessionContext,
     };
 
     use super::table::RemoteTable;
     use super::*;
+    use crate::FederatedQueryPlanner;
 
     #[derive(Clone)]
     struct TestExecutor {
@@ -1250,391 +1036,362 @@ mod tests {
         Ok(())
     }
 
-    // -------------------------------------------------------------------------
-    // Tests for sort-ordering correctness (issue: federation does not preserve
-    // sort ordering across multiple output batches).
-    // -------------------------------------------------------------------------
+    // --- EXISTS / NOT EXISTS federation tests ---
 
-    /// Verify that `find_top_sort` traverses through `Projection`,
-    /// `SubqueryAlias`, and `Limit` wrappers to locate a `Sort` node.
-    #[test]
-    fn find_top_sort_walks_projections() -> Result<(), DataFusionError> {
-        use datafusion::common::DFSchema;
-        use datafusion::logical_expr::{
-            Limit, LogicalPlan, Projection, Sort, SortExpr, SubqueryAlias,
-        };
-        use datafusion::prelude::col;
-        use std::sync::Arc;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
-
-        // Build a minimal leaf plan (empty relation) as the sort input.
-        let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: df_schema.clone(),
-            },
-        );
-
-        let sort_expr = SortExpr {
-            expr: col("id"),
-            asc: true,
-            nulls_first: false,
-        };
-        let sort_node = LogicalPlan::Sort(Sort {
-            expr: vec![sort_expr],
-            input: Arc::new(empty),
-            fetch: None,
-        });
-
-        // find_top_sort on a bare Sort returns Some.
-        assert!(find_top_sort(&sort_node).is_some(), "bare Sort");
-
-        // Wrap in a Projection — find_top_sort should still find the Sort.
-        let wrapped_in_proj = LogicalPlan::Projection(Projection::try_new(
-            df_schema
-                .columns()
-                .iter()
-                .map(|c| datafusion::prelude::Expr::Column(c.clone()))
-                .collect(),
-            Arc::new(sort_node.clone()),
-        )?);
-        assert!(
-            find_top_sort(&wrapped_in_proj).is_some(),
-            "Sort under Projection"
-        );
-
-        // Wrap in SubqueryAlias — find_top_sort should still find the Sort.
-        let wrapped_in_alias = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-            Arc::new(sort_node.clone()),
-            "alias",
-        )?);
-        assert!(
-            find_top_sort(&wrapped_in_alias).is_some(),
-            "Sort under SubqueryAlias"
-        );
-
-        // Wrap in Limit — find_top_sort should still find the Sort.
-        // This is the Projection → Limit → Sort pattern produced when DataFusion's
-        // TypeCoercion adds a CAST projection above a Limit+Sort.
-        let wrapped_in_limit = LogicalPlan::Limit(Limit {
-            skip: None,
-            fetch: Some(Box::new(datafusion::prelude::lit(30i64))),
-            input: Arc::new(sort_node.clone()),
-        });
-        assert!(
-            find_top_sort(&wrapped_in_limit).is_some(),
-            "Sort under Limit"
-        );
-
-        // Wrap Projection → Limit → Sort (the exact pattern from the bug).
-        let proj_over_limit = LogicalPlan::Projection(Projection::try_new(
-            df_schema
-                .columns()
-                .iter()
-                .map(|c| datafusion::prelude::Expr::Column(c.clone()))
-                .collect(),
-            Arc::new(wrapped_in_limit),
-        )?);
-        assert!(
-            find_top_sort(&proj_over_limit).is_some(),
-            "Sort under Projection → Limit"
-        );
-
-        // A plan without any Sort at the top returns None.
-        let empty2 = datafusion::logical_expr::LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: df_schema.clone(),
-            },
-        );
-        assert!(find_top_sort(&empty2).is_none(), "no Sort");
-
-        Ok(())
+    fn make_table_with_schema(
+        name: &str,
+        schema: SchemaRef,
+        executor: &TestExecutor,
+    ) -> Arc<dyn TableProvider> {
+        let table_ref = RemoteTableRef::try_from(name.to_string()).unwrap();
+        let table = Arc::new(RemoteTable::new(table_ref, schema));
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(executor.clone())));
+        let table_source = Arc::new(SQLTableSource { provider, table });
+        Arc::new(FederatedTableProviderAdaptor::new(table_source))
     }
 
-    /// When a federated plan contains a top-level `Sort`, `plan_federation`
-    /// must wrap the result in a `SortExec` to guarantee correct row ordering
-    /// even when the remote engine returns data in multiple batches.
-    ///
-    /// Without this fix the SQL Unparser emits `ORDER BY` only inside a
-    /// subquery, which SQL engines are not required to propagate to the outer
-    /// query.
+    fn orders_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_custkey", DataType::Int64, false),
+            Field::new("o_orderstatus", DataType::Utf8, false),
+            Field::new("o_orderdate", DataType::Date32, true),
+        ]))
+    }
+
+    fn lineitem_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_suppkey", DataType::Int64, false),
+            Field::new("l_commitdate", DataType::Date32, true),
+            Field::new("l_receiptdate", DataType::Date32, true),
+        ]))
+    }
+
+    fn supplier_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_name", DataType::Utf8, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]))
+    }
+
+    /// Creates a session state with a fixed `target_partitions` count so that
+    /// snapshot tests produce deterministic physical plans regardless of the
+    /// number of CPU cores on the host.
+    fn deterministic_session_state() -> SessionState {
+        let rules = crate::default_analyzer_rules();
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::default().with_target_partitions(4))
+            .with_analyzer_rules(rules)
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_default_features()
+            .build()
+    }
+
+    /// Runs `EXPLAIN <query>`, collects the output, and returns a formatted
+    /// string containing both logical and physical plans.
+    async fn explain_query(ctx: &SessionContext, query: &str) -> String {
+        let explain_sql = format!("EXPLAIN {query}");
+        let batches = ctx
+            .sql(&explain_sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let formatted = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap();
+        formatted.to_string()
+    }
+
+    /// Same-provider EXISTS: both tables from the same compute context.
+    /// The entire plan should be federated as a single unit so the backend
+    /// can decorrelate EXISTS into a semi-join.
     #[tokio::test]
-    async fn sort_exec_wraps_virtual_plan_for_ordered_query() -> Result<(), DataFusionError> {
-        let executor = TestExecutor {
-            compute_context: "sort_exec_test".into(),
+    async fn same_provider_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
             cannot_federate: None,
         };
-        let table_ref = "t".to_string();
-        let table = get_test_table_provider(table_ref.clone(), executor);
 
         let state = crate::default_session_state();
         let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref.clone(), table).unwrap();
 
-        // `ORDER BY a` at the top level: the whole plan (Sort → TableScan) is
-        // federated.  Our fix should add a SortExec on top so that multi-batch
-        // results arrive in the correct order.
-        let plan = ctx
-            .sql("SELECT a, b FROM t ORDER BY a ASC")
-            .await?
-            .into_optimized_plan()?;
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
 
-        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
-
-        // Walk the physical plan: there must be a SortExec that wraps the
-        // VirtualExecutionPlan (possibly through SchemaCastScanExec).
-        let mut found_sort_over_virtual = false;
-        physical_plan.apply(|node| {
-            if node.name() == "SortExec" {
-                node.apply(|child| {
-                    if child.name() == "sql_federation_exec" {
-                        found_sort_over_virtual = true;
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })?;
-                if found_sort_over_virtual {
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        assert!(
-            found_sort_over_virtual,
-            "Expected a SortExec wrapping VirtualExecutionPlan to enforce sort \
-             ordering across multiple batches."
+        insta::assert_snapshot!(
+            "same_provider_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
         );
-
-        Ok(())
     }
 
-    /// A query without `ORDER BY` must NOT get a spurious `SortExec` wrapping
-    /// the `VirtualExecutionPlan`.
+    /// Same-provider NOT EXISTS: mirrors TPC-H Q21 structure.
+    /// Must be federated as one unit so the backend can decorrelate to anti-join.
     #[tokio::test]
-    async fn no_sort_exec_for_unordered_query() -> Result<(), DataFusionError> {
-        let executor = TestExecutor {
-            compute_context: "no_sort_exec_test".into(),
+    async fn same_provider_not_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
             cannot_federate: None,
         };
-        let table_ref = "t".to_string();
-        let table = get_test_table_provider(table_ref.clone(), executor);
 
         let state = crate::default_session_state();
         let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref.clone(), table).unwrap();
 
-        let plan = ctx.sql("SELECT a, b FROM t").await?.into_optimized_plan()?;
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
 
-        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
-
-        let mut sort_over_virtual = false;
-        physical_plan.apply(|node| {
-            if node.name() == "SortExec" {
-                node.apply(|child| {
-                    if child.name() == "sql_federation_exec" {
-                        sort_over_virtual = true;
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })?;
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        assert!(
-            !sort_over_virtual,
-            "Did not expect a SortExec wrapping VirtualExecutionPlan for an \
-             unordered query."
+        insta::assert_snapshot!(
+            "same_provider_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name FROM supplier WHERE NOT EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_suppkey = s_suppkey \
+                  AND l_receiptdate > l_commitdate)",
+            )
+            .await
         );
-
-        Ok(())
     }
 
-    /// `sink_projection_below_sort` must rewrite `Projection → Limit → Sort`
-    /// into `Limit → Sort → Projection` so the SQL Unparser emits ORDER BY
-    /// and LIMIT at the outer query level.
-    ///
-    /// This is the fix for the exact pattern the user observed:
-    ///   WRONG:   SELECT id, CAST(name) FROM (SELECT id, name FROM t ORDER BY id LIMIT 30)
-    ///   CORRECT: SELECT id, CAST(name) FROM (SELECT id, name FROM t) ORDER BY id LIMIT 30
+    /// Cross-provider EXISTS: outer table on provider A, subquery table on provider B.
+    /// Each side must be independently federated (multiple Federated nodes).
     #[tokio::test]
-    async fn order_by_limit_not_buried_in_subquery() -> Result<(), DataFusionError> {
-        let executor = TestExecutor {
-            compute_context: "sql_shape_test".into(),
+    async fn cross_provider_exists_separately_federated() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
             cannot_federate: None,
         };
-        let table_ref = "t".to_string();
-        let table = get_test_table_provider(table_ref.clone(), executor);
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "cross_provider_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// Cross-provider NOT EXISTS: outer table on provider A, subquery table on provider B.
+    #[tokio::test]
+    async fn cross_provider_not_exists_separately_federated() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "cross_provider_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE NOT EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// TPC-H Q21 pattern: same-provider JOIN + NOT EXISTS + EXISTS.
+    /// All tables on the same provider. The entire plan must be federated
+    /// as a single unit so the backend handles decorrelation.
+    #[tokio::test]
+    async fn same_provider_join_with_not_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
 
         let state = crate::default_session_state();
         let ctx = SessionContext::new_with_state(state);
-        ctx.register_table(table_ref.clone(), table).unwrap();
 
-        // CAST forces a schema-coercion Projection above the Limit+Sort, which
-        // is exactly the pattern that used to bury ORDER BY in a subquery.
-        let plan = ctx
-            .sql("SELECT a, CAST(b AS TEXT) AS b FROM t ORDER BY a ASC LIMIT 10")
-            .await?
-            .into_optimized_plan()?;
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
 
-        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
-
-        // Extract the SQL that would be sent to the remote engine.
-        let mut final_queries: Vec<String> = Vec::new();
-        physical_plan.apply(|node| {
-            if node.name() == "sql_federation_exec" {
-                let vep = node
-                    .as_any()
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
-                final_queries.push(vep.final_sql()?);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        let [sql] = final_queries.as_slice() else {
-            panic!("expected exactly one federated SQL query, got: {final_queries:?}");
-        };
-
-        // ORDER BY and LIMIT must appear at the outer level, not inside a subquery.
-        let sql_upper = sql.to_uppercase();
-        // Find the last ORDER BY (outer level comes after any subquery's)
-        let outer_order_by_pos = sql_upper.rfind("ORDER BY");
-        let outer_limit_pos = sql_upper.rfind("LIMIT");
-        let last_subquery_close = sql_upper.rfind(')');
-
-        assert!(
-            outer_order_by_pos.is_some(),
-            "SQL must contain ORDER BY: {sql}"
+        insta::assert_snapshot!(
+            "same_provider_join_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name \
+                 FROM supplier \
+                 JOIN lineitem ON s_suppkey = l_suppkey \
+                 JOIN orders ON o_orderkey = l_orderkey \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM lineitem AS l2 \
+                     WHERE l2.l_orderkey = lineitem.l_orderkey \
+                     AND l2.l_suppkey <> lineitem.l_suppkey \
+                 )",
+            )
+            .await
         );
-        assert!(outer_limit_pos.is_some(), "SQL must contain LIMIT: {sql}");
-
-        // If there's a subquery, ORDER BY and LIMIT must come AFTER the closing ')'
-        if let Some(close_paren) = last_subquery_close {
-            assert!(
-                outer_order_by_pos.unwrap() > close_paren,
-                "ORDER BY must be at the outer level, not inside the subquery.\nSQL: {sql}"
-            );
-            assert!(
-                outer_limit_pos.unwrap() > close_paren,
-                "LIMIT must be at the outer level, not inside the subquery.\nSQL: {sql}"
-            );
-        }
-
-        Ok(())
     }
 
-    /// When a `Projection` doesn't include the sort column, `sink_exprs_below_sort`
-    /// must produce `Projection → Sort → Projection` so the sort can see the column
-    /// while the outer projection restores the original output schema.
-    #[test]
-    fn sink_exprs_below_sort_adds_missing_sort_col() -> Result<(), DataFusionError> {
-        use datafusion::common::DFSchema;
-        use datafusion::logical_expr::{LogicalPlan, Sort, SortExpr};
-        use datafusion::prelude::col;
-        use std::sync::Arc;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("age", DataType::Int64, false),
-        ]));
-        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
-
-        let empty = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
-            produce_one_row: false,
-            schema: df_schema,
-        });
-
-        // Sort by "age", but project only "id" and "name".
-        let sort_node = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr {
-                expr: col("age"),
-                asc: true,
-                nulls_first: false,
-            }],
-            input: Arc::new(empty),
-            fetch: None,
-        });
-
-        let proj_exprs = vec![col("id"), col("name")];
-        let result = sink_exprs_below_sort(proj_exprs, sort_node)?;
-
-        // Expected shape: Projection(id, name) → Sort(age) → Projection(id, name, age)
-        let LogicalPlan::Projection(outer) = &result else {
-            panic!("expected outer Projection, got: {result:?}");
+    /// Mixed providers: JOIN across providers + EXISTS subquery on a different provider.
+    /// supplier(ctx_a) JOIN lineitem(ctx_b) WHERE EXISTS on orders(ctx_a).
+    #[tokio::test]
+    async fn mixed_provider_join_with_exists() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
         };
-        assert_eq!(outer.expr.len(), 2, "outer projection should have 2 exprs");
-
-        let LogicalPlan::Sort(sort) = outer.input.as_ref() else {
-            panic!("expected Sort under outer Projection");
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
         };
 
-        let LogicalPlan::Projection(inner) = sort.input.as_ref() else {
-            panic!("expected inner Projection under Sort");
-        };
-        assert_eq!(
-            inner.expr.len(),
-            3,
-            "inner projection should have 3 exprs (id, name, age)"
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "mixed_provider_join_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name \
+                 FROM supplier \
+                 JOIN lineitem ON l_suppkey = s_suppkey \
+                 WHERE EXISTS ( \
+                     SELECT 1 FROM orders \
+                     WHERE o_custkey = s_suppkey \
+                 )",
+            )
+            .await
         );
-
-        // The final output schema should only contain "id" and "name".
-        let output_fields: Vec<&str> = outer
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert_eq!(output_fields, vec!["id", "name"]);
-
-        Ok(())
     }
 
-    /// When the sort column is already in the projection, no outer Projection
-    /// wrapper is needed — the result is simply `Sort → Projection`.
-    #[test]
-    fn sink_exprs_below_sort_no_wrapper_when_sort_col_present() -> Result<(), DataFusionError> {
-        use datafusion::common::DFSchema;
-        use datafusion::logical_expr::{LogicalPlan, Sort, SortExpr};
-        use datafusion::prelude::col;
-        use std::sync::Arc;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
-
-        let empty = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
-            produce_one_row: false,
-            schema: df_schema,
-        });
-
-        // Sort by "id", project "id" and "name" — sort col is present.
-        let sort_node = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr {
-                expr: col("id"),
-                asc: true,
-                nulls_first: false,
-            }],
-            input: Arc::new(empty),
-            fetch: None,
-        });
-
-        let proj_exprs = vec![col("id"), col("name")];
-        let result = sink_exprs_below_sort(proj_exprs, sort_node)?;
-
-        // Expected shape: Sort(id) → Projection(id, name) — no outer Projection.
-        let LogicalPlan::Sort(_) = &result else {
-            panic!("expected Sort at the top, got: {result:?}");
+    /// Same-provider NOT EXISTS with aliased outer table.
+    /// The outer query uses `lineitem l1` (alias). The NOT EXISTS subquery
+    /// references the alias: `l1.l_orderkey`. All tables are same provider.
+    #[tokio::test]
+    async fn same_provider_aliased_table_not_exists() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
         };
 
-        Ok(())
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        // TPC-H Q21 pattern: aliased lineitem l1, NOT EXISTS references l1.*
+        insta::assert_snapshot!(
+            "same_provider_aliased_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name, count(*) AS numwait \
+                 FROM supplier, lineitem l1, orders \
+                 WHERE s_suppkey = l1.l_suppkey \
+                   AND l1.l_orderkey = o_orderkey \
+                   AND l1.l_receiptdate > l1.l_commitdate \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM lineitem l2 \
+                       WHERE l2.l_orderkey = l1.l_orderkey \
+                         AND l2.l_suppkey <> l1.l_suppkey \
+                   ) \
+                 GROUP BY s_name \
+                 ORDER BY numwait DESC, s_name",
+            )
+            .await
+        );
     }
 }
