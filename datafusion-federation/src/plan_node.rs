@@ -16,8 +16,8 @@ use datafusion::{
 };
 
 pub struct FederatedPlanNode {
-    pub(crate) plan: LogicalPlan,
-    pub(crate) planner: Arc<dyn FederationPlanner>,
+    pub plan: LogicalPlan,
+    pub planner: Arc<dyn FederationPlanner>,
 }
 
 impl FederatedPlanNode {
@@ -27,10 +27,6 @@ impl FederatedPlanNode {
 
     pub fn plan(&self) -> &LogicalPlan {
         &self.plan
-    }
-
-    pub fn planner(&self) -> &Arc<dyn FederationPlanner> {
-        &self.planner
     }
 }
 
@@ -71,7 +67,7 @@ impl UserDefinedLogicalNodeCore for FederatedPlanNode {
 
         Ok(Self {
             plan: self.plan.clone(),
-            planner: Arc::clone(&self.planner),
+            planner: self.planner.clone(),
         })
     }
 }
