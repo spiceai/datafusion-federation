@@ -867,4 +867,279 @@ mod tests {
 
         Ok(())
     }
+
+    // -------------------------------------------------------------------------
+    // EXISTS / NOT EXISTS federation (port of spice patch #74 onto v0.5.3).
+    //
+    // In v0.5.3, `FederationOptimizerRule` (optimizer/mod.rs) gained `Expr::Exists`
+    // handling so correlated EXISTS / NOT EXISTS subqueries are recognised and
+    // federated together with their outer query when both sides share a provider.
+    //
+    // These tests assert the *exact federated SQL* emitted to the remote engine
+    // (via `VirtualExecutionPlan::final_sql`), which is the surface where the
+    // DataFusion-52.5 analyzer-rule architecture produced an alias bug
+    // (dropping the inner subquery alias and emitting tautological
+    // `lineitem.x = lineitem.x` predicates). The v0.5.3 unparser redesign emits
+    // the EXISTS subquery as a properly-aliased derived table
+    // (`(SELECT ... FROM lineitem AS l2) AS __correlated_sq_1`), so the bug is
+    // fixed by construction; these tests guard against regressing it.
+    // -------------------------------------------------------------------------
+
+    fn exists_table(
+        name: &str,
+        fields: Vec<Field>,
+        executor: &TestExecutor,
+    ) -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(fields));
+        let table_ref = RemoteTableRef::try_from(name.to_string()).unwrap();
+        let table = Arc::new(RemoteTable::new(table_ref, schema));
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(executor.clone())));
+        let table_source = Arc::new(SQLTableSource { provider, table });
+        Arc::new(FederatedTableProviderAdaptor::new(table_source))
+    }
+
+    /// Collects the SQL sent to each federated (`VirtualExecutionPlan`) node.
+    async fn federated_sqls(ctx: &SessionContext, query: &str) -> Vec<String> {
+        let df = ctx.sql(query).await.unwrap();
+        let logical_plan = df.into_optimized_plan().unwrap();
+        let physical_plan = ctx
+            .state()
+            .create_physical_plan(&logical_plan)
+            .await
+            .unwrap();
+        let mut sqls = vec![];
+        let _ = physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let node = node
+                    .as_any()
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .unwrap();
+                sqls.push(node.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        sqls
+    }
+
+    fn orders_pk(ex: &TestExecutor) -> Arc<dyn TableProvider> {
+        exists_table(
+            "orders",
+            vec![Field::new("o_orderkey", DataType::Int64, false)],
+            ex,
+        )
+    }
+    fn lineitem_ol(ex: &TestExecutor) -> Arc<dyn TableProvider> {
+        exists_table(
+            "lineitem",
+            vec![
+                Field::new("l_orderkey", DataType::Int64, false),
+                Field::new("l_suppkey", DataType::Int64, false),
+            ],
+            ex,
+        )
+    }
+    fn supplier(ex: &TestExecutor) -> Arc<dyn TableProvider> {
+        exists_table(
+            "supplier",
+            vec![
+                Field::new("s_suppkey", DataType::Int64, false),
+                Field::new("s_name", DataType::Utf8, false),
+            ],
+            ex,
+        )
+    }
+
+    /// Same-provider EXISTS: the whole query (outer + correlated subquery) must
+    /// be federated as one SQL statement so the backend can decorrelate it.
+    #[tokio::test]
+    async fn same_provider_exists_federates_as_single_unit() {
+        let ex = TestExecutor {
+            compute_context: "ctx_a".into(),
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("orders", orders_pk(&ex)).unwrap();
+        ctx.register_table("lineitem", lineitem_ol(&ex)).unwrap();
+
+        let sqls = federated_sqls(
+            &ctx,
+            "SELECT o_orderkey FROM orders WHERE EXISTS \
+             (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+        )
+        .await;
+
+        assert_eq!(sqls.len(), 1, "expected one federated query, got {sqls:?}");
+        assert_eq!(
+            sqls[0],
+            "SELECT orders.o_orderkey FROM orders WHERE EXISTS \
+             (SELECT 1 FROM (SELECT 1, lineitem.l_orderkey FROM lineitem) AS __correlated_sq_1 \
+             WHERE (__correlated_sq_1.l_orderkey = orders.o_orderkey))"
+        );
+    }
+
+    /// Same-provider JOIN + correlated NOT EXISTS using an inner alias `l2`
+    /// against an unaliased outer `lineitem` (TPC-H Q21 shape).
+    ///
+    /// Regression guard for Copilot thread (2): the inner alias `l2` must NOT be
+    /// dropped. The emitted SQL must keep the inner subquery columns distinct
+    /// from the outer `lineitem` columns (via the `__correlated_sq_1` derived
+    /// table) so the predicate is not the tautological `lineitem.x = lineitem.x`.
+    #[tokio::test]
+    async fn same_provider_join_not_exists_keeps_inner_alias() {
+        let ex = TestExecutor {
+            compute_context: "ctx_a".into(),
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("supplier", supplier(&ex)).unwrap();
+        ctx.register_table("lineitem", lineitem_ol(&ex)).unwrap();
+        ctx.register_table("orders", orders_pk(&ex)).unwrap();
+
+        let sqls = federated_sqls(
+            &ctx,
+            "SELECT s_name FROM supplier \
+             JOIN lineitem ON s_suppkey = l_suppkey \
+             JOIN orders ON o_orderkey = l_orderkey \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM lineitem AS l2 \
+                 WHERE l2.l_orderkey = lineitem.l_orderkey \
+                 AND l2.l_suppkey <> lineitem.l_suppkey \
+             )",
+        )
+        .await;
+
+        assert_eq!(sqls.len(), 1, "expected one federated query, got {sqls:?}");
+        let sql = &sqls[0];
+        // The inner subquery is unparsed as a derived table over `lineitem AS l2`,
+        // preserving the inner alias.
+        assert!(
+            sql.contains("FROM lineitem AS l2"),
+            "inner alias l2 dropped: {sql}"
+        );
+        // The correlated predicate must compare the inner derived-table columns to
+        // the OUTER lineitem columns -- never `lineitem.x = lineitem.x`.
+        assert!(
+            sql.contains("__correlated_sq_1.l_orderkey = lineitem.l_orderkey")
+                && sql.contains("__correlated_sq_1.l_suppkey <> lineitem.l_suppkey"),
+            "correlated predicate lost inner/outer distinction: {sql}"
+        );
+        assert!(
+            !sql.contains("lineitem.l_orderkey = lineitem.l_orderkey"),
+            "tautological self-comparison present (alias bug regressed): {sql}"
+        );
+    }
+
+    /// Same-provider correlated NOT EXISTS with BOTH outer (`l1`) and inner
+    /// (`l2`) aliases (TPC-H Q21 full shape, including ORDER BY).
+    ///
+    /// Regression guard for Copilot thread (3): the emitted SQL must use the
+    /// `l1` / `l2` aliases consistently and must not fall back to bare
+    /// `lineitem.*` references (which are invalid once the table is aliased).
+    #[tokio::test]
+    async fn same_provider_aliased_not_exists_uses_aliases() {
+        let ex = TestExecutor {
+            compute_context: "ctx_a".into(),
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("supplier", supplier(&ex)).unwrap();
+        ctx.register_table(
+            "lineitem",
+            exists_table(
+                "lineitem",
+                vec![
+                    Field::new("l_orderkey", DataType::Int64, false),
+                    Field::new("l_suppkey", DataType::Int64, false),
+                    Field::new("l_commitdate", DataType::Date32, true),
+                    Field::new("l_receiptdate", DataType::Date32, true),
+                ],
+                &ex,
+            ),
+        )
+        .unwrap();
+        ctx.register_table("orders", orders_pk(&ex)).unwrap();
+
+        let sqls = federated_sqls(
+            &ctx,
+            "SELECT s_name, count(*) AS numwait \
+             FROM supplier, lineitem l1, orders \
+             WHERE s_suppkey = l1.l_suppkey \
+               AND l1.l_orderkey = o_orderkey \
+               AND l1.l_receiptdate > l1.l_commitdate \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM lineitem l2 \
+                   WHERE l2.l_orderkey = l1.l_orderkey \
+                     AND l2.l_suppkey <> l1.l_suppkey \
+               ) \
+             GROUP BY s_name \
+             ORDER BY numwait DESC, s_name",
+        )
+        .await;
+
+        assert_eq!(sqls.len(), 1, "expected one federated query, got {sqls:?}");
+        let sql = &sqls[0];
+        assert!(sql.contains("lineitem AS l1"), "outer alias l1 lost: {sql}");
+        assert!(sql.contains("lineitem AS l2"), "inner alias l2 lost: {sql}");
+        // Correlation references the outer alias `l1`, not bare `lineitem`.
+        assert!(
+            sql.contains("__correlated_sq_1.l_orderkey = l1.l_orderkey")
+                && sql.contains("__correlated_sq_1.l_suppkey <> l1.l_suppkey"),
+            "correlation does not use outer alias l1: {sql}"
+        );
+        assert!(
+            !sql.contains("lineitem.l_orderkey = lineitem.l_orderkey"),
+            "tautological self-comparison present (alias bug regressed): {sql}"
+        );
+    }
+
+    /// Cross-provider NOT EXISTS: outer and subquery are on different providers,
+    /// so they must be federated as TWO separate SQL statements (DataFusion
+    /// performs the anti-join locally).
+    #[tokio::test]
+    async fn cross_provider_not_exists_splits() {
+        let ex_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+        };
+        let ex_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("orders", orders_pk(&ex_a)).unwrap();
+        ctx.register_table("lineitem", lineitem_ol(&ex_b)).unwrap();
+
+        let sqls = federated_sqls(
+            &ctx,
+            "SELECT o_orderkey FROM orders WHERE NOT EXISTS \
+             (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+        )
+        .await;
+
+        assert_eq!(
+            sqls.len(),
+            2,
+            "cross-provider EXISTS must split into two federated queries, got {sqls:?}"
+        );
+    }
+
+    /// Top-level ORDER BY on a single federated provider is pushed down into the
+    /// remote SQL and the whole plan is federated.
+    ///
+    /// Documents the behavior referenced by Copilot thread (4): v0.5.3 (matching
+    /// upstream) federates the ORDER BY into the remote query rather than keeping
+    /// a local top-level `SortExec`. This is upstream-by-design (the spice patch
+    /// that added local sort preservation, #71, was reverted by #72 for causing
+    /// correctness issues, and is not part of the v0.5.3 redesign).
+    #[tokio::test]
+    async fn top_level_order_by_is_pushed_down() {
+        let ex = TestExecutor {
+            compute_context: "ctx_a".into(),
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("orders", orders_pk(&ex)).unwrap();
+
+        let q = "SELECT o_orderkey FROM orders ORDER BY o_orderkey DESC";
+        let sqls = federated_sqls(&ctx, q).await;
+        assert_eq!(sqls.len(), 1, "expected one federated query, got {sqls:?}");
+        assert_eq!(
+            sqls[0],
+            "SELECT orders.o_orderkey FROM orders ORDER BY orders.o_orderkey DESC NULLS FIRST"
+        );
+    }
 }

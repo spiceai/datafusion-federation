@@ -5,9 +5,12 @@ use std::sync::Arc;
 use datafusion::{
     common::not_impl_err,
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    common::Column,
     datasource::source_as_provider,
     error::Result,
-    logical_expr::{Expr, Extension, LogicalPlan, Projection, TableScan, TableSource},
+    logical_expr::{
+        expr::Exists, Expr, Extension, LogicalPlan, Projection, TableScan, TableSource,
+    },
     optimizer::optimizer::{Optimizer, OptimizerConfig, OptimizerRule},
 };
 
@@ -110,6 +113,12 @@ impl FederationOptimizerRule {
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
+                Expr::Exists(ref exists) => {
+                    let plan_result = self.scan_plan_recursively(&exists.subquery.subquery)?;
+
+                    sole_provider.merge(plan_result);
+                    Ok(sole_provider.check_recursion())
+                }
                 Expr::InSubquery(_) => not_impl_err!("InSubquery"),
                 Expr::OuterReferenceColumn(..) => {
                     // Subqueries that reference outer columns are not supported
@@ -195,7 +204,16 @@ impl FederationOptimizerRule {
             // the Unparser, so they must not be federated as a whole. Only the
             // inner query should be federated; DataFusion's AnalyzeExec will
             // handle executing it and collecting metrics.
-            if matches!(plan, LogicalPlan::Analyze(_)) {
+            //
+            // DML plans must not be federated as a whole either: the SQL
+            // unparser's dml_to_sql is unimplemented, and wrapping DML in a
+            // FederatedPlanNode hides the Dml node from write-permission
+            // validators (a security bypass). Falling through leaves the Dml
+            // node intact (it is reconstructed via with_new_exprs/inputs below)
+            // so validators see it and DataFusion's physical planner can
+            // dispatch delete_from/update to the table provider, while the
+            // inner scan subtree is still federated.
+            if matches!(plan, LogicalPlan::Analyze(_) | LogicalPlan::Dml(_)) {
                 // Fall through to federate children instead.
             } else {
                 let Some(optimizer) = provider.optimizer() else {
@@ -298,6 +316,41 @@ impl FederationOptimizerRule {
                 Ok(Transformed::yes(Expr::ScalarSubquery(
                     subquery.with_plan(new_subquery.into()),
                 )))
+            }
+            Expr::Exists(ref exists) => {
+                // Optimize as root to force federating the sub-query
+                let (new_subquery, _) =
+                    self.optimize_plan_recursively(&exists.subquery.subquery, true, _config)?;
+                let Some(new_subquery) = new_subquery else {
+                    return Ok(Transformed::no(expr));
+                };
+
+                // The `decorrelate_predicate_subquery` optimizer rule (which
+                // turns EXISTS/NOT EXISTS into semi/anti joins) cannot handle a
+                // federated `LogicalPlan::Extension` directly as the subquery
+                // input. Wrap a no-op `Projection` around the federated node so
+                // the rule still sees a recognizable plan shape.
+                if matches!(new_subquery, LogicalPlan::Extension(_)) {
+                    let all_columns = new_subquery
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| Expr::Column(Column::new_unqualified(field.name())))
+                        .collect::<Vec<_>>();
+                    let projection_plan = LogicalPlan::Projection(Projection::try_new(
+                        all_columns,
+                        Arc::new(new_subquery),
+                    )?);
+                    return Ok(Transformed::yes(Expr::Exists(Exists::new(
+                        exists.subquery.with_plan(projection_plan.into()),
+                        exists.negated,
+                    ))));
+                }
+
+                Ok(Transformed::yes(Expr::Exists(Exists::new(
+                    exists.subquery.with_plan(new_subquery.into()),
+                    exists.negated,
+                ))))
             }
             Expr::InSubquery(_) => not_impl_err!("InSubquery"),
             _ => Ok(Transformed::no(expr)),
