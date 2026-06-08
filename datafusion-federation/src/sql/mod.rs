@@ -172,7 +172,7 @@ impl FederationPlanner for SQLFederationPlanner {
 pub struct VirtualExecutionPlan {
     plan: LogicalPlan,
     executor: Arc<dyn SQLExecutor>,
-    props: PlanProperties,
+    props: Arc<PlanProperties>,
     statistics: Statistics,
     filters: Vec<Arc<dyn PhysicalExpr>>,
 }
@@ -189,7 +189,7 @@ impl VirtualExecutionPlan {
         Self {
             plan,
             executor,
-            props,
+            props: Arc::new(props),
             statistics,
             filters: Vec::new(),
         }
@@ -413,7 +413,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
             .execute(&self.final_sql()?, self.schema(), &self.filters)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.props
     }
 
@@ -705,7 +705,7 @@ mod tests {
         let expected = vec![
             "SELECT table_a1.a, table_a1.b, table_a1.c FROM table_a1",
             "SELECT table_a2.a, table_a2.b, table_a2.c FROM table_a2",
-            "SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) AS table_b1",
+            "SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) table_b1",
         ];
 
         assert_eq!(
@@ -919,7 +919,7 @@ mod tests {
         });
 
         let expected = vec![
-            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) AS Table"#,
+            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) Table"#,
         ];
 
         assert_eq!(

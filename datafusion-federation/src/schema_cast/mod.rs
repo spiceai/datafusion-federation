@@ -26,7 +26,7 @@ mod struct_cast;
 pub struct SchemaCastScanExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics_set: ExecutionPlanMetricsSet,
 }
 
@@ -44,7 +44,7 @@ impl SchemaCastScanExec {
         Self {
             input,
             schema,
-            properties,
+            properties: Arc::new(properties),
             metrics_set: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -65,7 +65,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

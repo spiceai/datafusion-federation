@@ -221,6 +221,7 @@ impl RewriteTableScanAnalyzer {
                             join_constraint: join.join_constraint,
                             schema: Arc::new(join_schema),
                             null_equality: join.null_equality,
+                            null_aware: join.null_aware,
                         }))
                     }
                     LogicalPlan::SubqueryAlias(subquery_alias) => Ok(LogicalPlan::SubqueryAlias(
