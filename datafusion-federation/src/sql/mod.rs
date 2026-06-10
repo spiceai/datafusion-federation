@@ -431,26 +431,14 @@ impl ExecutionPlan for VirtualExecutionPlan {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        let parent_filters: Vec<_> = child_pushdown_result
-            .parent_filters
-            .into_iter()
-            .map(|f| f.filter)
-            .collect();
-
-        if parent_filters.is_empty() {
-            return Ok(FilterPushdownPropagation {
-                filters: vec![],
-                updated_node: None,
-            });
-        }
-
-        let filters_pushed_down = vec![PushedDown::Yes; parent_filters.len()];
-        let mut node = self.clone();
-        node.filters = parent_filters;
-
+        // Do not accept static filter pushdown — the SQL already incorporates any
+        // filters that were part of the federation plan, and the SQLExecutor may
+        // not apply unrecognised expressions passed at execution time. Returning
+        // PushedDown::No keeps the parent FilterExec in place, guaranteeing that
+        // filters which were not absorbed into the SQL are still evaluated locally.
         Ok(FilterPushdownPropagation {
-            filters: filters_pushed_down,
-            updated_node: Some(Arc::new(node)),
+            filters: vec![PushedDown::No; child_pushdown_result.parent_filters.len()],
+            updated_node: None,
         })
     }
 }
@@ -1392,6 +1380,132 @@ mod tests {
                  ORDER BY numwait DESC, s_name",
             )
             .await
+        );
+    }
+
+    /// When `can_execute_plan` returns `false` for a `Filter → TableScan` plan at a
+    /// non-root level, the federation analyzer must still federate the `TableScan`
+    /// child and leave the `Filter` above it for local execution.
+    ///
+    /// Before the fix the `(false, Some(_))` match arm caught `Some(Unable)` and
+    /// returned early without trying children, so nothing got federated at all.
+    #[tokio::test]
+    async fn can_execute_plan_non_root_unable_federates_child_table_scan(
+    ) -> Result<(), DataFusionError> {
+        // Block federation of any plan node that is a Filter — simulates a
+        // denied UDF in the WHERE clause.
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: Some(Arc::new(|plan| matches!(plan, LogicalPlan::Filter(_)))),
+        };
+
+        let table = get_test_table_provider("t".into(), executor);
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", table).unwrap();
+
+        let df = ctx.sql("SELECT * FROM t WHERE a > 5").await?;
+        let physical_plan = df.create_physical_plan().await?;
+
+        let mut has_filter_exec = false;
+        let mut federation_sqls: Vec<String> = Vec::new();
+
+        physical_plan.apply(|node| {
+            if node.name() == "FilterExec" {
+                has_filter_exec = true;
+            }
+            if node.name() == "sql_federation_exec" {
+                let vp = node
+                    .as_any()
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .unwrap();
+                federation_sqls.push(vp.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert!(
+            has_filter_exec,
+            "FilterExec must be present for the denied filter"
+        );
+        assert!(
+            !federation_sqls.is_empty(),
+            "VirtualExecutionPlan must be present — TableScan should still be federated"
+        );
+        for sql in &federation_sqls {
+            assert!(
+                !sql.to_lowercase().contains("where"),
+                "Federated SQL must not contain the denied filter predicate; got: {sql}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `VirtualExecutionPlan::handle_child_pushdown_result` must return
+    /// `PushedDown::No` for every filter so that `FilterExec` is never silently
+    /// removed while the executor ignores the passed expressions.
+    #[test]
+    fn virtual_execution_plan_declines_filter_pushdown() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::common::ScalarValue;
+        use datafusion::config::ConfigOptions;
+        use datafusion::physical_expr::expressions::Literal;
+        use datafusion::physical_plan::filter_pushdown::{
+            ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase,
+        };
+
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        };
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("a", DataType::Int64, false),
+        ]));
+        let plan = datafusion::logical_expr::LogicalPlan::EmptyRelation(
+            datafusion::logical_expr::EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(
+                    datafusion::common::DFSchema::try_from((*schema).clone()).unwrap(),
+                ),
+            },
+        );
+        let vp =
+            VirtualExecutionPlan::new(plan, Arc::new(executor), Statistics::new_unknown(&schema));
+
+        // Build a ChildPushdownResult with two mock parent filters.
+        let dummy_expr: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+        let parent_filters = vec![
+            ChildFilterPushdownResult {
+                filter: Arc::clone(&dummy_expr),
+                child_results: vec![PushedDown::Yes],
+            },
+            ChildFilterPushdownResult {
+                filter: Arc::clone(&dummy_expr),
+                child_results: vec![PushedDown::Yes],
+            },
+        ];
+        let child_result = ChildPushdownResult {
+            parent_filters,
+            self_filters: vec![],
+        };
+
+        let result = vp
+            .handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                child_result,
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+
+        assert!(
+            result.updated_node.is_none(),
+            "VirtualExecutionPlan must not update itself when declining filters"
+        );
+        assert!(
+            result.filters.iter().all(|f| matches!(f, PushedDown::No)),
+            "Every filter must be PushedDown::No; got: {:?}",
+            result.filters
         );
     }
 }

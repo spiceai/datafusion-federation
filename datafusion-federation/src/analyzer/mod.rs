@@ -264,7 +264,7 @@ impl FederationAnalyzerRule {
                 provider.analyzer(plan)
             };
             match (is_root, provider_analyzer) {
-                (false, Some(_)) => {
+                (false, Some(FederationAnalyzerForLogicalPlan::With(_))) => {
                     // The largest sub-plan is higher up.
                     return Ok((None, ScanResult::Distinct(provider)));
                 }
