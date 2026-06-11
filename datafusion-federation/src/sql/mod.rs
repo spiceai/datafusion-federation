@@ -431,14 +431,48 @@ impl ExecutionPlan for VirtualExecutionPlan {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        // Do not accept static filter pushdown — the SQL already incorporates any
-        // filters that were part of the federation plan, and the SQLExecutor may
-        // not apply unrecognised expressions passed at execution time. Returning
-        // PushedDown::No keeps the parent FilterExec in place, guaranteeing that
-        // filters which were not absorbed into the SQL are still evaluated locally.
+        // Ask the executor whether it will apply each filter inside execute().
+        // Filters the executor claims to handle are accepted (PushedDown::Yes), allowing
+        // the parent FilterExec to be removed — the executor is then responsible for
+        // applying them (e.g. by injecting them into the SQL at execution time).
+        // Filters the executor does not handle are declined (PushedDown::No), keeping
+        // the FilterExec in place for local evaluation.
+        //
+        // Note: filters that were part of the federation plan are already baked into
+        // final_sql() and never appear here — this path only sees filters that were
+        // NOT absorbed during logical federation planning.
+        let pushdown_results: Vec<PushedDown> = child_pushdown_result
+            .parent_filters
+            .iter()
+            .map(|f| {
+                if self.executor.can_handle_filter(f.filter.as_ref()) {
+                    PushedDown::Yes
+                } else {
+                    PushedDown::No
+                }
+            })
+            .collect();
+
+        let accepted: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
+            .parent_filters
+            .iter()
+            .zip(&pushdown_results)
+            .filter(|(_, pd)| matches!(pd, PushedDown::Yes))
+            .map(|(f, _)| Arc::clone(&f.filter))
+            .collect();
+
+        if accepted.is_empty() {
+            return Ok(FilterPushdownPropagation {
+                filters: pushdown_results,
+                updated_node: None,
+            });
+        }
+
+        let mut node = self.clone();
+        node.filters = accepted;
         Ok(FilterPushdownPropagation {
-            filters: vec![PushedDown::No; child_pushdown_result.parent_filters.len()],
-            updated_node: None,
+            filters: pushdown_results,
+            updated_node: Some(Arc::new(node)),
         })
     }
 }
@@ -1441,9 +1475,10 @@ mod tests {
         Ok(())
     }
 
-    /// `VirtualExecutionPlan::handle_child_pushdown_result` must return
-    /// `PushedDown::No` for every filter so that `FilterExec` is never silently
-    /// removed while the executor ignores the passed expressions.
+    /// `VirtualExecutionPlan::handle_child_pushdown_result` must consult
+    /// `SQLExecutor::can_handle_filter` for each filter. When the executor returns
+    /// `false` (the default), the filter must be declined so that `FilterExec`
+    /// stays in place for local evaluation.
     #[test]
     fn virtual_execution_plan_declines_filter_pushdown() {
         use datafusion::arrow::datatypes::DataType;

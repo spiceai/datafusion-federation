@@ -52,12 +52,27 @@ pub trait SQLExecutor: Sync + Send {
         None
     }
 
+    /// Returns whether this executor will apply `filter` when it is passed to [`Self::execute`].
+    ///
+    /// [`VirtualExecutionPlan`](super::VirtualExecutionPlan) calls this for each physical filter
+    /// expression that a parent [`FilterExec`](datafusion::physical_plan::filter::FilterExec) wants
+    /// to push down. Returning `true` allows the `FilterExec` to be removed from the plan
+    /// (the executor is then responsible for applying the filter inside [`Self::execute`]).
+    /// Returning `false` keeps the `FilterExec` in place for local evaluation.
+    ///
+    /// The default is `false` — filters are not applied. Override to opt in, e.g. for
+    /// runtime-only expressions like `DynamicFilterPhysicalExpr` that can be injected into
+    /// the SQL at execution time.
+    fn can_handle_filter(&self, _filter: &dyn PhysicalExpr) -> bool {
+        false
+    }
+
     /// Execute a SQL query.
     ///
-    /// `filters` contain physical expressions generated at runtime, like
-    /// `DynamicFilterPhysicalExpr`. Since the concrete expression values only become available when
-    /// the `SendableRecordBatchStream` is executed, they must be manually added to the SQL query,
-    /// if necessary. However, they can be safely ignored.
+    /// `filters` contain physical expressions for which [`Self::can_handle_filter`] returned
+    /// `true`. Their concrete values may only be available at execution time (e.g.
+    /// `DynamicFilterPhysicalExpr`), so they must be incorporated into the SQL query when the
+    /// stream is polled.
     fn execute(
         &self,
         query: &str,
