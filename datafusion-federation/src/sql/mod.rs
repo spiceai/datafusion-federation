@@ -35,7 +35,9 @@ use datafusion::{
 use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
 pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
-pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef, SqlQueryRewriter};
+pub use executor::{
+    LogicalOptimizer, SQLExecutor, SQLExecutorRef, SQLFilterPushDown, SqlQueryRewriter,
+};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
@@ -441,23 +443,29 @@ impl ExecutionPlan for VirtualExecutionPlan {
         // Note: filters that were part of the federation plan are already baked into
         // final_sql() and never appear here — this path only sees filters that were
         // NOT absorbed during logical federation planning.
-        let pushdown_results: Vec<PushedDown> = child_pushdown_result
+        let filter_refs: Vec<&dyn PhysicalExpr> = child_pushdown_result
             .parent_filters
             .iter()
-            .map(|f| {
-                if self.executor.can_handle_filter(f.filter.as_ref()) {
-                    PushedDown::Yes
-                } else {
-                    PushedDown::No
-                }
+            .map(|f| f.filter.as_ref())
+            .collect();
+        let executor_support = self.executor.supports_filters_pushdown(&filter_refs);
+
+        // Exact   → pass to execute(), remove FilterExec (PushedDown::Yes)
+        // Inexact → pass to execute() as a hint, keep FilterExec (PushedDown::No)
+        // Unsupported → do not pass, keep FilterExec (PushedDown::No)
+        let pushdown_results: Vec<PushedDown> = executor_support
+            .iter()
+            .map(|s| match s {
+                SQLFilterPushDown::Exact => PushedDown::Yes,
+                SQLFilterPushDown::Inexact | SQLFilterPushDown::Unsupported => PushedDown::No,
             })
             .collect();
 
         let accepted: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
             .parent_filters
             .iter()
-            .zip(&pushdown_results)
-            .filter(|(_, pd)| matches!(pd, PushedDown::Yes))
+            .zip(&executor_support)
+            .filter(|(_, s)| matches!(s, SQLFilterPushDown::Exact | SQLFilterPushDown::Inexact))
             .map(|(f, _)| Arc::clone(&f.filter))
             .collect();
 
@@ -1475,27 +1483,11 @@ mod tests {
         Ok(())
     }
 
-    /// `VirtualExecutionPlan::handle_child_pushdown_result` must consult
-    /// `SQLExecutor::can_handle_filter` for each filter. When the executor returns
-    /// `false` (the default), the filter must be declined so that `FilterExec`
-    /// stays in place for local evaluation.
-    #[test]
-    fn virtual_execution_plan_declines_filter_pushdown() {
-        use datafusion::arrow::datatypes::DataType;
-        use datafusion::common::ScalarValue;
-        use datafusion::config::ConfigOptions;
-        use datafusion::physical_expr::expressions::Literal;
-        use datafusion::physical_plan::filter_pushdown::{
-            ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase,
-        };
+    // ── helpers shared by the filter-pushdown tests ──────────────────────────
 
-        let executor = TestExecutor {
-            compute_context: "ctx".into(),
-            cannot_federate: None,
-        };
-        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new("a", DataType::Int64, false),
-        ]));
+    fn make_vp_with_executor(executor: TestExecutor) -> VirtualExecutionPlan {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let plan = datafusion::logical_expr::LogicalPlan::EmptyRelation(
             datafusion::logical_expr::EmptyRelation {
                 produce_one_row: false,
@@ -1504,43 +1496,210 @@ mod tests {
                 ),
             },
         );
-        let vp =
-            VirtualExecutionPlan::new(plan, Arc::new(executor), Statistics::new_unknown(&schema));
+        VirtualExecutionPlan::new(plan, Arc::new(executor), Statistics::new_unknown(&schema))
+    }
 
-        // Build a ChildPushdownResult with two mock parent filters.
-        let dummy_expr: Arc<dyn PhysicalExpr> =
-            Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
-        let parent_filters = vec![
-            ChildFilterPushdownResult {
-                filter: Arc::clone(&dummy_expr),
+    fn make_child_result(n: usize) -> ChildPushdownResult {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+        use datafusion::physical_plan::filter_pushdown::ChildFilterPushdownResult;
+
+        let dummy: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+        let parent_filters = (0..n)
+            .map(|_| ChildFilterPushdownResult {
+                filter: Arc::clone(&dummy),
                 child_results: vec![PushedDown::Yes],
-            },
-            ChildFilterPushdownResult {
-                filter: Arc::clone(&dummy_expr),
-                child_results: vec![PushedDown::Yes],
-            },
-        ];
-        let child_result = ChildPushdownResult {
+            })
+            .collect();
+        ChildPushdownResult {
             parent_filters,
             self_filters: vec![],
-        };
+        }
+    }
 
-        let result = vp
-            .handle_child_pushdown_result(
-                FilterPushdownPhase::Post,
-                child_result,
-                &ConfigOptions::default(),
-            )
-            .unwrap();
+    fn run_pushdown(
+        vp: &VirtualExecutionPlan,
+        n: usize,
+    ) -> FilterPushdownPropagation<Arc<dyn ExecutionPlan>> {
+        use datafusion::config::ConfigOptions;
+        use datafusion::physical_plan::filter_pushdown::FilterPushdownPhase;
+        vp.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            make_child_result(n),
+            &ConfigOptions::default(),
+        )
+        .unwrap()
+    }
+
+    // ── per-variant tests ─────────────────────────────────────────────────────
+
+    /// Default executor: all filters unsupported → PushedDown::No, no node update.
+    #[test]
+    fn virtual_execution_plan_declines_filter_pushdown() {
+        let vp = make_vp_with_executor(TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        });
+        let result = run_pushdown(&vp, 2);
 
         assert!(
             result.updated_node.is_none(),
-            "VirtualExecutionPlan must not update itself when declining filters"
+            "Unsupported: node must not be updated"
         );
         assert!(
             result.filters.iter().all(|f| matches!(f, PushedDown::No)),
-            "Every filter must be PushedDown::No; got: {:?}",
+            "Unsupported: every filter must be PushedDown::No; got: {:?}",
             result.filters
+        );
+    }
+
+    /// Executor that accepts all filters as Exact: FilterExec is removed (PushedDown::Yes)
+    /// and filters are stored on the updated node for injection into execute().
+    #[test]
+    fn virtual_execution_plan_exact_filter_pushdown() {
+        #[derive(Clone, Debug)]
+        struct ExactExecutor(TestExecutor);
+
+        #[async_trait]
+        impl SQLExecutor for ExactExecutor {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn compute_context(&self) -> Option<String> {
+                self.0.compute_context()
+            }
+            fn dialect(&self) -> Arc<dyn Dialect> {
+                self.0.dialect()
+            }
+            fn supports_filters_pushdown(
+                &self,
+                filters: &[&dyn PhysicalExpr],
+            ) -> Vec<SQLFilterPushDown> {
+                vec![SQLFilterPushDown::Exact; filters.len()]
+            }
+            fn execute(
+                &self,
+                q: &str,
+                s: SchemaRef,
+                f: &[Arc<dyn PhysicalExpr>],
+            ) -> Result<SendableRecordBatchStream> {
+                self.0.execute(q, s, f)
+            }
+            async fn table_names(&self) -> Result<Vec<String>> {
+                self.0.table_names().await
+            }
+            async fn get_table_schema(&self, t: &str) -> Result<SchemaRef> {
+                self.0.get_table_schema(t).await
+            }
+        }
+
+        let vp = make_vp_with_executor(TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        });
+        // Re-wrap with ExactExecutor
+        let vp2 = VirtualExecutionPlan {
+            executor: Arc::new(ExactExecutor(TestExecutor {
+                compute_context: "ctx".into(),
+                cannot_federate: None,
+            })),
+            ..vp
+        };
+        let result = run_pushdown(&vp2, 2);
+
+        assert!(
+            result.updated_node.is_some(),
+            "Exact: node must be updated with accepted filters"
+        );
+        assert!(
+            result.filters.iter().all(|f| matches!(f, PushedDown::Yes)),
+            "Exact: every filter must be PushedDown::Yes (FilterExec removed); got: {:?}",
+            result.filters
+        );
+        // Filters must be stored on the updated node for execute().
+        let updated = result.updated_node.unwrap();
+        let updated_vp = updated
+            .as_any()
+            .downcast_ref::<VirtualExecutionPlan>()
+            .unwrap();
+        assert_eq!(
+            updated_vp.filters.len(),
+            2,
+            "Exact: both filters must be stored on the node"
+        );
+    }
+
+    /// Executor that accepts all filters as Inexact: FilterExec is kept (PushedDown::No)
+    /// but filters are stored on the updated node so execute() can use them as hints.
+    #[test]
+    fn virtual_execution_plan_inexact_filter_pushdown() {
+        #[derive(Clone, Debug)]
+        struct InexactExecutor(TestExecutor);
+
+        #[async_trait]
+        impl SQLExecutor for InexactExecutor {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn compute_context(&self) -> Option<String> {
+                self.0.compute_context()
+            }
+            fn dialect(&self) -> Arc<dyn Dialect> {
+                self.0.dialect()
+            }
+            fn supports_filters_pushdown(
+                &self,
+                filters: &[&dyn PhysicalExpr],
+            ) -> Vec<SQLFilterPushDown> {
+                vec![SQLFilterPushDown::Inexact; filters.len()]
+            }
+            fn execute(
+                &self,
+                q: &str,
+                s: SchemaRef,
+                f: &[Arc<dyn PhysicalExpr>],
+            ) -> Result<SendableRecordBatchStream> {
+                self.0.execute(q, s, f)
+            }
+            async fn table_names(&self) -> Result<Vec<String>> {
+                self.0.table_names().await
+            }
+            async fn get_table_schema(&self, t: &str) -> Result<SchemaRef> {
+                self.0.get_table_schema(t).await
+            }
+        }
+
+        let vp = make_vp_with_executor(TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        });
+        let vp2 = VirtualExecutionPlan {
+            executor: Arc::new(InexactExecutor(TestExecutor {
+                compute_context: "ctx".into(),
+                cannot_federate: None,
+            })),
+            ..vp
+        };
+        let result = run_pushdown(&vp2, 2);
+
+        assert!(
+            result.updated_node.is_some(),
+            "Inexact: node must be updated so filters reach execute()"
+        );
+        assert!(
+            result.filters.iter().all(|f| matches!(f, PushedDown::No)),
+            "Inexact: FilterExec must stay (PushedDown::No); got: {:?}",
+            result.filters
+        );
+        let updated = result.updated_node.unwrap();
+        let updated_vp = updated
+            .as_any()
+            .downcast_ref::<VirtualExecutionPlan>()
+            .unwrap();
+        assert_eq!(
+            updated_vp.filters.len(),
+            2,
+            "Inexact: both filters must be stored on the node for execute()"
         );
     }
 }

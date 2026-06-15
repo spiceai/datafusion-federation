@@ -14,6 +14,25 @@ use super::ast_analyzer::AstAnalyzer;
 
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
 
+/// Indicates how a physical filter expression is handled when pushed down to a
+/// [`SQLExecutor`] via [`SQLExecutor::supports_filters_pushdown`].
+///
+/// Mirrors the semantics of
+/// [`TableProviderFilterPushDown`](datafusion::logical_expr::TableProviderFilterPushDown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SQLFilterPushDown {
+    /// The executor cannot apply this filter. The parent `FilterExec` is kept in the
+    /// plan and evaluates the filter locally.
+    Unsupported,
+    /// The executor will apply this filter exactly inside [`SQLExecutor::execute`].
+    /// The parent `FilterExec` is removed from the plan.
+    Exact,
+    /// The executor will apply this filter as a hint (e.g. for early pruning in the
+    /// generated SQL), but may not apply it precisely. The parent `FilterExec` is kept
+    /// in the plan to guarantee correctness.
+    Inexact,
+}
+
 pub type LogicalOptimizer = Box<dyn FnMut(LogicalPlan) -> Result<LogicalPlan>>;
 pub type SqlQueryRewriter = Box<dyn FnMut(String) -> Result<String>>;
 
@@ -52,25 +71,30 @@ pub trait SQLExecutor: Sync + Send {
         None
     }
 
-    /// Returns whether this executor will apply `filter` when it is passed to [`Self::execute`].
+    /// Returns how each of the provided physical filter expressions is handled when pushed
+    /// down to this executor. Called once with all candidate filters; returns one
+    /// [`SQLFilterPushDown`] per filter.
     ///
-    /// [`VirtualExecutionPlan`](super::VirtualExecutionPlan) calls this for each physical filter
-    /// expression that a parent [`FilterExec`](datafusion::physical_plan::filter::FilterExec) wants
-    /// to push down. Returning `true` allows the `FilterExec` to be removed from the plan
-    /// (the executor is then responsible for applying the filter inside [`Self::execute`]).
-    /// Returning `false` keeps the `FilterExec` in place for local evaluation.
+    /// - [`Unsupported`](SQLFilterPushDown::Unsupported): filter is not passed to
+    ///   [`Self::execute`]; the parent `FilterExec` stays in the plan for local evaluation.
+    /// - [`Exact`](SQLFilterPushDown::Exact): filter is passed to [`Self::execute`] and
+    ///   applied precisely; the parent `FilterExec` is removed.
+    /// - [`Inexact`](SQLFilterPushDown::Inexact): filter is passed to [`Self::execute`] as
+    ///   a hint (e.g. for early pruning in the generated SQL) but may not be applied
+    ///   exactly; the parent `FilterExec` is kept for correctness.
     ///
-    /// The default is `false` — filters are not applied. Override to opt in, e.g. for
-    /// runtime-only expressions like `DynamicFilterPhysicalExpr` that can be injected into
-    /// the SQL at execution time.
-    fn can_handle_filter(&self, _filter: &dyn PhysicalExpr) -> bool {
-        false
+    /// The default returns [`Unsupported`](SQLFilterPushDown::Unsupported) for every filter.
+    /// Override to opt in, e.g. for runtime-only expressions like `DynamicFilterPhysicalExpr`
+    /// that can be injected into the SQL at execution time.
+    fn supports_filters_pushdown(&self, filters: &[&dyn PhysicalExpr]) -> Vec<SQLFilterPushDown> {
+        vec![SQLFilterPushDown::Unsupported; filters.len()]
     }
 
     /// Execute a SQL query.
     ///
-    /// `filters` contain physical expressions for which [`Self::can_handle_filter`] returned
-    /// `true`. Their concrete values may only be available at execution time (e.g.
+    /// `filters` contain physical expressions for which [`Self::supports_filters_pushdown`]
+    /// returned [`Exact`](SQLFilterPushDown::Exact) or [`Inexact`](SQLFilterPushDown::Inexact).
+    /// Their concrete values may only be available at execution time (e.g.
     /// `DynamicFilterPhysicalExpr`), so they must be incorporated into the SQL query when the
     /// stream is polled.
     fn execute(
