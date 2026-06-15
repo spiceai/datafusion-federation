@@ -14,6 +14,25 @@ use super::ast_analyzer::AstAnalyzer;
 
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
 
+/// Indicates how a physical filter expression is handled when pushed down to a
+/// [`SQLExecutor`] via [`SQLExecutor::supports_filters_pushdown`].
+///
+/// Mirrors the semantics of
+/// [`TableProviderFilterPushDown`](datafusion::logical_expr::TableProviderFilterPushDown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SQLFilterPushDown {
+    /// The executor cannot apply this filter. The parent `FilterExec` is kept in the
+    /// plan and evaluates the filter locally.
+    Unsupported,
+    /// The executor will apply this filter exactly inside [`SQLExecutor::execute`].
+    /// The parent `FilterExec` is removed from the plan.
+    Exact,
+    /// The executor will apply this filter as a hint (e.g. for early pruning in the
+    /// generated SQL), but may not apply it precisely. The parent `FilterExec` is kept
+    /// in the plan to guarantee correctness.
+    Inexact,
+}
+
 pub type LogicalOptimizer = Box<dyn FnMut(LogicalPlan) -> Result<LogicalPlan>>;
 pub type SqlQueryRewriter = Box<dyn FnMut(String) -> Result<String>>;
 
@@ -52,12 +71,32 @@ pub trait SQLExecutor: Sync + Send {
         None
     }
 
+    /// Returns how each of the provided physical filter expressions is handled when pushed
+    /// down to this executor. Called once with all candidate filters; returns one
+    /// [`SQLFilterPushDown`] per filter.
+    ///
+    /// - [`Unsupported`](SQLFilterPushDown::Unsupported): filter is not passed to
+    ///   [`Self::execute`]; the parent `FilterExec` stays in the plan for local evaluation.
+    /// - [`Exact`](SQLFilterPushDown::Exact): filter is passed to [`Self::execute`] and
+    ///   applied precisely; the parent `FilterExec` is removed.
+    /// - [`Inexact`](SQLFilterPushDown::Inexact): filter is passed to [`Self::execute`] as
+    ///   a hint (e.g. for early pruning in the generated SQL) but may not be applied
+    ///   exactly; the parent `FilterExec` is kept for correctness.
+    ///
+    /// The default returns [`Unsupported`](SQLFilterPushDown::Unsupported) for every filter.
+    /// Override to opt in, e.g. for runtime-only expressions like `DynamicFilterPhysicalExpr`
+    /// that can be injected into the SQL at execution time.
+    fn supports_filters_pushdown(&self, filters: &[&dyn PhysicalExpr]) -> Vec<SQLFilterPushDown> {
+        vec![SQLFilterPushDown::Unsupported; filters.len()]
+    }
+
     /// Execute a SQL query.
     ///
-    /// `filters` contain physical expressions generated at runtime, like
-    /// `DynamicFilterPhysicalExpr`. Since the concrete expression values only become available when
-    /// the `SendableRecordBatchStream` is executed, they must be manually added to the SQL query,
-    /// if necessary. However, they can be safely ignored.
+    /// `filters` contain physical expressions for which [`Self::supports_filters_pushdown`]
+    /// returned [`Exact`](SQLFilterPushDown::Exact) or [`Inexact`](SQLFilterPushDown::Inexact).
+    /// Their concrete values may only be available at execution time (e.g.
+    /// `DynamicFilterPhysicalExpr`), so they must be incorporated into the SQL query when the
+    /// stream is polled.
     fn execute(
         &self,
         query: &str,
