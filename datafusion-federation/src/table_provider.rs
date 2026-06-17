@@ -1,4 +1,4 @@
-use std::{any::Any, borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -47,9 +47,6 @@ impl FederatedTableProviderAdaptor {
 
 #[async_trait]
 impl TableProvider for FederatedTableProviderAdaptor {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         if let Some(table_provider) = &self.table_provider {
             return table_provider.schema();
@@ -177,7 +174,6 @@ mod tests {
     use datafusion::error::DataFusionError;
     use datafusion::logical_expr::{dml::InsertOp, Expr, TableType};
     use datafusion::physical_plan::ExecutionPlan;
-    use std::any::Any;
 
     // Minimal FederatedTableSource implementation for tests that don't need DML.
     #[derive(Debug)]
@@ -194,9 +190,6 @@ mod tests {
     }
 
     impl datafusion::logical_expr::TableSource for NoOpSource {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -224,9 +217,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for RecordingProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }

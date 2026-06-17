@@ -6,7 +6,7 @@ mod schema;
 mod table;
 mod table_reference;
 
-use std::{any::Any, fmt, sync::Arc, vec};
+use std::{fmt, sync::Arc, vec};
 
 use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
 use ast_analyzer::RewriteMultiTableReference;
@@ -259,7 +259,9 @@ fn gather_analyzers(
             let provider = get_table_source(&table.source)
                 .expect("caller is virtual exec so this is valid")
                 .expect("caller is virtual exec so this is valid");
-            if let Some(source) = provider.as_any().downcast_ref::<SQLTableSource>() {
+            if let Some(source) =
+                (provider.as_ref() as &dyn std::any::Any).downcast_ref::<SQLTableSource>()
+            {
                 if let Some(analyzer) = source.table.logical_optimizer() {
                     logical_optimizers.push(analyzer);
                 }
@@ -387,10 +389,6 @@ impl ExecutionPlan for VirtualExecutionPlan {
         "sql_federation_exec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema()
     }
@@ -419,8 +417,8 @@ impl ExecutionPlan for VirtualExecutionPlan {
         &self.props
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-        Ok(self.statistics.clone())
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(self.statistics.clone()))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -723,7 +721,6 @@ mod tests {
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
-                    .as_any()
                     .downcast_ref::<VirtualExecutionPlan>()
                     .unwrap();
 
@@ -939,7 +936,6 @@ mod tests {
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
-                    .as_any()
                     .downcast_ref::<VirtualExecutionPlan>()
                     .unwrap();
 
@@ -1048,7 +1044,6 @@ mod tests {
         physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
-                    .as_any()
                     .downcast_ref::<VirtualExecutionPlan>()
                     .unwrap();
                 final_queries.push(node.final_sql()?);
@@ -1457,7 +1452,6 @@ mod tests {
             }
             if node.name() == "sql_federation_exec" {
                 let vp = node
-                    .as_any()
                     .downcast_ref::<VirtualExecutionPlan>()
                     .unwrap();
                 federation_sqls.push(vp.final_sql()?);
@@ -1619,7 +1613,6 @@ mod tests {
         // Filters must be stored on the updated node for execute().
         let updated = result.updated_node.unwrap();
         let updated_vp = updated
-            .as_any()
             .downcast_ref::<VirtualExecutionPlan>()
             .unwrap();
         assert_eq!(
@@ -1693,7 +1686,6 @@ mod tests {
         );
         let updated = result.updated_node.unwrap();
         let updated_vp = updated
-            .as_any()
             .downcast_ref::<VirtualExecutionPlan>()
             .unwrap();
         assert_eq!(

@@ -608,9 +608,6 @@ mod tests {
     }
 
     impl datafusion::logical_expr::TableSource for MockTableSource {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
@@ -651,10 +648,7 @@ pub fn get_table_source(
     let source = source_as_provider(source)?;
 
     // Get FederatedTableProviderAdaptor
-    let Some(wrapper) = source
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-    else {
+    let Some(wrapper) = source.downcast_ref::<FederatedTableProviderAdaptor>() else {
         return Ok(None);
     };
 
