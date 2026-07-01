@@ -6,16 +6,17 @@
 /// SELECT output column list in two different ways depending on context:
 ///
 /// - A **bare** output-column alias *is* allowed as a top-level sort key:
-///   `ORDER BY "my_alias"` ✅
+///   `ORDER BY "my_alias"`.
 /// - An alias used **inside a compound expression** is **not** resolved against
 ///   the SELECT list — it is resolved against the `FROM` tables only:
-///   `ORDER BY CASE WHEN "my_alias" = 0 THEN ... END` ❌ → `42703`
+///   `ORDER BY CASE WHEN "my_alias" = 0 THEN ... END`.
 ///
 /// DataFusion's unparser (`unproject_sort_expr`) only re-inlines `ScalarFunction`
 /// projection expressions into sort keys. For any other expression shape (e.g. a
 /// `BinaryExpr` like `grouping(a) + grouping(b)`), it falls through and leaves a
 /// bare `Column("alias")` inside compound sort expressions. When this column
-/// reference is not at the top level of the sort key, PostgreSQL cannot resolve it
+/// reference is not at the top level of the sort key, PostgreSQL (and other common
+///  databases) cannot resolve it
 /// and returns `ERROR: column "alias" does not exist (SQLSTATE 42703)`.
 ///
 /// See: <https://www.postgresql.org/docs/current/sql-select.html#SQL-ORDERBY>
@@ -23,17 +24,7 @@
 /// > *output column name* must stand alone, that is, it cannot be used in an
 /// > expression — for example, `ORDER BY foo + 1` is not valid if the output
 /// > column name is `foo`."
-///
-/// # The Fix
-///
-/// Before handing the federated sub-plan to the unparser, walk the plan tree.
-/// When a `Sort` node sits directly above a `Projection` node, examine every
-/// sort expression. Any `Expr::Column` with no relation qualifier that matches a
-/// Projection output alias AND maps to a non-trivial projection expression (i.e.
-/// not itself a plain `Column`) is replaced inline with that underlying expression
-/// (with any alias wrapper stripped). After this substitution the alias name no
-/// longer appears inside compound sort keys, so the SQL the unparser generates is
-/// valid for any standard-compliant SQL engine.
+
 use datafusion::{
     common::{
         tree_node::{Transformed, TreeNode},
@@ -89,7 +80,7 @@ fn inline_aliases_in_sort_expr(
 ) -> Result<datafusion::logical_expr::SortExpr> {
     // If the sort key is already a bare column reference at the top level,
     // leave it as-is: PostgreSQL handles bare output aliases fine.
-    if matches!(&sort_expr.expr, Expr::Column(c) if c.relation.is_none()) {
+    if matches!(&sort_expr.expr, Expr::Column(Column{relation: None,..}))  {
         return Ok(sort_expr);
     }
 
@@ -109,19 +100,13 @@ fn inline_aliases_in_sort_expr(
 /// expression, replace it with that expression (alias-stripped). Otherwise
 /// return `Transformed::no(expr)`.
 fn inline_one_column_ref(expr: Expr, proj: &Projection) -> Result<Transformed<Expr>> {
-    let Expr::Column(ref col) = expr else {
+    let Expr::Column(Column{ relation: None, name, ..}) = &expr else {
         return Ok(Transformed::no(expr));
     };
 
-    // Only rewrite unqualified column references (relation is None).
-    // A qualified reference like `table.col` cannot be a SELECT-list alias.
-    if col.relation.is_some() {
-        return Ok(Transformed::no(expr));
-    }
-
     // Look up the column name in the projection schema to find the
     // corresponding projection expression.
-    if let Ok(idx) = proj.schema.index_of_column(&Column::new_unqualified(&col.name)) {
+    if let Ok(idx) = proj.schema.index_of_column(&Column::new_unqualified(name)) {
         if let Some(proj_expr) = proj.expr.get(idx) {
             let underlying = strip_alias(proj_expr.clone());
             // Only inline if the underlying expression is non-trivial —
