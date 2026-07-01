@@ -24,7 +24,6 @@
 /// > *output column name* must stand alone, that is, it cannot be used in an
 /// > expression — for example, `ORDER BY foo + 1` is not valid if the output
 /// > column name is `foo`."
-
 use datafusion::{
     common::{
         tree_node::{Transformed, TreeNode},
@@ -51,7 +50,11 @@ pub fn inline_sort_projection_aliases(plan: LogicalPlan) -> Result<LogicalPlan> 
                 .collect::<Result<Vec<_>>>()?;
 
             if new_exprs == expr {
-                Ok(Transformed::no(LogicalPlan::Sort(Sort { expr, input, fetch })))
+                Ok(Transformed::no(LogicalPlan::Sort(Sort {
+                    expr,
+                    input,
+                    fetch,
+                })))
             } else {
                 Ok(Transformed::yes(LogicalPlan::Sort(Sort {
                     expr: new_exprs,
@@ -80,7 +83,7 @@ fn inline_aliases_in_sort_expr(
 ) -> Result<datafusion::logical_expr::SortExpr> {
     // If the sort key is already a bare column reference at the top level,
     // leave it as-is: PostgreSQL handles bare output aliases fine.
-    if matches!(&sort_expr.expr, Expr::Column(Column{relation: None,..}))  {
+    if matches!(&sort_expr.expr, Expr::Column(Column { relation: None, .. })) {
         return Ok(sort_expr);
     }
 
@@ -100,7 +103,12 @@ fn inline_aliases_in_sort_expr(
 /// expression, replace it with that expression (alias-stripped). Otherwise
 /// return `Transformed::no(expr)`.
 fn inline_one_column_ref(expr: Expr, proj: &Projection) -> Result<Transformed<Expr>> {
-    let Expr::Column(Column{ relation: None, name, ..}) = &expr else {
+    let Expr::Column(Column {
+        relation: None,
+        name,
+        ..
+    }) = &expr
+    else {
         return Ok(Transformed::no(expr));
     };
 
@@ -185,30 +193,30 @@ mod tests {
         });
 
         // Projection: (a + b) AS s, a
-        let proj_exprs = vec![
-            (col("a") + col("b")).alias("s"),
-            col("a"),
-        ];
+        let proj_exprs = vec![(col("a") + col("b")).alias("s"), col("a")];
         let proj_schema = schema_ref(&[("s", DataType::Int64), ("a", DataType::Int64)]);
-        let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
-            proj_exprs,
-            Arc::new(empty),
-            proj_schema,
-        ).unwrap());
+        let projection = LogicalPlan::Projection(
+            Projection::try_new_with_schema(proj_exprs, Arc::new(empty), proj_schema).unwrap(),
+        );
 
         // Sort: CASE WHEN s = 0 THEN a END ASC, s ASC
         let case_expr = Expr::Case(datafusion::logical_expr::Case {
             expr: None,
-            when_then_expr: vec![(
-                Box::new(col("s").eq(lit(0i64))),
-                Box::new(col("a")),
-            )],
+            when_then_expr: vec![(Box::new(col("s").eq(lit(0i64))), Box::new(col("a")))],
             else_expr: None,
         });
 
         let sort_exprs = vec![
-            SortExpr { expr: case_expr, asc: true, nulls_first: false },
-            SortExpr { expr: col("s"), asc: true, nulls_first: false },
+            SortExpr {
+                expr: case_expr,
+                asc: true,
+                nulls_first: false,
+            },
+            SortExpr {
+                expr: col("s"),
+                asc: true,
+                nulls_first: false,
+            },
         ];
         let sort = LogicalPlan::Sort(Sort {
             expr: sort_exprs,
@@ -265,7 +273,11 @@ mod tests {
 
         // Sort directly on EmptyRelation (no Projection in between).
         let sort = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr { expr: col("a"), asc: true, nulls_first: false }],
+            expr: vec![SortExpr {
+                expr: col("a"),
+                asc: true,
+                nulls_first: false,
+            }],
             input: Arc::new(empty),
             fetch: None,
         });
@@ -303,11 +315,9 @@ mod tests {
         // Projection: a AS x, b
         let proj_exprs = vec![col("a").alias("x"), col("b")];
         let proj_schema = schema_ref(&[("x", DataType::Int64), ("b", DataType::Int64)]);
-        let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
-            proj_exprs,
-            Arc::new(empty),
-            proj_schema,
-        ).unwrap());
+        let projection = LogicalPlan::Projection(
+            Projection::try_new_with_schema(proj_exprs, Arc::new(empty), proj_schema).unwrap(),
+        );
 
         // Sort: x + 1 — x is a trivial alias of column a, so `x` inside a
         // compound expression is NOT inlined (underlying expr is also a column).
@@ -318,13 +328,19 @@ mod tests {
         });
 
         let sort = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr { expr: sort_expr, asc: true, nulls_first: false }],
+            expr: vec![SortExpr {
+                expr: sort_expr,
+                asc: true,
+                nulls_first: false,
+            }],
             input: Arc::new(projection),
             fetch: None,
         });
 
         let rewritten = inline_sort_projection_aliases(sort).unwrap();
-        let LogicalPlan::Sort(rs) = &rewritten else { panic!() };
+        let LogicalPlan::Sort(rs) = &rewritten else {
+            panic!()
+        };
         // `x` is a trivial rename of `a`, so inlining would give `a + 1`
         // which is equivalent — but the underlying expr is a Column so
         // our rule deliberately does NOT inline it.
@@ -353,26 +369,29 @@ mod tests {
         // Projection: (a + b) AS s, a
         let proj_exprs = vec![(col("a") + col("b")).alias("s"), col("a")];
         let proj_schema = schema_ref(&[("s", DataType::Int64), ("a", DataType::Int64)]);
-        let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
-            proj_exprs,
-            Arc::new(empty),
-            proj_schema,
-        ).unwrap());
+        let projection = LogicalPlan::Projection(
+            Projection::try_new_with_schema(proj_exprs, Arc::new(empty), proj_schema).unwrap(),
+        );
 
         // Sort: CASE WHEN s = 0 THEN a END ASC, s ASC
         let case_expr = Expr::Case(datafusion::logical_expr::Case {
             expr: None,
-            when_then_expr: vec![(
-                Box::new(col("s").eq(lit(0i64))),
-                Box::new(col("a")),
-            )],
+            when_then_expr: vec![(Box::new(col("s").eq(lit(0i64))), Box::new(col("a")))],
             else_expr: None,
         });
 
         let sort = LogicalPlan::Sort(Sort {
             expr: vec![
-                SortExpr { expr: case_expr, asc: true, nulls_first: false },
-                SortExpr { expr: col("s"), asc: true, nulls_first: false },
+                SortExpr {
+                    expr: case_expr,
+                    asc: true,
+                    nulls_first: false,
+                },
+                SortExpr {
+                    expr: col("s"),
+                    asc: true,
+                    nulls_first: false,
+                },
             ],
             input: Arc::new(projection),
             fetch: None,
