@@ -3,6 +3,7 @@ pub mod ast_analyzer;
 mod executor;
 pub mod optimizer;
 mod schema;
+mod sort_alias_inliner;
 mod table;
 mod table_reference;
 
@@ -220,6 +221,14 @@ impl VirtualExecutionPlan {
         let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
         let plan = apply_logical_optimizers(plan, logical_optimizers)?;
+        // Re-inline projection alias expressions that appear inside compound ORDER BY
+        // expressions.  PostgreSQL (and the SQL standard) allow a bare output-column alias
+        // as a top-level sort key but NOT inside a larger expression such as a CASE.
+        // DataFusion's unparser only re-inlines ScalarFunction projection exprs, so any
+        // other shape (e.g. BinaryExpr `grouping(a)+grouping(b)`) leaks as a bare alias
+        // column inside the generated SQL, causing Postgres error 42703.
+        // See: datafusion-federation/src/sql/sort_alias_inliner.rs for the full writeup.
+        let plan = sort_alias_inliner::inline_sort_projection_aliases(plan)?;
         let ast = self.plan_to_statement(&plan)?;
         let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
         let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
@@ -1692,6 +1701,101 @@ mod tests {
             updated_vp.filters.len(),
             2,
             "Inexact: both filters must be stored on the node for execute()"
+        );
+    }
+
+    // ── sort alias inliner regression ────────────────────────────────────────
+
+    /// Regression: an alias referenced inside a CASE expression in ORDER BY must
+    /// be inlined before unparsing.
+    ///
+    /// PostgreSQL allows a bare output-column alias as a top-level sort key
+    /// (`ORDER BY "s"`) but rejects the same alias inside a compound expression
+    /// (`ORDER BY CASE WHEN "s" = 0 THEN … END`), returning SQLSTATE 42703.
+    ///
+    /// `VirtualExecutionPlan::final_sql` must call `inline_sort_projection_aliases`
+    /// so the alias is replaced by the underlying expression before the SQL is
+    /// emitted.  Without that call this test fails because the generated SQL
+    /// contains `CASE WHEN "s" = 0`.
+    #[test]
+    fn final_sql_does_not_leak_alias_inside_order_by_case() {
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{col, lit, Sort, SortExpr};
+
+        // EmptyRelation: schema (a: Int64, b: Int64)
+        let input_arrow = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let input_df = Arc::new(DFSchema::try_from((*input_arrow).clone()).unwrap());
+        let empty = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: input_df,
+        });
+
+        // Projection: (a + b) AS s, a
+        let proj_exprs = vec![(col("a") + col("b")).alias("s"), col("a")];
+        let proj_arrow = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Int64, true),
+            Field::new("a", DataType::Int64, true),
+        ]));
+        let proj_df = Arc::new(DFSchema::try_from((*proj_arrow).clone()).unwrap());
+        let projection = LogicalPlan::Projection(
+            Projection::try_new_with_schema(proj_exprs, Arc::new(empty), proj_df).unwrap(),
+        );
+
+        // Sort: CASE WHEN s = 0 THEN a END ASC, s ASC
+        // `s` is a projection alias for `a + b`; inside the CASE it must be
+        // replaced with the underlying expression so Postgres can resolve it.
+        let case_expr = Expr::Case(datafusion::logical_expr::Case {
+            expr: None,
+            when_then_expr: vec![(
+                Box::new(col("s").eq(lit(0i64))),
+                Box::new(col("a")),
+            )],
+            else_expr: None,
+        });
+        let sort_arrow = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Int64, true),
+            Field::new("a", DataType::Int64, true),
+        ]));
+        let sort = LogicalPlan::Sort(Sort {
+            expr: vec![
+                SortExpr { expr: case_expr, asc: true, nulls_first: false },
+                SortExpr { expr: col("s"), asc: true, nulls_first: false },
+            ],
+            input: Arc::new(projection),
+            fetch: None,
+        });
+
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        };
+        let vp = VirtualExecutionPlan::new(
+            sort,
+            Arc::new(executor),
+            Statistics::new_unknown(&sort_arrow),
+        );
+
+        let sql = vp.final_sql().expect("final_sql must succeed");
+
+        // Without the fix the DataFusion unparser leaves the alias as-is inside the CASE:
+        //   ORDER BY CASE WHEN (s = 0) THEN a END ...
+        // PostgreSQL rejects this with SQLSTATE 42703.
+        //
+        // With the fix `inline_sort_projection_aliases` replaces `s` with the underlying
+        // projection expression `a + b` before unparsing:
+        //   ORDER BY CASE WHEN ((a + b) = 0) THEN a END ...
+        assert!(
+            !sql.contains("CASE WHEN (s = 0)"),
+            "final_sql must not emit alias `s` inside CASE WHEN (Postgres 42703 regression); \
+             got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CASE WHEN ((a + b) = 0)"),
+            "ORDER BY CASE must inline the alias to the underlying expression `(a + b)`; \
+             got:\n{sql}"
         );
     }
 }

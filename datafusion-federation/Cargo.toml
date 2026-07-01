@@ -32,6 +32,16 @@ tracing = "0.1"
 tokio.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 insta = { version = "1.42.0", features = ["filters"] }
+anyhow = "1"
+tokio-postgres = "0.7"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
+async-trait.workspace = true
+futures.workspace = true
+
+[[test]]
+name = "postgres_federation"
+required-features = ["sql"]
 
 [[example]]
 name = "df-csv"
