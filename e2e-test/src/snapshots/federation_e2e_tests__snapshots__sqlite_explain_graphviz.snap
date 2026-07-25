@@ -1,0 +1,34 @@
+---
+source: e2e-test/src/snapshots.rs
+description: "EXPLAIN FORMAT GRAPHVIZ SELECT id, name FROM measurements WHERE id > 1 ORDER BY id"
+---
++--------------+----------------------------------------------------------------------+
+| plan_type    | plan                                                                 |
++--------------+----------------------------------------------------------------------+
+| logical_plan |                                                                      |
+|              | // Begin DataFusion GraphViz Plan,                                   |
+|              | // display it online here: https://dreampuf.github.io/GraphvizOnline |
+|              |                                                                      |
+|              | digraph {                                                            |
+|              |   subgraph cluster_1                                                 |
+|              |   {                                                                  |
+|              |     graph[label="LogicalPlan"]                                       |
+|              |     2[shape=box label="Federated                                     |
+|              |  Sort: measurements.id ASC NULLS LAST                                |
+|              |   Projection: measurements.id, measurements.name                     |
+|              |     Filter: measurements.id > Int64(1)                               |
+|              |       TableScan: measurements"]                                      |
+|              |   }                                                                  |
+|              |   subgraph cluster_3                                                 |
+|              |   {                                                                  |
+|              |     graph[label="Detailed LogicalPlan"]                              |
+|              |     4[shape=box label="Federated                                     |
+|              |  Sort: measurements.id ASC NULLS LAST                                |
+|              |   Projection: measurements.id, measurements.name                     |
+|              |     Filter: measurements.id > Int64(1)                               |
+|              |       TableScan: measurements\nSchema: [id:Int64;N, name:Utf8;N]"]   |
+|              |   }                                                                  |
+|              | }                                                                    |
+|              | // End DataFusion GraphViz Plan                                      |
+|              |                                                                      |
++--------------+----------------------------------------------------------------------+

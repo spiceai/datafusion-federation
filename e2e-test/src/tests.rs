@@ -1,32 +1,12 @@
 //! `EXPLAIN` / `EXPLAIN ANALYZE` federation, executed against real engines.
-
-use std::sync::Arc;
-
-use datafusion::{
-    arrow::util::pretty::pretty_format_batches, error::Result, execution::context::SessionContext,
-};
+//!
+//! These assert the behaviour that must hold; [`crate::snapshots`] captures the
+//! full rendered plans so unintended changes to them are visible in review.
 
 #[cfg(feature = "duckdb")]
-use crate::engines::DuckDbExecutor;
-use crate::{engines::SqliteExecutor, federated_context, TABLE};
-
-/// Filtered and ordered so the federated SQL is more than a bare table scan.
-const QUERY: &str = "SELECT id, name FROM measurements WHERE id > 1 ORDER BY id";
-
-#[cfg(feature = "duckdb")]
-async fn duckdb_ctx() -> Result<SessionContext> {
-    federated_context(Arc::new(DuckDbExecutor::new()?)).await
-}
-
-async fn sqlite_ctx() -> Result<SessionContext> {
-    federated_context(Arc::new(SqliteExecutor::new()?)).await
-}
-
-/// Runs `sql` to completion and renders the result as text.
-async fn run(ctx: &SessionContext, sql: &str) -> Result<String> {
-    let batches = ctx.sql(sql).await?.collect().await?;
-    Ok(pretty_format_batches(&batches)?.to_string())
-}
+use crate::duckdb_ctx;
+use crate::{run, sqlite_ctx, QUERY, TABLE};
+use datafusion::{error::Result, execution::context::SessionContext};
 
 /// Every operator of the remote sub-plan, innermost first. A federated `EXPLAIN`
 /// must show all of these, not just an opaque `Federated` leaf.

@@ -16,16 +16,22 @@
 #![cfg(test)]
 
 mod engines;
+mod snapshots;
 mod tests;
 
 use std::sync::Arc;
 
 use datafusion::{
+    arrow::util::pretty::pretty_format_batches,
     catalog::SchemaProvider,
     error::Result,
     execution::context::{SessionContext, SessionState},
 };
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLSchemaProvider};
+
+#[cfg(feature = "duckdb")]
+use crate::engines::DuckDbExecutor;
+use crate::engines::SqliteExecutor;
 
 /// The table every test federates.
 pub const TABLE: &str = "measurements";
@@ -33,6 +39,9 @@ pub const TABLE: &str = "measurements";
 /// Rows loaded into each engine. `id` is used to exercise filter pushdown.
 pub const FIXTURE_ROWS: &[(i64, &str, f64)] =
     &[(1, "alpha", 1.5), (2, "beta", 2.5), (3, "gamma", 3.5)];
+
+/// Filtered and ordered so the federated SQL is more than a bare table scan.
+pub const QUERY: &str = "SELECT id, name FROM measurements WHERE id > 1 ORDER BY id";
 
 /// Points the default catalog's default schema at `schema`, so unqualified table
 /// names resolve to the federated provider.
@@ -57,4 +66,19 @@ async fn federated_context(executor: Arc<dyn SQLExecutor>) -> Result<SessionCont
     overwrite_default_schema(&state, schema_provider)?;
 
     Ok(SessionContext::new_with_state(state))
+}
+
+#[cfg(feature = "duckdb")]
+pub async fn duckdb_ctx() -> Result<SessionContext> {
+    federated_context(Arc::new(DuckDbExecutor::new()?)).await
+}
+
+pub async fn sqlite_ctx() -> Result<SessionContext> {
+    federated_context(Arc::new(SqliteExecutor::new()?)).await
+}
+
+/// Runs `sql` to completion and renders the result as text.
+pub async fn run(ctx: &SessionContext, sql: &str) -> Result<String> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    Ok(pretty_format_batches(&batches)?.to_string())
 }
