@@ -13,12 +13,20 @@ publish = false
 default = []
 duckdb = ["dep:duckdb"]
 
+# DuckDB stays a regular dependency because Cargo rejects optional
+# dev-dependencies, and the `duckdb` feature above needs something optional to
+# switch. Keeping it here also means `duckdb/bundled` is unified across the
+# workspace under `--all-features`, which is what lets integration-test's binary
+# link without a system libduckdb.
 [dependencies]
+duckdb = { version = "1.10503", features = ["bundled"], optional = true }
+
+# Everything else is only ever used by the `#![cfg(test)]` crate body, so it does
+# not need building for `cargo check`/`cargo build`.
+[dev-dependencies]
 datafusion-federation = { workspace = true, features = ["sql"] }
 datafusion = { workspace = true }
 async-trait.workspace = true
 futures.workspace = true
 tokio.workspace = true
-# Both engines are `bundled` so the tests need no system library.
-duckdb = { version = "1.10503", features = ["bundled"], optional = true }
 rusqlite = { version = "0.40", features = ["bundled"] }

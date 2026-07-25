@@ -294,7 +294,10 @@ impl FederationAnalyzerRule {
                 if matches!(plan, LogicalPlan::Analyze(_) | LogicalPlan::Explain(_)) {
                     None
                 } else {
-                    provider.analyzer(&federated_plan)
+                    // Ask about the query itself, not the EXPLAIN wrapper: an executor
+                    // whose can_execute_plan rejects Explain/Analyze would otherwise
+                    // refuse to federate a query it can perfectly well run.
+                    provider.analyzer(plan)
                 };
             match (is_root, provider_analyzer) {
                 (false, Some(FederationAnalyzerForLogicalPlan::With(_))) => {
@@ -341,17 +344,20 @@ impl FederationAnalyzerRule {
                     return Ok(original_input);
                 };
 
-                let federated_input = Self::wrap_federated_plan(
-                    wrap_projection(original_input.clone())?,
-                    explain_context.as_deref(),
-                )?;
+                let projected_input = wrap_projection(original_input.clone())?;
 
+                // Ask about the query itself rather than the EXPLAIN wrapper applied
+                // below, so an executor that rejects Explain/Analyze in
+                // can_execute_plan still federates the query it wraps.
                 let Some(FederationAnalyzerForLogicalPlan::With(analyzer)) =
-                    provider.analyzer(&federated_input)
+                    provider.analyzer(&projected_input)
                 else {
                     // Either provider has no analyzer, or cannot federate [`LogicalPlan`].
                     return Ok(original_input);
                 };
+
+                let federated_input =
+                    Self::wrap_federated_plan(projected_input, explain_context.as_deref())?;
 
                 // Replace the input with the federated counterpart
                 analyzer.execute_and_check(federated_input, config, |_, _| {})
