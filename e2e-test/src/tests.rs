@@ -6,14 +6,14 @@ use datafusion::{
     arrow::util::pretty::pretty_format_batches, error::Result, execution::context::SessionContext,
 };
 
-use crate::{
-    engines::{DuckDbExecutor, SqliteExecutor},
-    federated_context, TABLE,
-};
+#[cfg(feature = "duckdb")]
+use crate::engines::DuckDbExecutor;
+use crate::{engines::SqliteExecutor, federated_context, TABLE};
 
 /// Filtered and ordered so the federated SQL is more than a bare table scan.
 const QUERY: &str = "SELECT id, name FROM measurements WHERE id > 1 ORDER BY id";
 
+#[cfg(feature = "duckdb")]
 async fn duckdb_ctx() -> Result<SessionContext> {
     federated_context(Arc::new(DuckDbExecutor::new()?)).await
 }
@@ -155,31 +155,37 @@ async fn assert_explain_format_graphviz(ctx: &SessionContext, engine: &str) -> R
     Ok(())
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn duckdb_query_federates() -> Result<()> {
     assert_query_federates(&duckdb_ctx().await?, "duckdb").await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn duckdb_explain() -> Result<()> {
     assert_explain(&duckdb_ctx().await?, "duckdb").await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn duckdb_explain_analyze() -> Result<()> {
     assert_explain_analyze(&duckdb_ctx().await?, "duckdb").await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn duckdb_explain_format_tree() -> Result<()> {
     assert_explain_format_tree(&duckdb_ctx().await?, "duckdb").await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn duckdb_explain_format_pgjson() -> Result<()> {
     assert_explain_format_pgjson(&duckdb_ctx().await?, "duckdb").await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn duckdb_explain_format_graphviz() -> Result<()> {
     assert_explain_format_graphviz(&duckdb_ctx().await?, "duckdb").await

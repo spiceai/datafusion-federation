@@ -7,12 +7,18 @@ license.workspace = true
 readme.workspace = true
 publish = false
 
+[features]
+# Off by default: `bundled` compiles DuckDB from source, which dominates a cold
+# build, so a plain `cargo test` covers only SQLite. Enable for the DuckDB tests.
+default = []
+duckdb = ["dep:duckdb"]
+
 [dependencies]
 datafusion-federation = { workspace = true, features = ["sql"] }
 datafusion = { workspace = true }
 async-trait.workspace = true
 futures.workspace = true
 tokio.workspace = true
-# `bundled` compiles DuckDB from source so the tests need no system libduckdb.
-duckdb = { version = "1.10503", features = ["bundled"] }
+# Both engines are `bundled` so the tests need no system library.
+duckdb = { version = "1.10503", features = ["bundled"], optional = true }
 rusqlite = { version = "0.40", features = ["bundled"] }

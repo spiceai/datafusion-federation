@@ -3,6 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+#[cfg(feature = "duckdb")]
+use datafusion::sql::unparser::dialect::DuckDBDialect;
 use datafusion::{
     arrow::{
         array::{ArrayRef, Float64Builder, Int64Builder, RecordBatch, StringBuilder},
@@ -10,7 +12,7 @@ use datafusion::{
     },
     error::{DataFusionError, Result},
     physical_plan::{stream::RecordBatchStreamAdapter, PhysicalExpr, SendableRecordBatchStream},
-    sql::unparser::dialect::{Dialect, DuckDBDialect, SqliteDialect},
+    sql::unparser::dialect::{Dialect, SqliteDialect},
 };
 use datafusion_federation::sql::SQLExecutor;
 
@@ -29,10 +31,12 @@ fn stream(schema: SchemaRef, batches: Vec<RecordBatch>) -> SendableRecordBatchSt
 }
 
 /// Federates to an in-memory DuckDB database.
+#[cfg(feature = "duckdb")]
 pub struct DuckDbExecutor {
     conn: Mutex<duckdb::Connection>,
 }
 
+#[cfg(feature = "duckdb")]
 impl DuckDbExecutor {
     /// Creates the database and loads [`FIXTURE_ROWS`].
     pub fn new() -> Result<Self> {
@@ -64,6 +68,7 @@ impl DuckDbExecutor {
     }
 }
 
+#[cfg(feature = "duckdb")]
 #[async_trait]
 impl SQLExecutor for DuckDbExecutor {
     fn name(&self) -> &str {
