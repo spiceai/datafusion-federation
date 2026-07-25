@@ -39,8 +39,9 @@ impl RewriteTableScanAnalyzer {
                         return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                     };
 
-                    let Some(sql_table_source) =
-                        federated_source.as_any().downcast_ref::<SQLTableSource>()
+                    let Some(sql_table_source) = (federated_source.as_ref()
+                        as &dyn std::any::Any)
+                        .downcast_ref::<SQLTableSource>()
                     else {
                         // Not a SQLTableSource (is this possible?)
                         return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
@@ -221,6 +222,7 @@ impl RewriteTableScanAnalyzer {
                             join_constraint: join.join_constraint,
                             schema: Arc::new(join_schema),
                             null_equality: join.null_equality,
+                            null_aware: join.null_aware,
                         }))
                     }
                     LogicalPlan::SubqueryAlias(subquery_alias) => Ok(LogicalPlan::SubqueryAlias(

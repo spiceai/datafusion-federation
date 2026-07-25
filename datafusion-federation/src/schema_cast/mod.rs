@@ -12,7 +12,6 @@ use datafusion::physical_plan::{
     PlanProperties,
 };
 use futures::StreamExt;
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -26,7 +25,7 @@ mod struct_cast;
 pub struct SchemaCastScanExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics_set: ExecutionPlanMetricsSet,
 }
 
@@ -44,7 +43,7 @@ impl SchemaCastScanExec {
         Self {
             input,
             schema,
-            properties,
+            properties: Arc::new(properties),
             metrics_set: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -61,11 +60,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         "SchemaCastScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -126,7 +121,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         )))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 

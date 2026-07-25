@@ -6,7 +6,7 @@ mod schema;
 mod table;
 mod table_reference;
 
-use std::{any::Any, fmt, sync::Arc, vec};
+use std::{fmt, sync::Arc, vec};
 
 use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
 use ast_analyzer::RewriteMultiTableReference;
@@ -35,7 +35,9 @@ use datafusion::{
 use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
 pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
-pub use executor::{LogicalOptimizer, SQLExecutor, SQLExecutorRef, SqlQueryRewriter};
+pub use executor::{
+    LogicalOptimizer, SQLExecutor, SQLExecutorRef, SQLFilterPushDown, SqlQueryRewriter,
+};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
@@ -190,7 +192,7 @@ impl FederationPlanner for SQLFederationPlanner {
 pub struct VirtualExecutionPlan {
     plan: LogicalPlan,
     executor: Arc<dyn SQLExecutor>,
-    props: PlanProperties,
+    props: Arc<PlanProperties>,
     statistics: Statistics,
     query_type: Option<FederatedQueryType>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -213,7 +215,7 @@ impl VirtualExecutionPlan {
         Self {
             plan,
             executor,
-            props,
+            props: Arc::new(props),
             statistics,
             query_type,
             filters: Vec::new(),
@@ -289,7 +291,9 @@ fn gather_analyzers(
             let provider = get_table_source(&table.source)
                 .expect("caller is virtual exec so this is valid")
                 .expect("caller is virtual exec so this is valid");
-            if let Some(source) = provider.as_any().downcast_ref::<SQLTableSource>() {
+            if let Some(source) =
+                (provider.as_ref() as &dyn std::any::Any).downcast_ref::<SQLTableSource>()
+            {
                 if let Some(analyzer) = source.table.logical_optimizer() {
                     logical_optimizers.push(analyzer);
                 }
@@ -417,10 +421,6 @@ impl ExecutionPlan for VirtualExecutionPlan {
         "sql_federation_exec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema()
     }
@@ -445,12 +445,12 @@ impl ExecutionPlan for VirtualExecutionPlan {
             .execute(&self.final_sql()?, self.schema(), &self.filters)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.props
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-        Ok(self.statistics.clone())
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(self.statistics.clone()))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -463,25 +463,53 @@ impl ExecutionPlan for VirtualExecutionPlan {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        let parent_filters: Vec<_> = child_pushdown_result
+        // Ask the executor whether it will apply each filter inside execute().
+        // Filters the executor claims to handle are accepted (PushedDown::Yes), allowing
+        // the parent FilterExec to be removed — the executor is then responsible for
+        // applying them (e.g. by injecting them into the SQL at execution time).
+        // Filters the executor does not handle are declined (PushedDown::No), keeping
+        // the FilterExec in place for local evaluation.
+        //
+        // Note: filters that were part of the federation plan are already baked into
+        // final_sql() and never appear here — this path only sees filters that were
+        // NOT absorbed during logical federation planning.
+        let filter_refs: Vec<&dyn PhysicalExpr> = child_pushdown_result
             .parent_filters
-            .into_iter()
-            .map(|f| f.filter)
+            .iter()
+            .map(|f| f.filter.as_ref())
+            .collect();
+        let executor_support = self.executor.supports_filters_pushdown(&filter_refs);
+
+        // Exact   → pass to execute(), remove FilterExec (PushedDown::Yes)
+        // Inexact → pass to execute() as a hint, keep FilterExec (PushedDown::No)
+        // Unsupported → do not pass, keep FilterExec (PushedDown::No)
+        let pushdown_results: Vec<PushedDown> = executor_support
+            .iter()
+            .map(|s| match s {
+                SQLFilterPushDown::Exact => PushedDown::Yes,
+                SQLFilterPushDown::Inexact | SQLFilterPushDown::Unsupported => PushedDown::No,
+            })
             .collect();
 
-        if parent_filters.is_empty() {
+        let accepted: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
+            .parent_filters
+            .iter()
+            .zip(&executor_support)
+            .filter(|(_, s)| matches!(s, SQLFilterPushDown::Exact | SQLFilterPushDown::Inexact))
+            .map(|(f, _)| Arc::clone(&f.filter))
+            .collect();
+
+        if accepted.is_empty() {
             return Ok(FilterPushdownPropagation {
-                filters: vec![],
+                filters: pushdown_results,
                 updated_node: None,
             });
         }
 
-        let filters_pushed_down = vec![PushedDown::Yes; parent_filters.len()];
         let mut node = self.clone();
-        node.filters = parent_filters;
-
+        node.filters = accepted;
         Ok(FilterPushdownPropagation {
-            filters: filters_pushed_down,
+            filters: pushdown_results,
             updated_node: Some(Arc::new(node)),
         })
     }
@@ -504,6 +532,7 @@ mod tests {
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::Alias;
     use datafusion::logical_expr::Projection;
     use datafusion::prelude::Expr;
@@ -512,11 +541,13 @@ mod tests {
     use datafusion::{
         arrow::datatypes::{DataType, Field},
         datasource::TableProvider,
+        execution::config::SessionConfig,
         execution::context::SessionContext,
     };
 
     use super::table::RemoteTable;
     use super::*;
+    use crate::FederatedQueryPlanner;
 
     #[derive(Clone)]
     struct TestExecutor {
@@ -723,7 +754,6 @@ mod tests {
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
-                    .as_any()
                     .downcast_ref::<VirtualExecutionPlan>()
                     .unwrap();
 
@@ -735,7 +765,7 @@ mod tests {
         let expected = vec![
             "SELECT table_a1.a, table_a1.b, table_a1.c FROM table_a1",
             "SELECT table_a2.a, table_a2.b, table_a2.c FROM table_a2",
-            "SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) AS table_b1",
+            "SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) table_b1",
         ];
 
         assert_eq!(
@@ -939,7 +969,6 @@ mod tests {
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
-                    .as_any()
                     .downcast_ref::<VirtualExecutionPlan>()
                     .unwrap();
 
@@ -949,7 +978,7 @@ mod tests {
         });
 
         let expected = vec![
-            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) AS Table"#,
+            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) Table"#,
         ];
 
         assert_eq!(
@@ -1173,7 +1202,6 @@ mod tests {
         physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
                 let node = node
-                    .as_any()
                     .downcast_ref::<VirtualExecutionPlan>()
                     .unwrap();
                 final_queries.push(node.final_sql()?);
@@ -1189,5 +1217,639 @@ mod tests {
         assert_eq!(rewrite_calls.load(Ordering::SeqCst), 1);
 
         Ok(())
+    }
+
+    // --- EXISTS / NOT EXISTS federation tests ---
+
+    fn make_table_with_schema(
+        name: &str,
+        schema: SchemaRef,
+        executor: &TestExecutor,
+    ) -> Arc<dyn TableProvider> {
+        let table_ref = RemoteTableRef::try_from(name.to_string()).unwrap();
+        let table = Arc::new(RemoteTable::new(table_ref, schema));
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(executor.clone())));
+        let table_source = Arc::new(SQLTableSource { provider, table });
+        Arc::new(FederatedTableProviderAdaptor::new(table_source))
+    }
+
+    fn orders_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_custkey", DataType::Int64, false),
+            Field::new("o_orderstatus", DataType::Utf8, false),
+            Field::new("o_orderdate", DataType::Date32, true),
+        ]))
+    }
+
+    fn lineitem_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_suppkey", DataType::Int64, false),
+            Field::new("l_commitdate", DataType::Date32, true),
+            Field::new("l_receiptdate", DataType::Date32, true),
+        ]))
+    }
+
+    fn supplier_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_name", DataType::Utf8, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]))
+    }
+
+    /// Creates a session state with a fixed `target_partitions` count so that
+    /// snapshot tests produce deterministic physical plans regardless of the
+    /// number of CPU cores on the host.
+    fn deterministic_session_state() -> SessionState {
+        let rules = crate::default_analyzer_rules();
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::default().with_target_partitions(4))
+            .with_analyzer_rules(rules)
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .with_default_features()
+            .build()
+    }
+
+    /// Runs `EXPLAIN <query>`, collects the output, and returns a formatted
+    /// string containing both logical and physical plans.
+    async fn explain_query(ctx: &SessionContext, query: &str) -> String {
+        let explain_sql = format!("EXPLAIN {query}");
+        let batches = ctx
+            .sql(&explain_sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let formatted = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap();
+        formatted.to_string()
+    }
+
+    /// Same-provider EXISTS: both tables from the same compute context.
+    /// The entire plan should be federated as a single unit so the backend
+    /// can decorrelate EXISTS into a semi-join.
+    #[tokio::test]
+    async fn same_provider_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "same_provider_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// Same-provider NOT EXISTS: mirrors TPC-H Q21 structure.
+    /// Must be federated as one unit so the backend can decorrelate to anti-join.
+    #[tokio::test]
+    async fn same_provider_not_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "same_provider_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name FROM supplier WHERE NOT EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_suppkey = s_suppkey \
+                  AND l_receiptdate > l_commitdate)",
+            )
+            .await
+        );
+    }
+
+    /// Cross-provider EXISTS: outer table on provider A, subquery table on provider B.
+    /// Each side must be independently federated (multiple Federated nodes).
+    #[tokio::test]
+    async fn cross_provider_exists_separately_federated() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "cross_provider_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// Cross-provider NOT EXISTS: outer table on provider A, subquery table on provider B.
+    #[tokio::test]
+    async fn cross_provider_not_exists_separately_federated() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "cross_provider_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT o_orderkey FROM orders WHERE NOT EXISTS \
+                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)",
+            )
+            .await
+        );
+    }
+
+    /// TPC-H Q21 pattern: same-provider JOIN + NOT EXISTS + EXISTS.
+    /// All tables on the same provider. The entire plan must be federated
+    /// as a single unit so the backend handles decorrelation.
+    #[tokio::test]
+    async fn same_provider_join_with_not_exists_federated_as_single_unit() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "same_provider_join_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name \
+                 FROM supplier \
+                 JOIN lineitem ON s_suppkey = l_suppkey \
+                 JOIN orders ON o_orderkey = l_orderkey \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM lineitem AS l2 \
+                     WHERE l2.l_orderkey = lineitem.l_orderkey \
+                     AND l2.l_suppkey <> lineitem.l_suppkey \
+                 )",
+            )
+            .await
+        );
+    }
+
+    /// Mixed providers: JOIN across providers + EXISTS subquery on a different provider.
+    /// supplier(ctx_a) JOIN lineitem(ctx_b) WHERE EXISTS on orders(ctx_a).
+    #[tokio::test]
+    async fn mixed_provider_join_with_exists() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+        let executor_b = TestExecutor {
+            compute_context: "ctx_b".into(),
+            cannot_federate: None,
+        };
+
+        let state = deterministic_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_b),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        insta::assert_snapshot!(
+            "mixed_provider_join_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name \
+                 FROM supplier \
+                 JOIN lineitem ON l_suppkey = s_suppkey \
+                 WHERE EXISTS ( \
+                     SELECT 1 FROM orders \
+                     WHERE o_custkey = s_suppkey \
+                 )",
+            )
+            .await
+        );
+    }
+
+    /// Same-provider NOT EXISTS with aliased outer table.
+    /// The outer query uses `lineitem l1` (alias). The NOT EXISTS subquery
+    /// references the alias: `l1.l_orderkey`. All tables are same provider.
+    #[tokio::test]
+    async fn same_provider_aliased_table_not_exists() {
+        let executor_a = TestExecutor {
+            compute_context: "ctx_a".into(),
+            cannot_federate: None,
+        };
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table(
+            "supplier",
+            make_table_with_schema("supplier", supplier_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor_a),
+        )
+        .unwrap();
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor_a),
+        )
+        .unwrap();
+
+        // TPC-H Q21 pattern: aliased lineitem l1, NOT EXISTS references l1.*
+        insta::assert_snapshot!(
+            "same_provider_aliased_not_exists",
+            explain_query(
+                &ctx,
+                "SELECT s_name, count(*) AS numwait \
+                 FROM supplier, lineitem l1, orders \
+                 WHERE s_suppkey = l1.l_suppkey \
+                   AND l1.l_orderkey = o_orderkey \
+                   AND l1.l_receiptdate > l1.l_commitdate \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM lineitem l2 \
+                       WHERE l2.l_orderkey = l1.l_orderkey \
+                         AND l2.l_suppkey <> l1.l_suppkey \
+                   ) \
+                 GROUP BY s_name \
+                 ORDER BY numwait DESC, s_name",
+            )
+            .await
+        );
+    }
+
+    /// When `can_execute_plan` returns `false` for a `Filter → TableScan` plan at a
+    /// non-root level, the federation analyzer must still federate the `TableScan`
+    /// child and leave the `Filter` above it for local execution.
+    ///
+    /// Before the fix the `(false, Some(_))` match arm caught `Some(Unable)` and
+    /// returned early without trying children, so nothing got federated at all.
+    #[tokio::test]
+    async fn can_execute_plan_non_root_unable_federates_child_table_scan(
+    ) -> Result<(), DataFusionError> {
+        // Block federation of any plan node that is a Filter — simulates a
+        // denied UDF in the WHERE clause.
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: Some(Arc::new(|plan| matches!(plan, LogicalPlan::Filter(_)))),
+        };
+
+        let table = get_test_table_provider("t".into(), executor);
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", table).unwrap();
+
+        let df = ctx.sql("SELECT * FROM t WHERE a > 5").await?;
+        let physical_plan = df.create_physical_plan().await?;
+
+        let mut has_filter_exec = false;
+        let mut federation_sqls: Vec<String> = Vec::new();
+
+        physical_plan.apply(|node| {
+            if node.name() == "FilterExec" {
+                has_filter_exec = true;
+            }
+            if node.name() == "sql_federation_exec" {
+                let vp = node
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .unwrap();
+                federation_sqls.push(vp.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert!(
+            has_filter_exec,
+            "FilterExec must be present for the denied filter"
+        );
+        assert!(
+            !federation_sqls.is_empty(),
+            "VirtualExecutionPlan must be present — TableScan should still be federated"
+        );
+        for sql in &federation_sqls {
+            assert!(
+                !sql.to_lowercase().contains("where"),
+                "Federated SQL must not contain the denied filter predicate; got: {sql}"
+            );
+        }
+
+        Ok(())
+    }
+
+    // ── helpers shared by the filter-pushdown tests ──────────────────────────
+
+    fn make_vp_with_executor(executor: TestExecutor) -> VirtualExecutionPlan {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let plan = datafusion::logical_expr::LogicalPlan::EmptyRelation(
+            datafusion::logical_expr::EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(
+                    datafusion::common::DFSchema::try_from((*schema).clone()).unwrap(),
+                ),
+            },
+        );
+        VirtualExecutionPlan::new(plan, Arc::new(executor), Statistics::new_unknown(&schema))
+    }
+
+    fn make_child_result(n: usize) -> ChildPushdownResult {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+        use datafusion::physical_plan::filter_pushdown::ChildFilterPushdownResult;
+
+        let dummy: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+        let parent_filters = (0..n)
+            .map(|_| ChildFilterPushdownResult {
+                filter: Arc::clone(&dummy),
+                child_results: vec![PushedDown::Yes],
+            })
+            .collect();
+        ChildPushdownResult {
+            parent_filters,
+            self_filters: vec![],
+        }
+    }
+
+    fn run_pushdown(
+        vp: &VirtualExecutionPlan,
+        n: usize,
+    ) -> FilterPushdownPropagation<Arc<dyn ExecutionPlan>> {
+        use datafusion::config::ConfigOptions;
+        use datafusion::physical_plan::filter_pushdown::FilterPushdownPhase;
+        vp.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            make_child_result(n),
+            &ConfigOptions::default(),
+        )
+        .unwrap()
+    }
+
+    // ── per-variant tests ─────────────────────────────────────────────────────
+
+    /// Default executor: all filters unsupported → PushedDown::No, no node update.
+    #[test]
+    fn virtual_execution_plan_declines_filter_pushdown() {
+        let vp = make_vp_with_executor(TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        });
+        let result = run_pushdown(&vp, 2);
+
+        assert!(
+            result.updated_node.is_none(),
+            "Unsupported: node must not be updated"
+        );
+        assert!(
+            result.filters.iter().all(|f| matches!(f, PushedDown::No)),
+            "Unsupported: every filter must be PushedDown::No; got: {:?}",
+            result.filters
+        );
+    }
+
+    /// Executor that accepts all filters as Exact: FilterExec is removed (PushedDown::Yes)
+    /// and filters are stored on the updated node for injection into execute().
+    #[test]
+    fn virtual_execution_plan_exact_filter_pushdown() {
+        #[derive(Clone, Debug)]
+        struct ExactExecutor(TestExecutor);
+
+        #[async_trait]
+        impl SQLExecutor for ExactExecutor {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn compute_context(&self) -> Option<String> {
+                self.0.compute_context()
+            }
+            fn dialect(&self) -> Arc<dyn Dialect> {
+                self.0.dialect()
+            }
+            fn supports_filters_pushdown(
+                &self,
+                filters: &[&dyn PhysicalExpr],
+            ) -> Vec<SQLFilterPushDown> {
+                vec![SQLFilterPushDown::Exact; filters.len()]
+            }
+            fn execute(
+                &self,
+                q: &str,
+                s: SchemaRef,
+                f: &[Arc<dyn PhysicalExpr>],
+            ) -> Result<SendableRecordBatchStream> {
+                self.0.execute(q, s, f)
+            }
+            async fn table_names(&self) -> Result<Vec<String>> {
+                self.0.table_names().await
+            }
+            async fn get_table_schema(&self, t: &str) -> Result<SchemaRef> {
+                self.0.get_table_schema(t).await
+            }
+        }
+
+        let vp = make_vp_with_executor(TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        });
+        // Re-wrap with ExactExecutor
+        let vp2 = VirtualExecutionPlan {
+            executor: Arc::new(ExactExecutor(TestExecutor {
+                compute_context: "ctx".into(),
+                cannot_federate: None,
+            })),
+            ..vp
+        };
+        let result = run_pushdown(&vp2, 2);
+
+        assert!(
+            result.updated_node.is_some(),
+            "Exact: node must be updated with accepted filters"
+        );
+        assert!(
+            result.filters.iter().all(|f| matches!(f, PushedDown::Yes)),
+            "Exact: every filter must be PushedDown::Yes (FilterExec removed); got: {:?}",
+            result.filters
+        );
+        // Filters must be stored on the updated node for execute().
+        let updated = result.updated_node.unwrap();
+        let updated_vp = updated
+            .downcast_ref::<VirtualExecutionPlan>()
+            .unwrap();
+        assert_eq!(
+            updated_vp.filters.len(),
+            2,
+            "Exact: both filters must be stored on the node"
+        );
+    }
+
+    /// Executor that accepts all filters as Inexact: FilterExec is kept (PushedDown::No)
+    /// but filters are stored on the updated node so execute() can use them as hints.
+    #[test]
+    fn virtual_execution_plan_inexact_filter_pushdown() {
+        #[derive(Clone, Debug)]
+        struct InexactExecutor(TestExecutor);
+
+        #[async_trait]
+        impl SQLExecutor for InexactExecutor {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn compute_context(&self) -> Option<String> {
+                self.0.compute_context()
+            }
+            fn dialect(&self) -> Arc<dyn Dialect> {
+                self.0.dialect()
+            }
+            fn supports_filters_pushdown(
+                &self,
+                filters: &[&dyn PhysicalExpr],
+            ) -> Vec<SQLFilterPushDown> {
+                vec![SQLFilterPushDown::Inexact; filters.len()]
+            }
+            fn execute(
+                &self,
+                q: &str,
+                s: SchemaRef,
+                f: &[Arc<dyn PhysicalExpr>],
+            ) -> Result<SendableRecordBatchStream> {
+                self.0.execute(q, s, f)
+            }
+            async fn table_names(&self) -> Result<Vec<String>> {
+                self.0.table_names().await
+            }
+            async fn get_table_schema(&self, t: &str) -> Result<SchemaRef> {
+                self.0.get_table_schema(t).await
+            }
+        }
+
+        let vp = make_vp_with_executor(TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        });
+        let vp2 = VirtualExecutionPlan {
+            executor: Arc::new(InexactExecutor(TestExecutor {
+                compute_context: "ctx".into(),
+                cannot_federate: None,
+            })),
+            ..vp
+        };
+        let result = run_pushdown(&vp2, 2);
+
+        assert!(
+            result.updated_node.is_some(),
+            "Inexact: node must be updated so filters reach execute()"
+        );
+        assert!(
+            result.filters.iter().all(|f| matches!(f, PushedDown::No)),
+            "Inexact: FilterExec must stay (PushedDown::No); got: {:?}",
+            result.filters
+        );
+        let updated = result.updated_node.unwrap();
+        let updated_vp = updated
+            .downcast_ref::<VirtualExecutionPlan>()
+            .unwrap();
+        assert_eq!(
+            updated_vp.filters.len(),
+            2,
+            "Inexact: both filters must be stored on the node for execute()"
+        );
     }
 }

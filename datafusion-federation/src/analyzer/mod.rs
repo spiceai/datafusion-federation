@@ -2,7 +2,7 @@ mod scan_result;
 
 use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProviderRef};
 use crate::{FederationAnalyzerForLogicalPlan, FederationProvider};
-use datafusion::logical_expr::{col, expr::InSubquery, LogicalPlanBuilder};
+use datafusion::logical_expr::{col, expr::Exists, expr::InSubquery, LogicalPlanBuilder};
 use datafusion::optimizer::optimize_unions::OptimizeUnions;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
@@ -35,6 +35,15 @@ impl AnalyzerRule for FederationAnalyzerRule {
     // TableScans from the same FederationProvider.
     // There 'largest sub-trees' are passed to their respective FederationProvider.optimizer.
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+        // DML plans must not be federated: the SQL unparser's dml_to_sql is
+        // unimplemented, and wrapping DML in a FederatedPlanNode hides the Dml
+        // node from write-permission validators (security bypass). Leave DML
+        // plans unwrapped so validators see them and DataFusion's physical
+        // planner can dispatch delete_from/update to the table provider.
+        if matches!(plan, LogicalPlan::Dml(_)) {
+            return Ok(plan);
+        }
+
         if !contains_federated_table(&plan)? {
             return Ok(plan);
         }
@@ -176,6 +185,13 @@ impl FederationAnalyzerRule {
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
+                Expr::Exists(ref exists) => {
+                    let plan_result =
+                        self.scan_plan_recursively(&exists.subquery.subquery, providers)?;
+
+                    sole_provider.merge(plan_result);
+                    Ok(sole_provider.check_recursion())
+                }
                 Expr::OuterReferenceColumn(_, ref col) => {
                     if let Some(table) = &col.relation {
                         if let Some(plan_result) = providers.get(table) {
@@ -275,7 +291,7 @@ impl FederationAnalyzerRule {
                     provider.analyzer(&federated_plan)
                 };
             match (is_root, provider_analyzer) {
-                (false, Some(_)) => {
+                (false, Some(FederationAnalyzerForLogicalPlan::With(_))) => {
                     // The largest sub-plan is higher up.
                     return Ok((None, ScanResult::Distinct(provider)));
                 }
@@ -454,6 +470,43 @@ impl FederationAnalyzerRule {
                     in_subquery.negated,
                 ))))
             }
+            Expr::Exists(ref exists) => {
+                let (new_subquery, _) = self.analyze_plan_recursively(
+                    &exists.subquery.subquery,
+                    true,
+                    _config,
+                    providers,
+                )?;
+                let Some(new_subquery) = new_subquery else {
+                    return Ok(Transformed::no(expr));
+                };
+
+                // DecorrelatePredicateSubquery optimizer rule doesn't support federated node
+                // (LogicalPlan::Extension(_)) as subquery.
+                // Wrap a no-op Projection outside the federated node to facilitate optimization.
+                if matches!(new_subquery, LogicalPlan::Extension(_)) {
+                    let all_columns = new_subquery
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| col(field.name()))
+                        .collect::<Vec<_>>();
+
+                    let projection_plan = LogicalPlanBuilder::from(new_subquery)
+                        .project(all_columns)?
+                        .build()?;
+
+                    return Ok(Transformed::yes(Expr::Exists(Exists {
+                        subquery: exists.subquery.with_plan(projection_plan.into()),
+                        negated: exists.negated,
+                    })));
+                }
+
+                Ok(Transformed::yes(Expr::Exists(Exists {
+                    subquery: exists.subquery.with_plan(new_subquery.into()),
+                    negated: exists.negated,
+                })))
+            }
             _ => Ok(Transformed::no(expr)),
         }
     }
@@ -486,6 +539,25 @@ fn get_plan_provider_recursively(
     let mut providers: HashMap<TableReference, Arc<dyn FederationProvider>> = HashMap::new();
 
     plan.apply_with_subqueries(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
+        // Register SubqueryAlias names (e.g. `lineitem l1`) so that OuterReferenceColumn resolved
+        // against the alias (e.g. `l1.l_orderkey`) can find the correct provider. Without this,
+        // correlated subqueries that reference an aliased outer table mark the scan as Ambiguous,
+        // breaking same-provider federation.
+        if let LogicalPlan::SubqueryAlias(subquery_alias) = p {
+            let alias_ref = TableReference::bare(subquery_alias.alias.table().to_string());
+            subquery_alias
+                .input
+                .apply(&mut |child| -> Result<TreeNodeRecursion> {
+                    if let (Some(provider), Some(table_reference)) = get_leaf_provider(child)? {
+                        providers.insert(alias_ref.clone(), Arc::clone(&provider));
+                        providers.insert(table_reference, provider);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+            return Ok(TreeNodeRecursion::Continue);
+        }
+
         if let (Some(federation_provider), Some(table_reference)) = get_leaf_provider(p)? {
             providers.insert(table_reference, federation_provider);
         }
@@ -551,6 +623,63 @@ fn get_leaf_provider(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::config::ConfigOptions;
+    use datafusion::logical_expr::{DmlStatement, EmptyRelation, WriteOp};
+    use datafusion::optimizer::analyzer::AnalyzerRule;
+    use datafusion::sql::TableReference;
+    use std::sync::Arc;
+
+    // Minimal TableSource needed to construct a DmlStatement.
+    #[derive(Debug)]
+    struct MockTableSource {
+        schema: SchemaRef,
+    }
+
+    impl MockTableSource {
+        fn new() -> Self {
+            Self {
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            }
+        }
+    }
+
+    impl datafusion::logical_expr::TableSource for MockTableSource {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    #[test]
+    fn dml_plan_is_returned_unchanged() {
+        let rule = FederationAnalyzerRule::new();
+        let config = ConfigOptions::default();
+
+        let empty = Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(datafusion::common::DFSchema::empty()),
+        }));
+        let source = Arc::new(MockTableSource::new());
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            TableReference::bare("t"),
+            source,
+            WriteOp::Delete,
+            empty,
+        ));
+
+        let result = rule.analyze(dml.clone(), &config).unwrap();
+
+        // The plan must come back as-is — Dml, not wrapped in a FederatedPlanNode.
+        assert!(
+            matches!(result, LogicalPlan::Dml(_)),
+            "expected Dml plan, got {result:?}"
+        );
+    }
+}
+
 #[allow(clippy::missing_errors_doc)]
 pub fn get_table_source(
     source: &Arc<dyn TableSource>,
@@ -559,10 +688,7 @@ pub fn get_table_source(
     let source = source_as_provider(source)?;
 
     // Get FederatedTableProviderAdaptor
-    let Some(wrapper) = source
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-    else {
+    let Some(wrapper) = source.downcast_ref::<FederatedTableProviderAdaptor>() else {
         return Ok(None);
     };
 

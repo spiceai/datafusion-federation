@@ -430,7 +430,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM (SELECT a FROM catalog.schema1.schema2.real_table) AS t1 JOIN other_catalog.other_schema1.other_schema2.real_table2 ON t1.a = other_catalog.other_schema1.other_schema2.real_table2.b"
+            "SELECT * FROM (SELECT a FROM catalog.schema1.schema2.real_table) t1 JOIN other_catalog.other_schema1.other_schema2.real_table2 ON t1.a = other_catalog.other_schema1.other_schema2.real_table2.b"
         );
     }
 
@@ -447,8 +447,8 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "SELECT * FROM catalog.schema1.schema2.real_table AS t1 WHERE EXISTS \
-            (SELECT 1 FROM other_catalog.other_schema1.other_schema2.real_table2 AS t2 WHERE t2.id = t1.id \
+            "SELECT * FROM catalog.schema1.schema2.real_table t1 WHERE EXISTS \
+            (SELECT 1 FROM other_catalog.other_schema1.other_schema2.real_table2 t2 WHERE t2.id = t1.id \
             AND t2.b > (SELECT MAX(a) FROM catalog.schema1.schema2.real_table WHERE catalog.schema1.schema2.real_table.group = t2.group))"
         );
     }
