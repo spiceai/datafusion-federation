@@ -503,7 +503,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
         // Only ever the remote engine's plan, and only while explaining. It is
         // display-only, and `with_new_children` below keeps it out of reach of
         // physical optimizer rules.
-        self.remote_plan.as_slice().iter().collect()
+        self.remote_plan.iter().collect()
     }
 
     fn with_new_children(
