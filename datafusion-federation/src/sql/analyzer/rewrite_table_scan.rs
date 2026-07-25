@@ -39,8 +39,7 @@ impl RewriteTableScanAnalyzer {
                         return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                     };
 
-                    let Some(sql_table_source) = (federated_source.as_ref()
-                        as &dyn std::any::Any)
+                    let Some(sql_table_source) = (federated_source.as_ref() as &dyn std::any::Any)
                         .downcast_ref::<SQLTableSource>()
                     else {
                         // Not a SQLTableSource (is this possible?)

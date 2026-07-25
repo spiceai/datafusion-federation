@@ -242,8 +242,17 @@ impl VirtualExecutionPlan {
     fn final_sql(&self) -> Result<String> {
         let sql = self.rewrite_plan_to_sql(self.plan.clone())?;
         match self.query_type {
-            Some(query_type) => Ok(format!("{} {sql}", query_type.prefix())),
-            None => Ok(sql),
+            // `EXPLAIN` is never executed remotely: DataFusion's `ExplainExec` only
+            // prints the plan, so the directive is carried into the displayed SQL for
+            // the user to run against the remote engine themselves.
+            Some(query_type @ FederatedQueryType::Explain) => {
+                Ok(format!("{} {sql}", query_type.prefix()))
+            }
+            // `EXPLAIN ANALYZE` *is* executed: `AnalyzeExec` drains this plan to
+            // collect metrics. Prefixing would make the remote return its own plan
+            // text, whose schema doesn't match what `SchemaCastScanExec` expects, so
+            // the query must be sent as-is and let DataFusion measure it.
+            Some(FederatedQueryType::Analyze) | None => Ok(sql),
         }
     }
 
@@ -346,7 +355,22 @@ fn apply_sql_query_rewriters(
 }
 
 impl DisplayAs for VirtualExecutionPlan {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        // `EXPLAIN FORMAT TREE` lays each node out in a narrow box and splits the
+        // text on newlines, so the single-line form below word-wraps into unreadable
+        // fragments. Emit one `key=value` per line instead, and only the SQL that is
+        // actually sent — the intermediate rewrites belong in the indent format.
+        if matches!(t, DisplayFormatType::TreeRender) {
+            writeln!(f, "name={}", self.executor.name())?;
+            if let Some(ctx) = self.executor.compute_context() {
+                writeln!(f, "compute_context={ctx}")?;
+            }
+            if let Ok(sql) = self.final_sql() {
+                writeln!(f, "sql={sql}")?;
+            }
+            return Ok(());
+        }
+
         write!(f, "VirtualExecutionPlan")?;
         write!(f, " name={}", self.executor.name())?;
         if let Some(ctx) = self.executor.compute_context() {
@@ -753,9 +777,7 @@ mod tests {
 
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
 
                 final_queries.push(node.final_sql()?);
             }
@@ -968,9 +990,7 @@ mod tests {
 
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
 
                 final_queries.push(node.final_sql()?);
             }
@@ -1034,7 +1054,8 @@ mod tests {
             "Expected a Federated node inside the Explain plan"
         );
 
-        let annotated_plan = crate::FederatedQueryPlanner::annotate_query_directives(&plan)?;
+        let annotated_plan = crate::FederatedQueryPlanner::annotate_query_directives(&plan)?
+            .expect("Explain root should be annotated");
         let LogicalPlan::Explain(ref annotated_explain) = annotated_plan else {
             panic!(
                 "Expected annotated Explain at root, got: {}",
@@ -1049,10 +1070,7 @@ mod tests {
         let mut final_queries = vec![];
         physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .as_any()
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
                 final_queries.push(node.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1061,7 +1079,7 @@ mod tests {
         assert_eq!(
             final_queries,
             vec![
-                "EXPLAIN SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) AS table_b1"
+                "EXPLAIN SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) table_b1"
                     .to_string()
             ]
         );
@@ -1087,7 +1105,7 @@ mod tests {
         let combined = explain_output.join("\n");
         assert!(
             combined.contains(
-                "rewritten_sql=EXPLAIN SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) AS table_b1"
+                "rewritten_sql=EXPLAIN SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) table_b1"
             ),
             "Expected EXPLAIN-prefixed rewritten SQL in output, got:\n{combined}",
         );
@@ -1095,8 +1113,10 @@ mod tests {
         Ok(())
     }
 
-    /// EXPLAIN ANALYZE keeps AnalyzeExec at the DataFusion level while the
-    /// federated child query preserves the EXPLAIN ANALYZE prefix in remote SQL.
+    /// EXPLAIN ANALYZE keeps AnalyzeExec at the DataFusion level. Because
+    /// AnalyzeExec executes the federated child to measure it, the remote SQL stays
+    /// un-prefixed: an `EXPLAIN ANALYZE` sent remotely would return the remote plan
+    /// text instead of the query's rows.
     #[tokio::test]
     async fn explain_analyze_federation_test() -> Result<(), DataFusionError> {
         let executor = TestExecutor {
@@ -1148,10 +1168,7 @@ mod tests {
         let mut final_queries = vec![];
         physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .as_any()
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
                 final_queries.push(node.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1159,10 +1176,7 @@ mod tests {
 
         assert_eq!(
             final_queries,
-            vec![
-                "EXPLAIN ANALYZE SELECT test_table.a, test_table.b, test_table.c FROM test_table"
-                    .to_string()
-            ]
+            vec!["SELECT test_table.a, test_table.b, test_table.c FROM test_table".to_string()]
         );
 
         Ok(())
@@ -1201,9 +1215,7 @@ mod tests {
         let mut final_queries = vec![];
         physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
                 final_queries.push(node.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1609,9 +1621,7 @@ mod tests {
                 has_filter_exec = true;
             }
             if node.name() == "sql_federation_exec" {
-                let vp = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let vp = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
                 federation_sqls.push(vp.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1648,7 +1658,12 @@ mod tests {
                 ),
             },
         );
-        VirtualExecutionPlan::new(plan, Arc::new(executor), Statistics::new_unknown(&schema))
+        VirtualExecutionPlan::new(
+            plan,
+            Arc::new(executor),
+            Statistics::new_unknown(&schema),
+            None,
+        )
     }
 
     fn make_child_result(n: usize) -> ChildPushdownResult {
@@ -1770,9 +1785,7 @@ mod tests {
         );
         // Filters must be stored on the updated node for execute().
         let updated = result.updated_node.unwrap();
-        let updated_vp = updated
-            .downcast_ref::<VirtualExecutionPlan>()
-            .unwrap();
+        let updated_vp = updated.downcast_ref::<VirtualExecutionPlan>().unwrap();
         assert_eq!(
             updated_vp.filters.len(),
             2,
@@ -1843,9 +1856,7 @@ mod tests {
             result.filters
         );
         let updated = result.updated_node.unwrap();
-        let updated_vp = updated
-            .downcast_ref::<VirtualExecutionPlan>()
-            .unwrap();
+        let updated_vp = updated.downcast_ref::<VirtualExecutionPlan>().unwrap();
         assert_eq!(
             updated_vp.filters.len(),
             2,

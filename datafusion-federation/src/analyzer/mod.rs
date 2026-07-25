@@ -95,9 +95,14 @@ impl FederationAnalyzerRule {
         self
     }
 
-    fn explain_context_template(plan: &LogicalPlan) -> Option<LogicalPlan> {
+    /// The `EXPLAIN`/`EXPLAIN ANALYZE` wrapper to re-apply around federated sub-plans.
+    ///
+    /// Held behind an [`Arc`] because it is threaded through the whole plan recursion:
+    /// cloning the wrapper itself for every node and expression would deep-copy the
+    /// plan repeatedly.
+    fn explain_context_template(plan: &LogicalPlan) -> Option<Arc<LogicalPlan>> {
         match plan {
-            LogicalPlan::Explain(_) | LogicalPlan::Analyze(_) => Some(plan.clone()),
+            LogicalPlan::Explain(_) | LogicalPlan::Analyze(_) => Some(Arc::new(plan.clone())),
             _ => None,
         }
     }
@@ -222,7 +227,7 @@ impl FederationAnalyzerRule {
         is_root: bool,
         config: &ConfigOptions,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
-        explain_context: Option<LogicalPlan>,
+        explain_context: Option<Arc<LogicalPlan>>,
     ) -> Result<(Option<LogicalPlan>, ScanResult)> {
         let explain_context = explain_context.or_else(|| Self::explain_context_template(plan));
         let mut sole_provider: ScanResult = ScanResult::None;
@@ -283,7 +288,8 @@ impl FederationAnalyzerRule {
             // Explain and Analyze wrappers stay in the DataFusion plan so their
             // physical operators can still run. The corresponding directive is
             // injected into the federated subquery instead.
-            let federated_plan = Self::wrap_federated_plan(plan.clone(), explain_context.as_ref())?;
+            let federated_plan =
+                Self::wrap_federated_plan(plan.clone(), explain_context.as_deref())?;
             let provider_analyzer =
                 if matches!(plan, LogicalPlan::Analyze(_) | LogicalPlan::Explain(_)) {
                     None
@@ -337,7 +343,7 @@ impl FederationAnalyzerRule {
 
                 let federated_input = Self::wrap_federated_plan(
                     wrap_projection(original_input.clone())?,
-                    explain_context.as_ref(),
+                    explain_context.as_deref(),
                 )?;
 
                 let Some(FederationAnalyzerForLogicalPlan::With(analyzer)) =
@@ -372,7 +378,7 @@ impl FederationAnalyzerRule {
         plan: &LogicalPlan,
         config: &ConfigOptions,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
-        explain_context: Option<LogicalPlan>,
+        explain_context: Option<Arc<LogicalPlan>>,
     ) -> Result<Vec<Expr>> {
         plan.expressions()
             .iter()
@@ -392,7 +398,7 @@ impl FederationAnalyzerRule {
         expr: Expr,
         _config: &ConfigOptions,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
-        explain_context: Option<LogicalPlan>,
+        explain_context: Option<Arc<LogicalPlan>>,
     ) -> Result<Transformed<Expr>> {
         match expr {
             Expr::ScalarSubquery(ref subquery) => {
@@ -476,6 +482,7 @@ impl FederationAnalyzerRule {
                     true,
                     _config,
                     providers,
+                    explain_context,
                 )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));

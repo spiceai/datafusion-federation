@@ -149,32 +149,29 @@ impl FederatedQueryPlanner {
         Ok(plan)
     }
 
-    pub(crate) fn annotate_query_directives(plan: &LogicalPlan) -> Result<LogicalPlan> {
-        match plan {
-            LogicalPlan::Explain(_) => {
-                let inputs = plan.inputs();
-                let [input] = inputs.as_slice() else {
-                    return Err(DataFusionError::Plan(
-                        "Explain plan must have exactly one input".into(),
-                    ));
-                };
-                let annotated_input =
-                    Self::annotate_query_type(input, FederatedQueryType::Explain)?;
-                plan.with_new_exprs(plan.expressions(), vec![annotated_input])
-            }
-            LogicalPlan::Analyze(_) => {
-                let inputs = plan.inputs();
-                let [input] = inputs.as_slice() else {
-                    return Err(DataFusionError::Plan(
-                        "Analyze plan must have exactly one input".into(),
-                    ));
-                };
-                let annotated_input =
-                    Self::annotate_query_type(input, FederatedQueryType::Analyze)?;
-                plan.with_new_exprs(plan.expressions(), vec![annotated_input])
-            }
-            _ => Ok(plan.clone()),
-        }
+    /// Annotates federated nodes below an `EXPLAIN`/`EXPLAIN ANALYZE` root with the
+    /// directive that wrapped them.
+    ///
+    /// Returns `None` when `plan` is neither, so callers can keep using the original
+    /// plan instead of paying for a copy on every query.
+    pub(crate) fn annotate_query_directives(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+        let query_type = match plan {
+            LogicalPlan::Explain(_) => FederatedQueryType::Explain,
+            LogicalPlan::Analyze(_) => FederatedQueryType::Analyze,
+            _ => return Ok(None),
+        };
+
+        let inputs = plan.inputs();
+        let [input] = inputs.as_slice() else {
+            return Err(DataFusionError::Plan(format!(
+                "{} plan must have exactly one input",
+                query_type.prefix()
+            )));
+        };
+        let annotated_input = Self::annotate_query_type(input, query_type)?;
+
+        plan.with_new_exprs(plan.expressions(), vec![annotated_input])
+            .map(Some)
     }
 }
 
@@ -185,14 +182,15 @@ impl QueryPlanner for FederatedQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let logical_plan = Self::annotate_query_directives(logical_plan)?;
+        let annotated = Self::annotate_query_directives(logical_plan)?;
+        let logical_plan = annotated.as_ref().unwrap_or(logical_plan);
 
         let physical_planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![
                 Arc::new(FederatedPlanner::new()),
             ]);
         physical_planner
-            .create_physical_plan(&logical_plan, session_state)
+            .create_physical_plan(logical_plan, session_state)
             .await
     }
 }

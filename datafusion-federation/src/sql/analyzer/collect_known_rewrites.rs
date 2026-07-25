@@ -19,8 +19,7 @@ pub fn collect_known_rewrites(
         if let LogicalPlan::TableScan(table_scan) = plan {
             let original_table_name = table_scan.table_name.clone();
             if let Some(federated_source) = get_table_source(&table_scan.source)? {
-                if let Some(sql_table_source) = (federated_source.as_ref()
-                    as &dyn std::any::Any)
+                if let Some(sql_table_source) = (federated_source.as_ref() as &dyn std::any::Any)
                     .downcast_ref::<SQLTableSource>()
                 {
                     known_rewrites.insert(original_table_name, sql_table_source.table_reference());
