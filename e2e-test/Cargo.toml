@@ -1,0 +1,18 @@
+[package]
+name = "federation-e2e-tests"
+description = "End-to-end federation tests against real remote SQL engines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+
+[dependencies]
+datafusion-federation = { workspace = true, features = ["sql"] }
+datafusion = { workspace = true }
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+# `bundled` compiles DuckDB from source so the tests need no system libduckdb.
+duckdb = { version = "1.10503", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
