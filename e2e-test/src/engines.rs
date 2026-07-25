@@ -7,14 +7,17 @@ use async_trait::async_trait;
 use datafusion::sql::unparser::dialect::DuckDBDialect;
 use datafusion::{
     arrow::{
-        array::{ArrayRef, Float64Builder, Int64Builder, RecordBatch, StringBuilder},
+        array::{
+            Array, ArrayRef, Float64Builder, Int64Builder, RecordBatch, StringArray, StringBuilder,
+        },
         datatypes::{DataType, Field, Schema, SchemaRef},
     },
     error::{DataFusionError, Result},
     physical_plan::{stream::RecordBatchStreamAdapter, PhysicalExpr, SendableRecordBatchStream},
     sql::unparser::dialect::{Dialect, SqliteDialect},
 };
-use datafusion_federation::sql::SQLExecutor;
+use datafusion_federation::sql::{RemotePlanNode, SQLExecutor};
+use datafusion_federation::FederatedQueryType;
 
 use crate::{FIXTURE_ROWS, TABLE};
 
@@ -100,6 +103,108 @@ impl SQLExecutor for DuckDbExecutor {
     async fn get_table_schema(&self, table_name: &str) -> Result<SchemaRef> {
         let (schema, _) = self.query(&format!("SELECT * FROM {table_name} LIMIT 0"))?;
         Ok(schema)
+    }
+
+    /// DuckDB renders its default `EXPLAIN` as box-drawing art, which is not worth
+    /// parsing. `FORMAT JSON` reports the same plan as a tree of
+    /// `{name, extra_info, children}`, and under `ANALYZE` a query profile whose
+    /// operators additionally carry measured timings and row counts.
+    async fn explain_plan(
+        &self,
+        query: &str,
+        query_type: FederatedQueryType,
+    ) -> Result<Option<RemotePlanNode>> {
+        let statement = match query_type {
+            FederatedQueryType::Explain => format!("EXPLAIN (FORMAT JSON) {query}"),
+            FederatedQueryType::Analyze => format!("EXPLAIN (ANALYZE, FORMAT JSON) {query}"),
+        };
+
+        let (_, batches) = self.query(&statement)?;
+        let Some(json) = last_column_text(&batches) else {
+            return Ok(None);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| remote_err("duckdb", e))?;
+
+        Ok(match query_type {
+            // `EXPLAIN` yields an array holding the root operator.
+            FederatedQueryType::Explain => value
+                .as_array()
+                .and_then(|nodes| nodes.first())
+                .map(duckdb_node),
+            // `ANALYZE` yields the query profile; its single child is the
+            // `EXPLAIN_ANALYZE` operator wrapping the plan we asked about, which is an
+            // artifact of the statement rather than part of the query.
+            FederatedQueryType::Analyze => value
+                .get("children")
+                .and_then(|c| c.as_array())
+                .and_then(|nodes| nodes.first())
+                .and_then(|explain_analyze| {
+                    explain_analyze
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .and_then(|nodes| nodes.first())
+                })
+                .map(duckdb_node),
+        })
+    }
+}
+
+/// The text of the last column of `batches`, concatenated. Both DuckDB explain
+/// shapes put the payload there.
+fn last_column_text(batches: &[RecordBatch]) -> Option<String> {
+    let mut out = String::new();
+    for batch in batches {
+        let column = batch.column(batch.num_columns().checked_sub(1)?);
+        let values = column.as_any().downcast_ref::<StringArray>()?;
+        for index in 0..values.len() {
+            out.push_str(values.value(index));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Converts one DuckDB plan node, and everything below it, to a [`RemotePlanNode`].
+fn duckdb_node(value: &serde_json::Value) -> RemotePlanNode {
+    // `EXPLAIN` names the operator `name`; the `ANALYZE` profile uses
+    // `operator_name` and adds measured columns beside it.
+    let name = value
+        .get("operator_name")
+        .or_else(|| value.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("UNKNOWN");
+
+    let mut node = RemotePlanNode::new(name)
+        .with_detail("rows", json_scalar(value.get("operator_cardinality")))
+        .with_detail("timing", json_scalar(value.get("operator_timing")));
+
+    if let Some(extra) = value.get("extra_info").and_then(|e| e.as_object()) {
+        for (key, detail) in extra {
+            node = node.with_detail(key.to_lowercase(), json_scalar(Some(detail)));
+        }
+    }
+
+    node.with_children(
+        value
+            .get("children")
+            .and_then(|c| c.as_array())
+            .map(|children| children.iter().map(duckdb_node).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    )
+}
+
+/// Renders a JSON value as a single line. Arrays become comma-separated so a
+/// multi-column projection stays on one detail line.
+fn json_scalar(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| json_scalar(Some(item)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(other) => other.to_string(),
     }
 }
 
@@ -218,6 +323,74 @@ impl SQLExecutor for SqliteExecutor {
 
         Ok(Arc::new(Schema::new(fields)))
     }
+
+    /// SQLite has no `EXPLAIN ANALYZE`; `EXPLAIN` alone returns VDBE opcodes, which
+    /// describe the bytecode rather than the plan. `EXPLAIN QUERY PLAN` is the useful
+    /// one: `(id, parent, notused, detail)` rows forming a tree by parent pointer, so
+    /// both directives report the same estimated plan with no timings.
+    async fn explain_plan(
+        &self,
+        query: &str,
+        _query_type: FederatedQueryType,
+    ) -> Result<Option<RemotePlanNode>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .map_err(|e| remote_err("sqlite", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| remote_err("sqlite", e))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| remote_err("sqlite", e))?;
+
+        Ok(sqlite_tree(&rows, 0).into_iter().next())
+    }
+}
+
+/// Builds the children of `parent` from SQLite's `(id, parent, detail)` rows.
+///
+/// The first word of `detail` is the operator (`SCAN`, `SEARCH`, `USE TEMP B-TREE`),
+/// which reads well as a node name; the remainder is what it applies to.
+fn sqlite_tree(rows: &[(i64, i64, String)], parent: i64) -> Vec<RemotePlanNode> {
+    rows.iter()
+        .filter(|(_, row_parent, _)| *row_parent == parent)
+        .map(|(id, _, detail)| {
+            let (operator, rest) = split_sqlite_detail(detail);
+            RemotePlanNode::new(operator)
+                .with_detail("detail", rest)
+                .with_children(sqlite_tree(rows, *id))
+        })
+        .collect()
+}
+
+/// Splits `SCAN measurements` into `("SCAN", "measurements")`. SQLite's multi-word
+/// operators are upper-case, so the split takes every leading upper-case word.
+fn split_sqlite_detail(detail: &str) -> (String, String) {
+    let mut operator = Vec::new();
+    let mut rest = Vec::new();
+
+    for word in detail.split_whitespace() {
+        let still_operator = rest.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '-' || c.is_ascii_digit());
+        if still_operator {
+            operator.push(word);
+        } else {
+            rest.push(word);
+        }
+    }
+
+    if operator.is_empty() {
+        return (detail.to_string(), String::new());
+    }
+    (operator.join(" "), rest.join(" "))
 }
 
 /// The Arrow types these tests need from SQLite's dynamically typed rows.

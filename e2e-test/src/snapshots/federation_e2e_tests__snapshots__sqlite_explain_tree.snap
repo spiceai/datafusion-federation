@@ -2,37 +2,35 @@
 source: e2e-test/src/snapshots.rs
 description: "EXPLAIN FORMAT TREE SELECT id, name FROM measurements WHERE id > 1 ORDER BY id"
 ---
-+---------------+-------------------------------+
-| plan_type     | plan                          |
-+---------------+-------------------------------+
-| physical_plan | ┌───────────────────────────┐ |
-|               | │     SchemaCastScanExec    │ |
-|               | │    --------------------   │ |
-|               | │     SchemaCastScanExec    │ |
-|               | └─────────────┬─────────────┘ |
-|               | ┌─────────────┴─────────────┐ |
-|               | │      CooperativeExec      │ |
-|               | │    --------------------   │ |
-|               | │      CooperativeExec      │ |
-|               | └─────────────┬─────────────┘ |
-|               | ┌─────────────┴─────────────┐ |
-|               | │    sql_federation_exec    │ |
-|               | │    --------------------   │ |
-|               | │      compute_context:     │ |
-|               | │         sqlite_e2e        │ |
-|               | │                           │ |
-|               | │      name: sqlite_e2e     │ |
-|               | │                           │ |
-|               | │            sql:           │ |
-|               | │      EXPLAIN SELECT       │ |
-|               | │       `measurements`      │ |
-|               | │   .`id`, `measurements`.  │ |
-|               | │        `name` FROM        │ |
-|               | │       `measurements`      │ |
-|               | │   WHERE (`measurements`.  │ |
-|               | │    `id` > 1) ORDER BY     │ |
-|               | │    `measurements`.`id`    │ |
-|               | │       ASC NULLS LAST      │ |
-|               | └───────────────────────────┘ |
-|               |                               |
-+---------------+-------------------------------+
+┌───────────────────────────┐
+│     SchemaCastScanExec    │
+│    --------------------   │
+│     SchemaCastScanExec    │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│      CooperativeExec      │
+│    --------------------   │
+│      CooperativeExec      │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│    sql_federation_exec    │
+│    --------------------   │
+│      compute_context:     │
+│         sqlite_e2e        │
+│                           │
+│      name: sqlite_e2e     │
+│                           │
+│            sql:           │
+│ SELECT `measurements`.`id`│
+│  , `measurements`.`name`  │
+│     FROM `measurements`   │
+│    WHERE (`measurements`  │
+│    .`id` > 1) ORDER BY    │
+│    `measurements`.`id`    │
+│       ASC NULLS LAST      │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│            SCAN           │
+│    --------------------   │
+│    detail: measurements   │
+└───────────────────────────┘

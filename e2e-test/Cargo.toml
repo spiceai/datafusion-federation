@@ -31,3 +31,4 @@ futures.workspace = true
 tokio.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 insta = { version = "1.42.0", features = ["filters"] }
+serde_json = "1"

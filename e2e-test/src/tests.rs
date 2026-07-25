@@ -33,12 +33,27 @@ fn assert_reconstructs_logical_tree(output: &str, engine: &str, format: &str) {
     }
 }
 
-/// The physical side: the federation node, and the SQL that carries the remote
-/// sub-plan across the boundary. `node` differs by format — the indent format
-/// prints the `DisplayAs` string, the tree format labels boxes by `name()`.
+/// Operators the remote engine reports for [`QUERY`], which the federation layer
+/// runs its EXPLAIN to obtain and grafts below the federated node. DuckDB names its
+/// scan `SEQ_SCAN`; SQLite's `EXPLAIN QUERY PLAN` says `SCAN`.
+fn remote_operators(engine: &str) -> &'static [&'static str] {
+    match engine {
+        "duckdb" => &["SEQ_SCAN", "ORDER_BY"],
+        "sqlite" => &["SCAN"],
+        other => panic!("no expected remote operators for {other}"),
+    }
+}
+
+/// The physical side: the federation node, the SQL that crosses the boundary, and
+/// the remote engine's own operators grafted underneath. `node` differs by format —
+/// the indent format prints the `DisplayAs` string, the tree format labels boxes by
+/// `name()`.
 fn assert_reconstructs_physical_tree(output: &str, engine: &str, format: &str, node: &str) {
     for needle in ["SchemaCastScanExec", node, TABLE] {
         assert_contains(output, engine, format, needle);
+    }
+    for operator in remote_operators(engine) {
+        assert_contains(output, engine, format, operator);
     }
 }
 
@@ -59,24 +74,26 @@ async fn assert_query_federates(ctx: &SessionContext, engine: &str) -> Result<()
     Ok(())
 }
 
-/// `EXPLAIN` is never executed remotely — `ExplainExec` only prints the plan — so
-/// the remote SQL carries the directive for the user to run themselves.
+/// A federated `EXPLAIN` runs the remote engine's own EXPLAIN and grafts the
+/// operators it reports below the federated node, so the plan spans both sides of
+/// the boundary. The SQL sent for the query itself is never rewritten.
 async fn assert_explain(ctx: &SessionContext, engine: &str) -> Result<()> {
     let output = run(ctx, &format!("EXPLAIN {QUERY}")).await?;
 
     assert_reconstructs_logical_tree(&output, engine, "indent");
     assert_reconstructs_physical_tree(&output, engine, "indent", "VirtualExecutionPlan");
     assert!(
-        output.contains("EXPLAIN SELECT"),
-        "[{engine}/indent] expected EXPLAIN-prefixed remote SQL:\n{output}"
+        !output.contains("EXPLAIN SELECT"),
+        "[{engine}/indent] the query SQL must not carry the directive:\n{output}"
     );
 
     Ok(())
 }
 
-/// `EXPLAIN ANALYZE` *is* executed: `AnalyzeExec` drains the federated child to
-/// measure it. The remote SQL must stay un-prefixed, or the remote returns its own
-/// plan text — a different schema than `SchemaCastScanExec` expects.
+/// `EXPLAIN ANALYZE` executes the federated child so `AnalyzeExec` can measure it,
+/// and separately asks the remote for its measured plan. The query SQL stays
+/// un-prefixed either way — a remote `EXPLAIN ANALYZE` returns plan text, whose
+/// schema is not what `SchemaCastScanExec` expects.
 async fn assert_explain_analyze(ctx: &SessionContext, engine: &str) -> Result<()> {
     let output = run(ctx, &format!("EXPLAIN ANALYZE {QUERY}")).await?;
 
@@ -106,6 +123,10 @@ async fn assert_explain_format_tree(ctx: &SessionContext, engine: &str) -> Resul
     assert!(
         !output.contains("base_sql"),
         "[{engine}/tree] the tree format should show only the SQL that is sent:\n{output}"
+    );
+    assert!(
+        !output.contains("CooperativeExec") || output.contains("sql_federation_exec"),
+        "[{engine}/tree] federation node missing:\n{output}"
     );
 
     Ok(())

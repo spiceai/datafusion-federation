@@ -11,7 +11,7 @@
 
 #[cfg(feature = "duckdb")]
 use crate::duckdb_ctx;
-use crate::{run, sqlite_ctx, QUERY};
+use crate::{plan_text, sqlite_ctx, QUERY};
 use datafusion::{error::Result, execution::context::SessionContext};
 
 /// Redactions for the parts of `EXPLAIN ANALYZE` output that are timing- and
@@ -26,11 +26,14 @@ const METRIC_FILTERS: &[(&str, &str)] = &[
     (r"output_bytes=[0-9.]+ [A-Za-z]+", "output_bytes=[BYTES]"),
     // Any remaining bare duration metric, e.g. fetch_time=…, repartition_time=…
     (r"_time=[0-9.]+(ns|µs|ms|s)", "_time=[TIME]"),
+    // Per-operator timings the remote engine measured, reported in its own units —
+    // DuckDB uses fractional seconds, e.g. timing=4.459e-6, timing=0.000095834.
+    (r"timing=[0-9.]+(e-?[0-9]+)?", "timing=[TIME]"),
 ];
 
 /// Renders `sql` against `ctx` and snapshots it under `name`.
 async fn assert_plan_snapshot(ctx: &SessionContext, name: &str, sql: &str) -> Result<()> {
-    let plan = run(ctx, sql).await?;
+    let plan = plan_text(ctx, sql).await?;
 
     insta::with_settings!({
         description => sql.to_string(),

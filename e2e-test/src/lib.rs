@@ -22,9 +22,12 @@ mod tests;
 use std::sync::Arc;
 
 use datafusion::{
-    arrow::util::pretty::pretty_format_batches,
+    arrow::{
+        array::{Array, StringArray},
+        util::pretty::pretty_format_batches,
+    },
     catalog::SchemaProvider,
-    error::Result,
+    error::{DataFusionError, Result},
     execution::context::{SessionContext, SessionState},
 };
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLSchemaProvider};
@@ -77,8 +80,37 @@ pub async fn sqlite_ctx() -> Result<SessionContext> {
     federated_context(Arc::new(SqliteExecutor::new()?)).await
 }
 
-/// Runs `sql` to completion and renders the result as text.
+/// Runs `sql` to completion and renders the result as a text table.
 pub async fn run(ctx: &SessionContext, sql: &str) -> Result<String> {
     let batches = ctx.sql(sql).await?.collect().await?;
     Ok(pretty_format_batches(&batches)?.to_string())
+}
+
+/// Runs an `EXPLAIN` and returns just the plan column.
+///
+/// Deliberately not the `pretty_format_batches` table: that pads every row to the
+/// widest cell, so a value of a different length — a remote operator timing, say —
+/// shifts the whole table even when the plan is unchanged. The plan text on its own
+/// is both stable and far easier to read in a snapshot.
+pub async fn plan_text(ctx: &SessionContext, sql: &str) -> Result<String> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+
+    let mut lines = Vec::new();
+    for batch in &batches {
+        let column = batch.column(batch.num_columns() - 1);
+        let plans = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "expected the plan column of `{sql}` to be Utf8, got {}",
+                    column.data_type()
+                ))
+            })?;
+        for index in 0..plans.len() {
+            lines.push(plans.value(index).to_string());
+        }
+    }
+
+    Ok(lines.join("\n"))
 }

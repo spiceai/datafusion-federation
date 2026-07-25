@@ -11,6 +11,8 @@ use datafusion::{
 use std::sync::Arc;
 
 use super::ast_analyzer::AstAnalyzer;
+use super::remote_plan::RemotePlanNode;
+use crate::FederatedQueryType;
 
 pub type SQLExecutorRef = Arc<dyn SQLExecutor>;
 
@@ -109,6 +111,33 @@ pub trait SQLExecutor: Sync + Send {
     /// trait.
     async fn statistics(&self, plan: &LogicalPlan) -> Result<Statistics> {
         Ok(Statistics::new_unknown(plan.schema().as_arrow()))
+    }
+
+    /// Returns the remote engine's own plan for `query`, so an `EXPLAIN` of a
+    /// federated query does not stop at the federation boundary.
+    ///
+    /// Called once during physical planning when the query is being explained. The
+    /// implementation runs whatever statement its engine uses to report a plan —
+    /// `EXPLAIN (FORMAT JSON)`, `EXPLAIN QUERY PLAN`, … — and parses the result into
+    /// [`RemotePlanNode`]s, which are attached below the federated node and rendered
+    /// by every `EXPLAIN` format. `query_type` says which directive the user wrote,
+    /// so an engine that can report measured timings for
+    /// [`Analyze`](FederatedQueryType::Analyze) may do so.
+    ///
+    /// This is display-only: the rows for the query itself still come from
+    /// [`Self::execute`], which is always given `query` unchanged. Returning
+    /// `Ok(None)` — the default — leaves the plan showing the federation node as a
+    /// leaf, which is the behaviour of any executor that does not implement this.
+    ///
+    /// Errors propagate and fail the `EXPLAIN`, so an executor that cannot reach its
+    /// remote, or gets output it does not recognise, should prefer `Ok(None)`.
+    async fn explain_plan(
+        &self,
+        query: &str,
+        query_type: FederatedQueryType,
+    ) -> Result<Option<RemotePlanNode>> {
+        let _ = (query, query_type);
+        Ok(None)
     }
 
     /// Returns the tables provided by the remote

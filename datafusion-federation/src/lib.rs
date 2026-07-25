@@ -20,6 +20,7 @@ use datafusion::{
         },
         Analyzer, AnalyzerRule,
     },
+    physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule},
 };
 
 pub use analyzer::{get_table_source, FederationAnalyzerRule};
@@ -35,7 +36,27 @@ pub fn default_session_state() -> SessionState {
         .with_analyzer_rules(rules)
         .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
         .with_default_features()
+        .with_physical_optimizer_rules(default_physical_optimizer_rules())
         .build()
+}
+
+/// DataFusion's default physical optimizer rules, plus the federation rule that
+/// grafts a remote engine's own plan into an explained query.
+///
+/// The federation rule must come last: it turns the federated node from a leaf into a
+/// parent, and rules like `EnsureCooperative` and `EnforceDistribution` decide what to
+/// insert based on which nodes are leaves.
+#[cfg(feature = "sql")]
+pub fn default_physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    let mut rules = PhysicalOptimizer::default().rules;
+    rules.push(Arc::new(crate::sql::AttachRemotePlans::new()));
+    rules
+}
+
+/// DataFusion's default physical optimizer rules.
+#[cfg(not(feature = "sql"))]
+pub fn default_physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    PhysicalOptimizer::default().rules
 }
 
 /// datafusion-federation customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
