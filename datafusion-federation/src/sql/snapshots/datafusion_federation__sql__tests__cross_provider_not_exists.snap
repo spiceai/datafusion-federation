@@ -1,6 +1,5 @@
 ---
 source: datafusion-federation/src/sql/mod.rs
-assertion_line: 1241
 expression: "explain_query(&ctx,\n\"SELECT o_orderkey FROM orders WHERE NOT EXISTS \\\n                 (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey)\",).await"
 ---
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

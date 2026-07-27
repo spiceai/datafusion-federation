@@ -55,8 +55,9 @@ impl AnalyzerRule for FederationAnalyzerRule {
 
         // Find all federation providers for TableReferences that appear in the plan, to resolve OuterRefColumns
         let providers = get_plan_provider_recursively(&plan)?;
+        let explain_context = Self::explain_context_template(&plan);
 
-        match self.analyze_plan_recursively(&plan, true, config, &providers)? {
+        match self.analyze_plan_recursively(&plan, true, config, &providers, explain_context)? {
             (Some(optimized_plan), _) => Ok(optimized_plan),
             (None, _) => Ok(plan),
         }
@@ -92,6 +93,32 @@ impl FederationAnalyzerRule {
     pub fn with_optimizer(mut self, optimizer: Optimizer) -> Self {
         self.optimizer = optimizer;
         self
+    }
+
+    /// The `EXPLAIN`/`EXPLAIN ANALYZE` wrapper to re-apply around federated sub-plans.
+    ///
+    /// Held behind an [`Arc`] because it is threaded through the whole plan recursion:
+    /// cloning the wrapper itself for every node and expression would deep-copy the
+    /// plan repeatedly.
+    fn explain_context_template(plan: &LogicalPlan) -> Option<Arc<LogicalPlan>> {
+        match plan {
+            LogicalPlan::Explain(_) | LogicalPlan::Analyze(_) => Some(Arc::new(plan.clone())),
+            _ => None,
+        }
+    }
+
+    fn wrap_federated_plan(
+        plan: LogicalPlan,
+        explain_context: Option<&LogicalPlan>,
+    ) -> Result<LogicalPlan> {
+        if matches!(plan, LogicalPlan::Explain(_) | LogicalPlan::Analyze(_)) {
+            return Ok(plan);
+        }
+
+        match explain_context {
+            Some(wrapper) => wrapper.with_new_exprs(wrapper.expressions(), vec![plan]),
+            None => Ok(plan),
+        }
     }
 
     /// Scans a plan to see if it belongs to a single [`FederationProvider`].
@@ -200,7 +227,9 @@ impl FederationAnalyzerRule {
         is_root: bool,
         config: &ConfigOptions,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+        explain_context: Option<Arc<LogicalPlan>>,
     ) -> Result<(Option<LogicalPlan>, ScanResult)> {
+        let explain_context = explain_context.or_else(|| Self::explain_context_template(plan));
         let mut sole_provider: ScanResult = ScanResult::None;
 
         if let LogicalPlan::Extension(Extension { ref node }) = plan {
@@ -233,7 +262,9 @@ impl FederationAnalyzerRule {
         // Recursively analyze inputs
         let input_results = inputs
             .iter()
-            .map(|i| self.analyze_plan_recursively(i, false, config, providers))
+            .map(|i| {
+                self.analyze_plan_recursively(i, false, config, providers, explain_context.clone())
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Aggregate the input providers
@@ -254,15 +285,20 @@ impl FederationAnalyzerRule {
 
         // If all sources are federated to the same provider
         if let ScanResult::Distinct(provider) = sole_provider {
-            // Analyze plans (EXPLAIN ANALYZE) cannot be converted to SQL by the
-            // Unparser, so they must not be federated as a whole. Only the inner
-            // query should be federated; DataFusion's AnalyzeExec will handle
-            // executing it and collecting metrics.
-            let provider_analyzer = if matches!(plan, LogicalPlan::Analyze(_)) {
-                None
-            } else {
-                provider.analyzer(plan)
-            };
+            // Explain and Analyze wrappers stay in the DataFusion plan so their
+            // physical operators can still run. The corresponding directive is
+            // injected into the federated subquery instead.
+            let federated_plan =
+                Self::wrap_federated_plan(plan.clone(), explain_context.as_deref())?;
+            let provider_analyzer =
+                if matches!(plan, LogicalPlan::Analyze(_) | LogicalPlan::Explain(_)) {
+                    None
+                } else {
+                    // Ask about the query itself, not the EXPLAIN wrapper: an executor
+                    // whose can_execute_plan rejects Explain/Analyze would otherwise
+                    // refuse to federate a query it can perfectly well run.
+                    provider.analyzer(plan)
+                };
             match (is_root, provider_analyzer) {
                 (false, Some(FederationAnalyzerForLogicalPlan::With(_))) => {
                     // The largest sub-plan is higher up.
@@ -270,7 +306,8 @@ impl FederationAnalyzerRule {
                 }
                 (true, Some(FederationAnalyzerForLogicalPlan::With(analyzer))) => {
                     // If this is the root plan node; federate the entire plan
-                    let optimized = analyzer.execute_and_check(plan.clone(), config, |_, _| {})?;
+                    let optimized =
+                        analyzer.execute_and_check(federated_plan, config, |_, _| {})?;
                     return Ok((Some(optimized), ScanResult::None));
                 }
                 (_, None | Some(FederationAnalyzerForLogicalPlan::Unable)) => {
@@ -307,22 +344,29 @@ impl FederationAnalyzerRule {
                     return Ok(original_input);
                 };
 
+                let projected_input = wrap_projection(original_input.clone())?;
+
+                // Ask about the query itself rather than the EXPLAIN wrapper applied
+                // below, so an executor that rejects Explain/Analyze in
+                // can_execute_plan still federates the query it wraps.
                 let Some(FederationAnalyzerForLogicalPlan::With(analyzer)) =
-                    provider.analyzer(&original_input)
+                    provider.analyzer(&projected_input)
                 else {
                     // Either provider has no analyzer, or cannot federate [`LogicalPlan`].
                     return Ok(original_input);
                 };
 
+                let federated_input =
+                    Self::wrap_federated_plan(projected_input, explain_context.as_deref())?;
+
                 // Replace the input with the federated counterpart
-                let wrapped = wrap_projection(original_input)?;
-                analyzer.execute_and_check(wrapped, config, |_, _| {})
+                analyzer.execute_and_check(federated_input, config, |_, _| {})
             })
             .collect::<Result<Vec<_>>>()?;
 
         // Optimize expressions if needed
         let new_expressions = if optimize_expressions {
-            self.analyze_plan_exprs(plan, config, providers)?
+            self.analyze_plan_exprs(plan, config, providers, explain_context)?
         } else {
             plan.expressions()
         };
@@ -340,13 +384,14 @@ impl FederationAnalyzerRule {
         plan: &LogicalPlan,
         config: &ConfigOptions,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+        explain_context: Option<Arc<LogicalPlan>>,
     ) -> Result<Vec<Expr>> {
         plan.expressions()
             .iter()
             .map(|expr| {
-                let transformed = expr
-                    .clone()
-                    .transform(&|e| self.analyze_expr_recursively(e, config, providers))?;
+                let transformed = expr.clone().transform(&|e| {
+                    self.analyze_expr_recursively(e, config, providers, explain_context.clone())
+                })?;
                 Ok(transformed.data)
             })
             .collect::<Result<Vec<_>>>()
@@ -359,12 +404,18 @@ impl FederationAnalyzerRule {
         expr: Expr,
         _config: &ConfigOptions,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+        explain_context: Option<Arc<LogicalPlan>>,
     ) -> Result<Transformed<Expr>> {
         match expr {
             Expr::ScalarSubquery(ref subquery) => {
                 // Analyze as root to force federating the sub-query
-                let (new_subquery, _) =
-                    self.analyze_plan_recursively(&subquery.subquery, true, _config, providers)?;
+                let (new_subquery, _) = self.analyze_plan_recursively(
+                    &subquery.subquery,
+                    true,
+                    _config,
+                    providers,
+                    explain_context.clone(),
+                )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
                 };
@@ -398,6 +449,7 @@ impl FederationAnalyzerRule {
                     true,
                     _config,
                     providers,
+                    explain_context,
                 )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
@@ -436,6 +488,7 @@ impl FederationAnalyzerRule {
                     true,
                     _config,
                     providers,
+                    explain_context,
                 )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));

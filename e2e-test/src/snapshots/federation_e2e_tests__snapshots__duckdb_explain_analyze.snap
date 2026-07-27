@@ -1,0 +1,11 @@
+---
+source: e2e-test/src/snapshots.rs
+description: "EXPLAIN ANALYZE SELECT id, name FROM measurements WHERE id > 1 ORDER BY id"
+---
+SchemaCastScanExec, metrics=[output_rows=2, elapsed_compute=[TIME], output_bytes=[BYTES], output_batches=0]
+  CooperativeExec, metrics=[]
+    VirtualExecutionPlan name=duckdb_e2e compute_context=duckdb_e2e base_sql=SELECT "measurements"."id", "measurements"."name" FROM "measurements" WHERE ("measurements"."id" > 1) ORDER BY "measurements"."id" ASC NULLS LAST, metrics=[]
+      RemotePlan: PROJECTION rows=2 timing=[TIME] estimated cardinality=0 projections=__internal_decompress_integral_bigint(#0, 1), __internal_decompress_string(#1), metrics=[]
+        RemotePlan: ORDER_BY rows=2 timing=[TIME] order by=memory.main.measurements.id ASC, metrics=[]
+          RemotePlan: PROJECTION rows=2 timing=[TIME] estimated cardinality=1 projections=__internal_compress_integral_utinyint(#0, 1), __internal_compress_string_ubigint(#1), metrics=[]
+            RemotePlan: SEQ_SCAN rows=2 timing=[TIME] estimated cardinality=1 filters=id>1 projections=id, name table=memory.main.measurements type=Sequential Scan, metrics=[]

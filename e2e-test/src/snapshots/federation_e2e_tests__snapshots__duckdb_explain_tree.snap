@@ -1,0 +1,76 @@
+---
+source: e2e-test/src/snapshots.rs
+description: "EXPLAIN FORMAT TREE SELECT id, name FROM measurements WHERE id > 1 ORDER BY id"
+---
+┌───────────────────────────┐
+│     SchemaCastScanExec    │
+│    --------------------   │
+│     SchemaCastScanExec    │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│      CooperativeExec      │
+│    --------------------   │
+│      CooperativeExec      │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│    sql_federation_exec    │
+│    --------------------   │
+│      compute_context:     │
+│         duckdb_e2e        │
+│                           │
+│      name: duckdb_e2e     │
+│                           │
+│            sql:           │
+│ SELECT "measurements"."id"│
+│  , "measurements"."name"  │
+│     FROM "measurements"   │
+│    WHERE ("measurements"  │
+│    ."id" > 1) ORDER BY    │
+│    "measurements"."id"    │
+│       ASC NULLS LAST      │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│         PROJECTION        │
+│    --------------------   │
+│   estimated cardinality:  │
+│             0             │
+│                           │
+│        projections:       │
+│__internal_decompress_integ│
+│     ral_bigint(#0, 1),    │
+│      __internal_decomp    │
+│      ress_string(#1)      │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│          ORDER_BY         │
+│    --------------------   │
+│         order by:         │
+│  memory.main.measurements │
+│          .id ASC          │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│         PROJECTION        │
+│    --------------------   │
+│   estimated cardinality:  │
+│             1             │
+│                           │
+│        projections:       │
+│__internal_compress_integra│
+│     l_utinyint(#0, 1),    │
+│      __internal_compre    │
+│   ss_string_ubigint(#1)   │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│          SEQ_SCAN         │
+│    --------------------   │
+│   estimated cardinality:  │
+│             1             │
+│                           │
+│       filters: id>1       │
+│   projections: id, name   │
+│                           │
+│           table:          │
+│  memory.main.measurements │
+│                           │
+│   type: Sequential Scan   │
+└───────────────────────────┘

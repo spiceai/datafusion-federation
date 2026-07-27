@@ -1,0 +1,17 @@
+---
+source: e2e-test/src/snapshots.rs
+description: "EXPLAIN FORMAT PGJSON SELECT id, name FROM measurements WHERE id > 1 ORDER BY id"
+---
+[
+  {
+    "Plan": {
+      "Detail": "Federated\n Sort: measurements.id ASC NULLS LAST\n  Projection: measurements.id, measurements.name\n    Filter: measurements.id > Int64(1)\n      TableScan: measurements",
+      "Node Type": "Federated",
+      "Output": [
+        "id",
+        "name"
+      ],
+      "Plans": []
+    }
+  }
+]

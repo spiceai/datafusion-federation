@@ -1,0 +1,34 @@
+[package]
+name = "federation-e2e-tests"
+description = "End-to-end federation tests against real remote SQL engines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+
+[features]
+# Off by default: `bundled` compiles DuckDB from source, which dominates a cold
+# build, so a plain `cargo test` covers only SQLite. Enable for the DuckDB tests.
+default = []
+duckdb = ["dep:duckdb"]
+
+# DuckDB stays a regular dependency because Cargo rejects optional
+# dev-dependencies, and the `duckdb` feature above needs something optional to
+# switch. Keeping it here also means `duckdb/bundled` is unified across the
+# workspace under `--all-features`, which is what lets integration-test's binary
+# link without a system libduckdb.
+[dependencies]
+duckdb = { version = "1.10503", features = ["bundled"], optional = true }
+
+# Everything else is only ever used by the `#![cfg(test)]` crate body, so it does
+# not need building for `cargo check`/`cargo build`.
+[dev-dependencies]
+datafusion-federation = { workspace = true, features = ["sql"] }
+datafusion = { workspace = true }
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+insta = { version = "1.42.0", features = ["filters"] }
+serde_json = "1"

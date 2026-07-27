@@ -2,6 +2,7 @@ mod analyzer;
 pub mod ast_analyzer;
 mod executor;
 pub mod optimizer;
+mod remote_plan;
 mod schema;
 mod table;
 mod table_reference;
@@ -38,13 +39,15 @@ pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
 pub use executor::{
     LogicalOptimizer, SQLExecutor, SQLExecutorRef, SQLFilterPushDown, SqlQueryRewriter,
 };
+pub use remote_plan::{AttachRemotePlans, RemotePlanExec, RemotePlanNode};
 pub use schema::{MultiSchemaProvider, SQLSchemaProvider};
 pub use table::{RemoteTable, SQLTable, SQLTableSource};
 pub use table_reference::{MultiPartTableReference, RemoteTableRef};
 
 use crate::{
-    get_table_source, schema_cast, FederatedPlanNode, FederationAnalyzerForLogicalPlan,
-    FederationAnalyzerRule, FederationPlanner, FederationProvider,
+    get_table_source, schema_cast, FederatedPlanNode, FederatedQueryType,
+    FederationAnalyzerForLogicalPlan, FederationAnalyzerRule, FederationPlanner,
+    FederationProvider,
 };
 
 /// Returns a federation analyzer rule that is optimized for SQL federation.
@@ -112,6 +115,18 @@ impl SQLFederationAnalyzerRule {
 impl AnalyzerRule for SQLFederationAnalyzerRule {
     /// Try to rewrite `plan` to an optimized form.
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        let (plan, query_type) = match plan {
+            LogicalPlan::Explain(explain) => (
+                explain.plan.as_ref().clone(),
+                Some(FederatedQueryType::Explain),
+            ),
+            LogicalPlan::Analyze(analyze) => (
+                analyze.input.as_ref().clone(),
+                Some(FederatedQueryType::Analyze),
+            ),
+            plan => (plan, None),
+        };
+
         if let LogicalPlan::Extension(Extension { ref node }) = plan {
             if node.name() == "Federated" {
                 // Avoid attempting double federation
@@ -120,7 +135,11 @@ impl AnalyzerRule for SQLFederationAnalyzerRule {
         }
 
         let mut plan = LogicalPlan::Extension(Extension {
-            node: Arc::new(FederatedPlanNode::new(plan.clone(), self.planner.clone())),
+            node: Arc::new(FederatedPlanNode::new_with_query_type(
+                plan.clone(),
+                self.planner.clone(),
+                query_type,
+            )),
         });
         if let Some(mut rewriter) = self.planner.executor.logical_optimizer() {
             plan = rewriter(plan)?;
@@ -160,12 +179,28 @@ impl FederationPlanner for SQLFederationPlanner {
         let schema = Arc::new(node.plan().schema().as_arrow().clone());
         let plan = node.plan().clone();
         let statistics = self.executor.statistics(&plan).await?;
-        let input = Arc::new(VirtualExecutionPlan::new(
+        let virtual_plan = VirtualExecutionPlan::new(
             plan,
             Arc::clone(&self.executor),
             statistics,
-        ));
-        let schema_cast_exec = schema_cast::SchemaCastScanExec::new(input, schema);
+            node.query_type(),
+        );
+
+        // When the query is being explained, fetch the remote engine's own plan now —
+        // this is the only place an async call can be made. It is held pending, not
+        // attached, until [`AttachRemotePlans`] runs after physical optimization.
+        let virtual_plan = match node.query_type() {
+            Some(query_type) => {
+                let sql = virtual_plan.final_sql()?;
+                match self.executor.explain_plan(&sql, query_type).await? {
+                    Some(remote_plan) => virtual_plan.with_remote_plan(remote_plan),
+                    None => virtual_plan,
+                }
+            }
+            None => virtual_plan,
+        };
+
+        let schema_cast_exec = schema_cast::SchemaCastScanExec::new(Arc::new(virtual_plan), schema);
         Ok(Arc::new(schema_cast_exec))
     }
 }
@@ -176,11 +211,24 @@ pub struct VirtualExecutionPlan {
     executor: Arc<dyn SQLExecutor>,
     props: Arc<PlanProperties>,
     statistics: Statistics,
+    query_type: Option<FederatedQueryType>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// The remote engine's plan, once [`AttachRemotePlans`] has materialized it.
+    remote_plan: Option<Arc<dyn ExecutionPlan>>,
+    /// The remote engine's plan as fetched during planning. Held aside rather than
+    /// exposed through `children()` so this node stays a leaf while DataFusion
+    /// optimizes: rules such as `EnsureCooperative` and `EnforceDistribution` treat
+    /// leaves differently, and grafting early changes the plan that runs.
+    pending_remote_plan: Option<RemotePlanNode>,
 }
 
 impl VirtualExecutionPlan {
-    pub fn new(plan: LogicalPlan, executor: Arc<dyn SQLExecutor>, statistics: Statistics) -> Self {
+    pub fn new(
+        plan: LogicalPlan,
+        executor: Arc<dyn SQLExecutor>,
+        statistics: Statistics,
+        query_type: Option<FederatedQueryType>,
+    ) -> Self {
         let schema: Schema = <DFSchema as AsRef<Schema>>::as_ref(plan.schema().as_ref()).clone();
         let props = PlanProperties::new(
             EquivalenceProperties::new(Arc::new(schema)),
@@ -193,8 +241,30 @@ impl VirtualExecutionPlan {
             executor,
             props: Arc::new(props),
             statistics,
+            query_type,
             filters: Vec::new(),
+            remote_plan: None,
+            pending_remote_plan: None,
         }
+    }
+
+    /// Records the remote engine's plan, to be attached as this node's child once
+    /// physical optimization is done. See [`AttachRemotePlans`].
+    #[must_use]
+    pub fn with_remote_plan(mut self, remote_plan: RemotePlanNode) -> Self {
+        self.pending_remote_plan = Some(remote_plan);
+        self
+    }
+
+    /// Turns a pending remote plan into this node's child. `None` when there is
+    /// nothing to attach, so callers can leave the plan untouched.
+    fn materialize_remote_plan(&self) -> Option<Self> {
+        let pending = self.pending_remote_plan.clone()?;
+        Some(Self {
+            remote_plan: Some(RemotePlanExec::new(pending)),
+            pending_remote_plan: None,
+            ..self.clone()
+        })
     }
 
     pub fn plan(&self) -> &LogicalPlan {
@@ -209,13 +279,34 @@ impl VirtualExecutionPlan {
         &self.statistics
     }
 
+    /// The directive this query was federated under, if it was explained.
+    pub fn query_type(&self) -> Option<FederatedQueryType> {
+        self.query_type
+    }
+
+    /// The remote engine's plan, present only when the query is being explained and
+    /// the executor implements [`SQLExecutor::explain_plan`].
+    pub fn remote_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        self.remote_plan.as_ref()
+    }
+
     fn schema(&self) -> SchemaRef {
         let df_schema = self.plan.schema().as_ref();
         Arc::new(<DFSchema as AsRef<Schema>>::as_ref(df_schema).clone())
     }
 
+    /// The SQL sent to the remote engine.
+    ///
+    /// `EXPLAIN`/`EXPLAIN ANALYZE` never change this. The directive would make the
+    /// remote return its own plan text — a different schema than
+    /// [`schema_cast::SchemaCastScanExec`] expects, and for SQLite not even valid
+    /// syntax. The remote plan is obtained separately, via
+    /// [`SQLExecutor::explain_plan`], and attached as this node's child.
     fn final_sql(&self) -> Result<String> {
-        let plan = self.plan.clone();
+        self.rewrite_plan_to_sql(self.plan.clone())
+    }
+
+    fn rewrite_plan_to_sql(&self, plan: LogicalPlan) -> Result<String> {
         let known_rewrites = collect_known_rewrites(&plan)?;
         let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
@@ -314,7 +405,22 @@ fn apply_sql_query_rewriters(
 }
 
 impl DisplayAs for VirtualExecutionPlan {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        // `EXPLAIN FORMAT TREE` lays each node out in a narrow box and splits the
+        // text on newlines, so the single-line form below word-wraps into unreadable
+        // fragments. Emit one `key=value` per line instead, and only the SQL that is
+        // actually sent — the intermediate rewrites belong in the indent format.
+        if matches!(t, DisplayFormatType::TreeRender) {
+            writeln!(f, "name={}", self.executor.name())?;
+            if let Some(ctx) = self.executor.compute_context() {
+                writeln!(f, "compute_context={ctx}")?;
+            }
+            if let Ok(sql) = self.final_sql() {
+                writeln!(f, "sql={sql}")?;
+            }
+            return Ok(());
+        }
+
         write!(f, "VirtualExecutionPlan")?;
         write!(f, " name={}", self.executor.name())?;
         if let Some(ctx) = self.executor.compute_context() {
@@ -394,7 +500,10 @@ impl ExecutionPlan for VirtualExecutionPlan {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        // Only ever the remote engine's plan, and only while explaining. It is
+        // display-only, and `with_new_children` below keeps it out of reach of
+        // physical optimizer rules.
+        self.remote_plan.iter().collect()
     }
 
     fn with_new_children(
@@ -496,6 +605,7 @@ mod tests {
     };
     use crate::FederatedTableProviderAdaptor;
     use async_trait::async_trait;
+    use datafusion::arrow::array::Array;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::SendableRecordBatchStream;
@@ -720,9 +830,7 @@ mod tests {
 
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
 
                 final_queries.push(node.final_sql()?);
             }
@@ -935,9 +1043,7 @@ mod tests {
 
         let _ = physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
 
                 final_queries.push(node.final_sql()?);
             }
@@ -956,11 +1062,120 @@ mod tests {
         Ok(())
     }
 
-    /// EXPLAIN ANALYZE must not federate the Analyze wrapper — only the inner
-    /// query should be federated. Otherwise the SQL Unparser fails because it
-    /// cannot convert Analyze to SQL.
     #[tokio::test]
-    async fn explain_analyze_not_federated() -> Result<(), DataFusionError> {
+    async fn explain_federation_test() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "test".into(),
+            cannot_federate: None,
+        };
+
+        let local_table_ref = "table_local_explain".to_string();
+        let remote_table_ref = "table_b1(1)".to_string();
+        let table = get_test_table_provider(remote_table_ref, executor);
+
+        let state = crate::default_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(local_table_ref, table).unwrap();
+
+        let plan = ctx
+            .sql("EXPLAIN SELECT * FROM table_local_explain")
+            .await?
+            .into_optimized_plan()?;
+
+        let LogicalPlan::Explain(ref explain) = plan else {
+            panic!("Expected Explain at root, got: {}", plan.display_indent());
+        };
+
+        let mut found_federated = false;
+        explain.plan.apply(|node| {
+            if let LogicalPlan::Extension(extension) = node {
+                if extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<FederatedPlanNode>()
+                    .is_some()
+                {
+                    found_federated = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert!(
+            found_federated,
+            "Expected a Federated node inside the Explain plan"
+        );
+
+        let annotated_plan = crate::FederatedQueryPlanner::annotate_query_directives(&plan)?
+            .expect("Explain root should be annotated");
+        let LogicalPlan::Explain(ref annotated_explain) = annotated_plan else {
+            panic!(
+                "Expected annotated Explain at root, got: {}",
+                annotated_plan.display_indent()
+            );
+        };
+
+        let physical_plan = ctx
+            .state()
+            .create_physical_plan(annotated_explain.plan.as_ref())
+            .await?;
+        let mut final_queries = vec![];
+        physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
+                final_queries.push(node.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        // The query itself is sent unchanged; the directive is not injected into it.
+        // The remote plan comes from `SQLExecutor::explain_plan` instead, which this
+        // mock executor does not implement.
+        assert_eq!(
+            final_queries,
+            vec!["SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) table_b1".to_string()]
+        );
+
+        let batches = ctx
+            .sql("EXPLAIN SELECT * FROM table_local_explain")
+            .await?
+            .collect()
+            .await?;
+
+        let explain_output: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    .unwrap();
+                (0..col.len()).map(move |index| col.value(index).to_string())
+            })
+            .collect();
+
+        let combined = explain_output.join("\n");
+        assert!(
+            combined.contains(
+                "rewritten_sql=SELECT table_b1.a, table_b1.b, table_b1.c FROM table_b1(1) table_b1"
+            ),
+            "Expected the un-prefixed remote SQL in output, got:\n{combined}",
+        );
+        assert!(
+            !combined.contains("EXPLAIN SELECT"),
+            "The directive must not be injected into the federated query, got:\n{combined}",
+        );
+
+        Ok(())
+    }
+
+    /// EXPLAIN ANALYZE keeps AnalyzeExec at the DataFusion level, and the federated
+    /// query is sent unchanged so it returns rows for AnalyzeExec to measure. The
+    /// remote engine's own plan is fetched separately, via
+    /// [`SQLExecutor::explain_plan`], which this mock executor does not implement.
+    #[tokio::test]
+    async fn explain_analyze_federation_test() -> Result<(), DataFusionError> {
         let executor = TestExecutor {
             compute_context: "a".into(),
             cannot_federate: None,
@@ -1007,6 +1222,20 @@ mod tests {
         let physical_plan = ctx.state().create_physical_plan(&plan).await?;
         assert_eq!(physical_plan.name(), "AnalyzeExec");
 
+        let mut final_queries = vec![];
+        physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
+                final_queries.push(node.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert_eq!(
+            final_queries,
+            vec!["SELECT test_table.a, test_table.b, test_table.c FROM test_table".to_string()]
+        );
+
         Ok(())
     }
 
@@ -1043,9 +1272,7 @@ mod tests {
         let mut final_queries = vec![];
         physical_plan.apply(|node| {
             if node.name() == "sql_federation_exec" {
-                let node = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let node = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
                 final_queries.push(node.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1451,9 +1678,7 @@ mod tests {
                 has_filter_exec = true;
             }
             if node.name() == "sql_federation_exec" {
-                let vp = node
-                    .downcast_ref::<VirtualExecutionPlan>()
-                    .unwrap();
+                let vp = node.downcast_ref::<VirtualExecutionPlan>().unwrap();
                 federation_sqls.push(vp.final_sql()?);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1490,7 +1715,12 @@ mod tests {
                 ),
             },
         );
-        VirtualExecutionPlan::new(plan, Arc::new(executor), Statistics::new_unknown(&schema))
+        VirtualExecutionPlan::new(
+            plan,
+            Arc::new(executor),
+            Statistics::new_unknown(&schema),
+            None,
+        )
     }
 
     fn make_child_result(n: usize) -> ChildPushdownResult {
@@ -1612,9 +1842,7 @@ mod tests {
         );
         // Filters must be stored on the updated node for execute().
         let updated = result.updated_node.unwrap();
-        let updated_vp = updated
-            .downcast_ref::<VirtualExecutionPlan>()
-            .unwrap();
+        let updated_vp = updated.downcast_ref::<VirtualExecutionPlan>().unwrap();
         assert_eq!(
             updated_vp.filters.len(),
             2,
@@ -1685,9 +1913,7 @@ mod tests {
             result.filters
         );
         let updated = result.updated_node.unwrap();
-        let updated_vp = updated
-            .downcast_ref::<VirtualExecutionPlan>()
-            .unwrap();
+        let updated_vp = updated.downcast_ref::<VirtualExecutionPlan>().unwrap();
         assert_eq!(
             updated_vp.filters.len(),
             2,

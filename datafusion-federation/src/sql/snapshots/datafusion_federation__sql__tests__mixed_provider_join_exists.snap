@@ -1,6 +1,5 @@
 ---
 source: datafusion-federation/src/sql/mod.rs
-assertion_line: 1331
 expression: "explain_query(&ctx,\n\"SELECT s_name \\\n                 FROM supplier \\\n                 JOIN lineitem ON l_suppkey = s_suppkey \\\n                 WHERE EXISTS ( \\\n                     SELECT 1 FROM orders \\\n                     WHERE o_custkey = s_suppkey \\\n                 )\",).await"
 ---
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
