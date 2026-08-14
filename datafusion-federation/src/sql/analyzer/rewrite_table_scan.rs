@@ -79,6 +79,11 @@ impl RewriteTableScanAnalyzer {
                         match expr {
                             Expr::Column(col) => rewrite_column(col, known_rewrites)
                                 .map(|t| t.update_data(Expr::Column)),
+                            Expr::OuterReferenceColumn(field, col) => {
+                                rewrite_column(col, known_rewrites).map(|t| {
+                                    t.update_data(|col| Expr::OuterReferenceColumn(field, col))
+                                })
+                            }
                             Expr::Alias(alias) => match &alias.relation {
                                 Some(relation) => {
                                     let Some(rewrite) =
@@ -569,16 +574,20 @@ mod tests {
         }
     }
 
-    fn get_test_table_provider() -> Arc<dyn TableProvider> {
+    fn get_test_table_provider_named(remote_name: &str) -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Utf8, false),
             Field::new("c", DataType::Date32, false),
         ]));
-        let table = Arc::new(TestTable::new("remote_table".to_string(), schema));
+        let table = Arc::new(TestTable::new(remote_name.to_string(), schema));
         let provider = Arc::new(SQLFederationProvider::new(Arc::new(TestExecutor)));
         let table_source = Arc::new(SQLTableSource { provider, table });
         Arc::new(FederatedTableProviderAdaptor::new(table_source))
+    }
+
+    fn get_test_table_provider() -> Arc<dyn TableProvider> {
+        get_test_table_provider_named("remote_table")
     }
 
     fn get_test_table_source() -> Arc<DefaultTableSource> {
@@ -918,6 +927,53 @@ mod tests {
                 r#"SELECT aapp_table FROM (SELECT remote_table.a AS aapp_table FROM "default".remote_table)"#,
             ),
         ];
+
+        for test in tests {
+            test_sql(&ctx, test.0, test.1).await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_correlated_subquery_outer_reference() -> Result<()> {
+        init_tracing();
+
+        // Use distinct remote names for the outer and inner tables (unlike
+        // get_test_df_context, where both map to "remote_table") so the
+        // expected SQL can't coincidentally pass by both qualifiers
+        // collapsing to the same identifier - it must show the outer
+        // reference rewritten to its own remote name, distinct from the
+        // subquery's own table.
+        let ctx = SessionContext::new();
+        let catalog = ctx
+            .catalog("datafusion")
+            .expect("default catalog is datafusion");
+        let foo_schema = Arc::new(MemorySchemaProvider::new()) as Arc<dyn SchemaProvider>;
+        catalog
+            .register_schema("foo", Arc::clone(&foo_schema))
+            .expect("to register schema");
+        foo_schema
+            .register_table(
+                "df_table".to_string(),
+                get_test_table_provider_named("remote_outer"),
+            )
+            .expect("to register table");
+
+        let public_schema = catalog
+            .schema("public")
+            .expect("public schema should exist");
+        public_schema
+            .register_table(
+                "app_table".to_string(),
+                get_test_table_provider_named("remote_inner"),
+            )
+            .expect("to register table");
+
+        let tests = vec![(
+            "SELECT a FROM foo.df_table WHERE a = (SELECT MIN(app_table.a) FROM app_table WHERE app_table.b = df_table.b)",
+            r#"SELECT remote_outer.a FROM remote_outer WHERE (remote_outer.a = (SELECT min(remote_inner.a) FROM remote_inner WHERE (remote_inner.b = remote_outer.b)))"#,
+        )];
 
         for test in tests {
             test_sql(&ctx, test.0, test.1).await?;
