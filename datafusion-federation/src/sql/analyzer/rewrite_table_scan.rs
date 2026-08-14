@@ -79,6 +79,11 @@ impl RewriteTableScanAnalyzer {
                         match expr {
                             Expr::Column(col) => rewrite_column(col, known_rewrites)
                                 .map(|t| t.update_data(Expr::Column)),
+                            Expr::OuterReferenceColumn(field, col) => {
+                                rewrite_column(col, known_rewrites).map(|t| {
+                                    t.update_data(|col| Expr::OuterReferenceColumn(field, col))
+                                })
+                            }
                             Expr::Alias(alias) => match &alias.relation {
                                 Some(relation) => {
                                     let Some(rewrite) =
@@ -918,6 +923,23 @@ mod tests {
                 r#"SELECT aapp_table FROM (SELECT remote_table.a AS aapp_table FROM "default".remote_table)"#,
             ),
         ];
+
+        for test in tests {
+            test_sql(&ctx, test.0, test.1).await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_correlated_subquery_outer_reference() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let tests = vec![(
+            "SELECT a FROM foo.df_table WHERE a = (SELECT MIN(app_table.a) FROM app_table WHERE app_table.b = df_table.b)",
+            r#"SELECT remote_table.a FROM remote_table WHERE (remote_table.a = (SELECT min(remote_table.a) FROM remote_table WHERE (remote_table.b = remote_table.b)))"#,
+        )];
 
         for test in tests {
             test_sql(&ctx, test.0, test.1).await?;
