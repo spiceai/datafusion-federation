@@ -18,7 +18,7 @@ use datafusion::{
         analyzer::{
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
-        Analyzer, AnalyzerRule,
+        Analyzer, AnalyzerRule, OptimizerRule,
     },
     physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule},
 };
@@ -87,6 +87,16 @@ pub trait FederationProvider: Send + Sync + std::fmt::Debug {
     // Returns the compute context in which this federation provider
     // will execute a query. For example: database instance & catalog.
     fn compute_context(&self) -> Option<String>;
+
+    /// Returns optimizer rules to apply after this provider has been identified
+    /// for a candidate subtree and before checking whether it can be federated.
+    ///
+    /// Rules must preserve the candidate's federation-provider ownership. The
+    /// same optimized candidate is passed to [`Self::analyzer`] and, if accepted,
+    /// to the returned analyzer for federation.
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        vec![]
+    }
 
     // Returns an analyzer that can cut out, and federate part of the [`LogicalPlan`].
     //

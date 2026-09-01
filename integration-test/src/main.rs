@@ -126,7 +126,7 @@ async fn run_test_query(
     let plan_display = pretty_format_batches(&plan)?.to_string();
 
     insta::with_settings!({
-        description => format!("Federated Query Explain"),
+        description => "Federated Query Explain".to_string(),
         snapshot_path => "../snapshots/explain",
         filters => vec![
             (r"compute_context=.*/([^/]+\.db)", "compute_context=$1")

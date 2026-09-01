@@ -95,6 +95,23 @@ impl FederationAnalyzerRule {
         self
     }
 
+    fn optimize_for_provider(
+        provider: &FederationProviderRef,
+        plan: LogicalPlan,
+        config: &ConfigOptions,
+    ) -> Result<LogicalPlan> {
+        let rules = provider.pre_federation_optimizer_rules();
+        if rules.is_empty() {
+            return Ok(plan);
+        }
+
+        Optimizer::with_rules(rules).optimize(
+            plan,
+            &OptimizerContext::new_with_config_options(Arc::new(config.clone())),
+            |_, _| {},
+        )
+    }
+
     /// The `EXPLAIN`/`EXPLAIN ANALYZE` wrapper to re-apply around federated sub-plans.
     ///
     /// Held behind an [`Arc`] because it is threaded through the whole plan recursion:
@@ -285,11 +302,18 @@ impl FederationAnalyzerRule {
 
         // If all sources are federated to the same provider
         if let ScanResult::Distinct(provider) = sole_provider {
+            let prepared_plan = if matches!(plan, LogicalPlan::Analyze(_) | LogicalPlan::Explain(_))
+            {
+                plan.clone()
+            } else {
+                Self::optimize_for_provider(&provider, plan.clone(), config)?
+            };
+
             // Explain and Analyze wrappers stay in the DataFusion plan so their
             // physical operators can still run. The corresponding directive is
             // injected into the federated subquery instead.
             let federated_plan =
-                Self::wrap_federated_plan(plan.clone(), explain_context.as_deref())?;
+                Self::wrap_federated_plan(prepared_plan.clone(), explain_context.as_deref())?;
             let provider_analyzer =
                 if matches!(plan, LogicalPlan::Analyze(_) | LogicalPlan::Explain(_)) {
                     None
@@ -297,7 +321,7 @@ impl FederationAnalyzerRule {
                     // Ask about the query itself, not the EXPLAIN wrapper: an executor
                     // whose can_execute_plan rejects Explain/Analyze would otherwise
                     // refuse to federate a query it can perfectly well run.
-                    provider.analyzer(plan)
+                    provider.analyzer(&prepared_plan)
                 };
             match (is_root, provider_analyzer) {
                 (false, Some(FederationAnalyzerForLogicalPlan::With(_))) => {
@@ -345,19 +369,21 @@ impl FederationAnalyzerRule {
                 };
 
                 let projected_input = wrap_projection(original_input.clone())?;
+                let prepared_input =
+                    Self::optimize_for_provider(&provider, projected_input, config)?;
 
                 // Ask about the query itself rather than the EXPLAIN wrapper applied
                 // below, so an executor that rejects Explain/Analyze in
                 // can_execute_plan still federates the query it wraps.
                 let Some(FederationAnalyzerForLogicalPlan::With(analyzer)) =
-                    provider.analyzer(&projected_input)
+                    provider.analyzer(&prepared_input)
                 else {
                     // Either provider has no analyzer, or cannot federate [`LogicalPlan`].
                     return Ok(original_input);
                 };
 
                 let federated_input =
-                    Self::wrap_federated_plan(projected_input, explain_context.as_deref())?;
+                    Self::wrap_federated_plan(prepared_input, explain_context.as_deref())?;
 
                 // Replace the input with the federated counterpart
                 analyzer.execute_and_check(federated_input, config, |_, _| {})

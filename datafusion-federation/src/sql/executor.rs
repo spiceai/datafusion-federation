@@ -5,6 +5,7 @@ use datafusion::{
     common::Statistics,
     error::Result,
     logical_expr::LogicalPlan,
+    optimizer::OptimizerRule,
     physical_plan::{metrics::MetricsSet, PhysicalExpr, SendableRecordBatchStream},
     sql::unparser::dialect::Dialect,
 };
@@ -61,6 +62,12 @@ pub trait SQLExecutor: Sync + Send {
     /// i.e. if there are UDFs that only DataFusion can execute.
     fn can_execute_plan(&self, _logical_plan: &LogicalPlan) -> bool {
         true
+    }
+
+    /// Returns optimizer rules to apply to a candidate plan before
+    /// [`Self::can_execute_plan`] is called.
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        vec![]
     }
 
     /// Returns the analyzer rule specific for this engine to modify the logical plan before execution

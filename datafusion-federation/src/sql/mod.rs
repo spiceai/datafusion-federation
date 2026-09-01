@@ -20,7 +20,9 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
     logical_expr::{Extension, LogicalPlan},
-    optimizer::{optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer},
+    optimizer::{
+        optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer, OptimizerRule,
+    },
     physical_expr::EquivalenceProperties,
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
@@ -88,6 +90,10 @@ impl FederationProvider for SQLFederationProvider {
 
     fn compute_context(&self) -> Option<String> {
         self.executor.compute_context()
+    }
+
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        self.executor.pre_federation_optimizer_rules()
     }
 
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
@@ -612,6 +618,8 @@ mod tests {
     use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::Alias;
     use datafusion::logical_expr::Projection;
+    use datafusion::optimizer::eliminate_filter::EliminateFilter;
+    use datafusion::optimizer::OptimizerRule;
     use datafusion::prelude::Expr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::{self};
@@ -658,6 +666,14 @@ mod tests {
                 return true;
             };
             !logical_plan.exists(|p| Ok(fnc(p))).unwrap_or(false)
+        }
+
+        fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+            if self.compute_context == "pre_federation_optimizer" {
+                vec![Arc::new(EliminateFilter::new())]
+            } else {
+                vec![]
+            }
         }
 
         fn dialect(&self) -> Arc<dyn Dialect> {
@@ -846,6 +862,40 @@ mod tests {
         assert_eq!(
             HashSet::<&str>::from_iter(final_queries.iter().map(|x| x.as_str())),
             HashSet::from_iter(expected)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_optimizer_runs_before_capability_check() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "pre_federation_optimizer".into(),
+            cannot_federate: Some(Arc::new(|plan| matches!(plan, LogicalPlan::Filter(_)))),
+        };
+        let table_name = "provider_optimizer_table";
+        let table = get_test_table_provider(table_name.to_string(), executor);
+        let ctx = SessionContext::new();
+        ctx.register_table(table_name, table)?;
+
+        let plan = ctx
+            .state()
+            .create_logical_plan(&format!("SELECT * FROM {table_name} WHERE true"))
+            .await?;
+        let analyzed = federation_analyzer_rule().analyze(plan, &ConfigOptions::default())?;
+
+        let LogicalPlan::Extension(Extension { node }) = analyzed else {
+            panic!("expected the provider optimizer to make the full plan federatable");
+        };
+        let federated = node
+            .as_any()
+            .downcast_ref::<FederatedPlanNode>()
+            .expect("expected a FederatedPlanNode");
+        assert!(
+            !federated
+                .plan()
+                .exists(|plan| Ok(matches!(plan, LogicalPlan::Filter(_))))?,
+            "the plan checked for capability and wrapped for federation must be optimized"
         );
 
         Ok(())
