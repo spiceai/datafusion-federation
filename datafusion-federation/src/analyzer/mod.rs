@@ -627,14 +627,12 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 }
 
 fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
-    let federated_table_exists = plan.exists(|x| {
-        if let (Some(provider), _) = get_leaf_provider(x)? {
-            return Ok(provider.analyzer(plan).is_some());
-        }
-        Ok(false)
-    })?;
-
-    Ok(federated_table_exists)
+    plan.exists(|node| {
+        let LogicalPlan::TableScan(TableScan { source, .. }) = node else {
+            return Ok(false);
+        };
+        Ok(get_table_source(source)?.is_some())
+    })
 }
 
 fn get_leaf_provider(

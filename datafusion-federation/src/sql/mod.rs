@@ -603,7 +603,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
 mod tests {
     use std::any::Any;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use crate::sql::{
@@ -617,10 +617,10 @@ mod tests {
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::Alias;
-    use datafusion::logical_expr::Projection;
+    use datafusion::logical_expr::{LogicalPlanBuilder, Projection};
     use datafusion::optimizer::eliminate_filter::EliminateFilter;
     use datafusion::optimizer::OptimizerRule;
-    use datafusion::prelude::Expr;
+    use datafusion::prelude::{lit, Expr};
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::{self};
     use datafusion::{
@@ -869,20 +869,37 @@ mod tests {
 
     #[tokio::test]
     async fn provider_optimizer_runs_before_capability_check() -> Result<(), DataFusionError> {
+        let capability_saw_unoptimized_filter = Arc::new(AtomicBool::new(false));
+        let capability_observation = Arc::clone(&capability_saw_unoptimized_filter);
         let executor = TestExecutor {
             compute_context: "pre_federation_optimizer".into(),
-            cannot_federate: Some(Arc::new(|plan| matches!(plan, LogicalPlan::Filter(_)))),
+            cannot_federate: Some(Arc::new(move |plan| {
+                if matches!(plan, LogicalPlan::Filter(_)) {
+                    capability_observation.store(true, Ordering::SeqCst);
+                    return true;
+                }
+                false
+            })),
         };
         let table_name = "provider_optimizer_table";
         let table = get_test_table_provider(table_name.to_string(), executor);
-        let ctx = SessionContext::new();
-        ctx.register_table(table_name, table)?;
-
-        let plan = ctx
-            .state()
-            .create_logical_plan(&format!("SELECT * FROM {table_name} WHERE true"))
-            .await?;
+        let plan = LogicalPlanBuilder::scan(
+            table_name,
+            datafusion::datasource::provider_as_source(table),
+            None,
+        )?
+        .filter(lit(true))?
+        .build()?;
+        assert!(
+            plan.exists(|plan| Ok(matches!(plan, LogicalPlan::Filter(_))))?,
+            "the test plan must reach the analyzer with a filter for the provider optimizer to remove"
+        );
         let analyzed = federation_analyzer_rule().analyze(plan, &ConfigOptions::default())?;
+
+        assert!(
+            !capability_saw_unoptimized_filter.load(Ordering::SeqCst),
+            "no provider capability check may run before the provider optimizer removes the filter"
+        );
 
         let LogicalPlan::Extension(Extension { node }) = analyzed else {
             panic!("expected the provider optimizer to make the full plan federatable");
