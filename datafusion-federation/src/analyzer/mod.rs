@@ -671,12 +671,19 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// bare reference to it collide deliberately: over-matching costs a refusal, where
 /// binding a correlation to the wrong relation of the same name would return wrong
 /// rows with no error.
+///
+/// The walk is `apply`, not `apply_with_subqueries`: the relation a correlated
+/// reference binds to is in the candidate's own `FROM`, reached through its inputs.
+/// A relation defined inside a *nested* subquery is not visible at the reference's
+/// position, so counting one would be a false match on nothing more than a reused
+/// alias — and the plan would then be federated alone, with that identifier unbound
+/// in the emitted SQL.
 fn scope_names_a_scanless_relation(scope: &LogicalPlan, relation: &TableReference) -> Result<bool> {
     let wanted = relation.table();
     let mut matches = 0usize;
     let mut scanless = false;
 
-    scope.apply_with_subqueries(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
+    scope.apply(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
         let named = match node {
             LogicalPlan::SubqueryAlias(alias) => alias.alias.table() == wanted,
             LogicalPlan::TableScan(scan) => scan.table_name.table() == wanted,
@@ -891,6 +898,27 @@ mod tests {
                 .expect("resolve h"),
             "a relation that scans a table must not be rendered inline into another \
              engine's statement"
+        );
+    }
+
+    /// A relation of that name reached only through a *nested* subquery is not the
+    /// binding: it is not visible at the reference's position, so counting it would
+    /// federate the plan alone and leave that identifier unbound in the emitted SQL.
+    #[test]
+    fn a_relation_named_only_inside_a_nested_subquery_is_not_the_binding() {
+        let scope = LogicalPlanBuilder::from(scan("orders"))
+            .filter(datafusion::logical_expr::in_subquery(
+                col("orders.id"),
+                Arc::new(scanless_relation("h")),
+            ))
+            .expect("filter")
+            .build()
+            .expect("build");
+        assert!(
+            !scope_names_a_scanless_relation(&scope, &TableReference::bare("h"))
+                .expect("resolve h"),
+            "an alias reused inside a nested subquery is not what the correlation binds \
+             to, and treating it as one emits an unbound identifier"
         );
     }
 
