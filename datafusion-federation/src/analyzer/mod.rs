@@ -693,15 +693,19 @@ fn scope_names_a_scanless_relation(scope: &LogicalPlan, relation: &TableReferenc
             matches += 1;
             scanless = matches == 1 && !plan_scans_anything(node)?;
         }
-        // A `SubqueryAlias` is a query block: it is itself a relation of this scope,
-        // and the relations *inside* it are not. Its name has just been counted, so
-        // stop here rather than descend and count a relation nothing outside it can
-        // refer to.
-        Ok(if matches!(node, LogicalPlan::SubqueryAlias(_)) {
-            TreeNodeRecursion::Jump
-        } else {
-            TreeNodeRecursion::Continue
-        })
+        // Stop at each query block. A `SubqueryAlias` is itself a relation of this
+        // scope and the relations inside it are not, and a `Union`'s branches are
+        // separate `SELECT`s whose relations are not visible to each other or to
+        // anything above — a node above a union sees its output columns, not its
+        // inputs. Either way the block's own name has just been counted, so
+        // descending would only find relations nothing outside it can refer to.
+        Ok(
+            if matches!(node, LogicalPlan::SubqueryAlias(_) | LogicalPlan::Union(_)) {
+                TreeNodeRecursion::Jump
+            } else {
+                TreeNodeRecursion::Continue
+            },
+        )
     })?;
 
     Ok(matches == 1 && scanless)
@@ -928,6 +932,19 @@ mod tests {
                 .expect("resolve h"),
             "an alias reused inside a nested subquery is not what the correlation binds \
              to, and treating it as one emits an unbound identifier"
+        );
+
+        // And in a sibling `UNION` branch, which is its own `SELECT`: a reference in
+        // one branch binds to an enclosing scope, never to the other branch.
+        let sibling = LogicalPlanBuilder::from(scanless_relation("h"))
+            .union(scanless_relation("g"))
+            .expect("union")
+            .build()
+            .expect("build");
+        assert!(
+            !scope_names_a_scanless_relation(&sibling, &TableReference::bare("h"))
+                .expect("resolve h"),
+            "a relation aliased in one union branch is not visible to the other"
         );
 
         // The same, nested in a derived table rather than an expression subquery.
