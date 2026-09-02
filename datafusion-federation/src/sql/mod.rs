@@ -1423,6 +1423,120 @@ mod tests {
         formatted.to_string()
     }
 
+    /// The statements a plan reaches the remote engine as, one per
+    /// `VirtualExecutionPlan`.
+    async fn pushed_statements(
+        ctx: &SessionContext,
+        query: &str,
+    ) -> Result<Vec<String>, DataFusionError> {
+        let physical_plan = ctx.sql(query).await?.create_physical_plan().await?;
+        let mut statements = Vec::new();
+        physical_plan.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                let virtual_plan = node
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .expect("sql_federation_exec is a VirtualExecutionPlan");
+                statements.push(virtual_plan.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(statements)
+    }
+
+    /// A correlated subquery whose *outer* relation scans nothing must still federate
+    /// as one statement.
+    ///
+    /// The provider map is keyed off the relations that scan something, so the
+    /// `UNION ALL` of literal selects this correlates against is absent from it by
+    /// construction. Reading that absence as a second engine refuses the whole
+    /// candidate — the verdict propagates through every enclosing node, so nothing is
+    /// federated at any level and a statement whose only tables are one engine's
+    /// degrades to one scan per table reference, each of them re-executed for every
+    /// place the plan mentions it.
+    ///
+    /// The control below is the same statement correlated against a scanning
+    /// relation, which federates whole either way. The pair is what distinguishes
+    /// this fix from "correlated subqueries do not federate".
+    #[tokio::test]
+    async fn a_correlation_against_a_scanless_relation_federates_as_one_statement(
+    ) -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor),
+        )?;
+
+        let statements = pushed_statements(
+            &ctx,
+            "WITH keys AS (SELECT 1 AS k UNION ALL SELECT 2 AS k) \
+             SELECT keys.k, \
+                    (SELECT count(*) FROM lineitem WHERE l_orderkey = keys.k) AS n \
+             FROM keys",
+        )
+        .await?;
+
+        assert_eq!(
+            statements.len(),
+            1,
+            "the correlation is bound by a relation the statement itself emits, so the \
+             whole plan has to reach the engine as one statement; got {}: {statements:#?}",
+            statements.len()
+        );
+        // Non-vacuity: one statement that pushed none of the work would also be one
+        // statement. The correlated aggregate has to be in it.
+        let pushed = statements[0].to_lowercase();
+        assert!(
+            pushed.contains("count(") && pushed.contains("l_orderkey"),
+            "the one statement has to carry the correlated aggregate, not just a bare \
+             scan: {}",
+            statements[0]
+        );
+
+        Ok(())
+    }
+
+    /// Control for the test above: correlating against a relation that *scans* is
+    /// unaffected, so a regression there is told apart from a regression in the
+    /// scanless case.
+    #[tokio::test]
+    async fn a_correlation_against_a_scanning_relation_still_federates_as_one_statement(
+    ) -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table(
+            "orders",
+            make_table_with_schema("orders", orders_schema(), &executor),
+        )?;
+        ctx.register_table(
+            "lineitem",
+            make_table_with_schema("lineitem", lineitem_schema(), &executor),
+        )?;
+
+        let statements = pushed_statements(
+            &ctx,
+            "SELECT o_orderkey, \
+                    (SELECT count(*) FROM lineitem WHERE l_orderkey = o_orderkey) AS n \
+             FROM orders",
+        )
+        .await?;
+
+        assert_eq!(
+            statements.len(),
+            1,
+            "got {}: {statements:#?}",
+            statements.len()
+        );
+
+        Ok(())
+    }
+
     /// Same-provider EXISTS: both tables from the same compute context.
     /// The entire plan should be federated as a single unit so the backend
     /// can decorrelate EXISTS into a semi-join.

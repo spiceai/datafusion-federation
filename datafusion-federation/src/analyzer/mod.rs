@@ -139,15 +139,21 @@ impl FederationAnalyzerRule {
     }
 
     /// Scans a plan to see if it belongs to a single [`FederationProvider`].
+    ///
+    /// `scope` is the candidate that would become one remote statement, which is
+    /// `plan` itself except when scanning a subquery, where it stays the enclosing
+    /// candidate. Only [`Self::scan_expr_recursively`] reads it, to decide whether a
+    /// correlated reference stays bound inside the statement it would be emitted in.
     fn scan_plan_recursively(
         &self,
         plan: &LogicalPlan,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+        scope: &LogicalPlan,
     ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
         plan.apply(&mut |p: &LogicalPlan| -> Result<TreeNodeRecursion> {
-            let exprs_provider = self.scan_plan_exprs(p, providers)?;
+            let exprs_provider = self.scan_plan_exprs(p, providers, scope)?;
             sole_provider.merge(exprs_provider);
 
             if sole_provider.is_ambiguous() {
@@ -168,12 +174,13 @@ impl FederationAnalyzerRule {
         &self,
         plan: &LogicalPlan,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+        scope: &LogicalPlan,
     ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
         let exprs = plan.expressions();
         for expr in &exprs {
-            let expr_result = self.scan_expr_recursively(expr, providers)?;
+            let expr_result = self.scan_expr_recursively(expr, providers, scope)?;
             sole_provider.merge(expr_result);
 
             if sole_provider.is_ambiguous() {
@@ -189,27 +196,32 @@ impl FederationAnalyzerRule {
         &self,
         expr: &Expr,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+        scope: &LogicalPlan,
     ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
         expr.apply(&mut |e: &Expr| -> Result<TreeNodeRecursion> {
             match e {
                 Expr::ScalarSubquery(ref subquery) => {
-                    let plan_result = self.scan_plan_recursively(&subquery.subquery, providers)?;
+                    let plan_result =
+                        self.scan_plan_recursively(&subquery.subquery, providers, scope)?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
                 Expr::InSubquery(ref insubquery) => {
-                    let plan_result =
-                        self.scan_plan_recursively(&insubquery.subquery.subquery, providers)?;
+                    let plan_result = self.scan_plan_recursively(
+                        &insubquery.subquery.subquery,
+                        providers,
+                        scope,
+                    )?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
                 Expr::Exists(ref exists) => {
                     let plan_result =
-                        self.scan_plan_recursively(&exists.subquery.subquery, providers)?;
+                        self.scan_plan_recursively(&exists.subquery.subquery, providers, scope)?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
@@ -220,8 +232,18 @@ impl FederationAnalyzerRule {
                             sole_provider.merge(ScanResult::Distinct(Arc::clone(plan_result)));
                             return Ok(sole_provider.check_recursion());
                         }
+                        // A relation that scans nothing has no provider to report, but
+                        // the remote engine renders it inline and its alias is defined
+                        // inside the same statement, so the correlation stays bound and
+                        // constrains nothing about which engine runs the statement.
+                        if scope_names_a_scanless_relation(scope, table)? {
+                            return Ok(sole_provider.check_recursion());
+                        }
                     }
-                    // If we don't know about this table, we can't federate
+                    // The reference names a relation this candidate does not define, or
+                    // one it cannot be shown to define uniquely. Federating would emit
+                    // an identifier the remote engine binds to something else or not at
+                    // all, so leave the correlation to DataFusion.
                     sole_provider = ScanResult::Ambiguous;
                     Ok(TreeNodeRecursion::Stop)
                 }
@@ -260,7 +282,7 @@ impl FederationAnalyzerRule {
         let (leaf_provider, _) = get_leaf_provider(plan)?;
 
         // Check if the expressions contain, a potentially different, FederationProvider
-        let exprs_result = self.scan_plan_exprs(plan, providers)?;
+        let exprs_result = self.scan_plan_exprs(plan, providers, plan)?;
 
         // Return early if this is a leaf and there is no ambiguity with the expressions.
         if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
@@ -626,13 +648,88 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     }
 }
 
-fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
-    plan.exists(|node| {
-        let LogicalPlan::TableScan(TableScan { source, .. }) = node else {
-            return Ok(false);
+/// Whether `scope` defines exactly one relation named `relation`, and that relation
+/// scans nothing.
+///
+/// This is the question a correlated reference the provider map cannot resolve
+/// actually poses: not "which engine owns this relation" but "if this whole
+/// candidate becomes one remote statement, does the identifier still bind, and to
+/// this same relation". A relation built only from constants — a `VALUES` list, or
+/// the `UNION ALL` of literal selects a hand-written `hours`-style CTE plans to —
+/// is emitted inline by the unparser and carries its own alias into that
+/// statement, so the answer is yes and the reference says nothing about which
+/// engine should run it.
+///
+/// "Scans nothing" is the whole test because every `TableScan` reports a provider:
+/// a federated one reports its own, and a non-federated one reports
+/// [`NopFederationProvider`]. So a relation that scans anything is already in the
+/// provider map, or belongs to an engine this candidate cannot be handed to, and
+/// either way it is not this branch's business.
+///
+/// A unique match is required, and a duplicate name is refused rather than
+/// resolved. Names are compared on the last segment, so a qualified scan and a
+/// bare reference to it collide deliberately: over-matching costs a refusal, where
+/// binding a correlation to the wrong relation of the same name would return wrong
+/// rows with no error.
+fn scope_names_a_scanless_relation(scope: &LogicalPlan, relation: &TableReference) -> Result<bool> {
+    let wanted = relation.table();
+    let mut matches = 0usize;
+    let mut scanless = false;
+
+    scope.apply_with_subqueries(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
+        let named = match node {
+            LogicalPlan::SubqueryAlias(alias) => alias.alias.table() == wanted,
+            LogicalPlan::TableScan(scan) => scan.table_name.table() == wanted,
+            _ => false,
         };
-        Ok(get_table_source(source)?.is_some())
-    })
+        if named {
+            matches += 1;
+            scanless = matches == 1 && !plan_scans_anything(node)?;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    Ok(matches == 1 && scanless)
+}
+
+/// Whether any `TableScan` appears in `plan`, including inside its subquery
+/// expressions — a scan reached only through a correlated subquery is still a scan
+/// the relation depends on.
+fn plan_scans_anything(plan: &LogicalPlan) -> Result<bool> {
+    let mut found = false;
+    plan.apply_with_subqueries(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
+        if matches!(node, LogicalPlan::TableScan(_)) {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
+}
+
+/// Whether any federated table appears in `plan`, **including inside its subquery
+/// expressions**.
+///
+/// A plan whose only federated tables are reached through a scalar, `IN` or
+/// `EXISTS` subquery is the case this has to descend for: the outer query's own
+/// `FROM` may be a constant relation, so a walk that stops at the plan's inputs
+/// reports no federated table and [`FederationAnalyzerRule::analyze`] returns
+/// before doing anything. Nothing is then federated at any level, and a statement
+/// whose only tables belong to one engine reaches it as one scan per table
+/// reference instead of one query.
+fn contains_federated_table(plan: &LogicalPlan) -> Result<bool> {
+    let mut found = false;
+    plan.apply_with_subqueries(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
+        let LogicalPlan::TableScan(TableScan { source, .. }) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        if get_table_source(source)?.is_some() {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
 }
 
 fn get_leaf_provider(
@@ -665,7 +762,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::config::ConfigOptions;
-    use datafusion::logical_expr::{DmlStatement, EmptyRelation, WriteOp};
+    use datafusion::logical_expr::{lit, DmlStatement, EmptyRelation, WriteOp};
     use datafusion::optimizer::analyzer::AnalyzerRule;
     use datafusion::sql::TableReference;
     use std::sync::Arc;
@@ -713,6 +810,110 @@ mod tests {
         assert!(
             matches!(result, LogicalPlan::Dml(_)),
             "expected Dml plan, got {result:?}"
+        );
+    }
+
+    /// `SELECT 0 AS hr UNION ALL SELECT 1 AS hr`, aliased — the shape a hand-written
+    /// hour-bucket CTE plans to, and a relation that scans nothing.
+    fn scanless_relation(alias: &str) -> LogicalPlan {
+        let one_row = || {
+            LogicalPlanBuilder::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: true,
+                schema: Arc::new(datafusion::common::DFSchema::empty()),
+            }))
+        };
+        one_row()
+            .project(vec![lit(0i64).alias("hr")])
+            .expect("first branch")
+            .union(
+                one_row()
+                    .project(vec![lit(1i64).alias("hr")])
+                    .expect("second branch")
+                    .build()
+                    .expect("build second branch"),
+            )
+            .expect("union")
+            .alias(alias)
+            .expect("alias")
+            .build()
+            .expect("build")
+    }
+
+    fn scan(table: &str) -> LogicalPlan {
+        LogicalPlanBuilder::scan(table, Arc::new(MockTableSource::new()), None)
+            .expect("scan")
+            .build()
+            .expect("build scan")
+    }
+
+    /// A correlated reference whose relation scans nothing must not be read as a
+    /// second engine.
+    ///
+    /// The provider map is keyed off the relations that scan something, so a constant
+    /// relation is absent from it by construction. Reading that absence as
+    /// "ambiguous" refuses the whole candidate: the verdict propagates through every
+    /// enclosing node, nothing is federated at any level, and a statement whose only
+    /// tables are one engine's degrades to one scan per table reference.
+    ///
+    /// The relation is emitted inline and carries its own alias into the statement,
+    /// so the correlation stays bound and says nothing about which engine runs it.
+    #[test]
+    fn a_correlated_reference_to_a_scanless_relation_is_not_a_second_engine() {
+        assert!(
+            scope_names_a_scanless_relation(&scanless_relation("h"), &TableReference::bare("h"))
+                .expect("resolve h"),
+            "a constant relation the candidate defines has to keep the correlation bound"
+        );
+    }
+
+    /// A relation the candidate does not define at all stays ambiguous: federating
+    /// would emit an identifier the remote engine cannot bind.
+    #[test]
+    fn a_correlated_reference_to_an_undefined_relation_stays_ambiguous() {
+        assert!(
+            !scope_names_a_scanless_relation(&scanless_relation("h"), &TableReference::bare("g"))
+                .expect("resolve g"),
+            "a name the candidate never defines must not be treated as bound"
+        );
+    }
+
+    /// A relation that scans something is not this branch's business — it either has
+    /// a provider already or belongs to another engine.
+    #[test]
+    fn a_correlated_reference_to_a_scanning_relation_stays_ambiguous() {
+        let scope = LogicalPlanBuilder::from(scan("orders"))
+            .alias("h")
+            .expect("alias")
+            .build()
+            .expect("build");
+        assert!(
+            !scope_names_a_scanless_relation(&scope, &TableReference::bare("h"))
+                .expect("resolve h"),
+            "a relation that scans a table must not be rendered inline into another \
+             engine's statement"
+        );
+    }
+
+    /// Two relations of one name are refused rather than resolved. Binding the
+    /// correlation to the wrong one of them would return wrong rows with no error,
+    /// where refusing costs only the pushdown.
+    #[test]
+    fn a_duplicated_relation_name_is_refused_rather_than_resolved() {
+        let scope = LogicalPlanBuilder::from(scanless_relation("h"))
+            .cross_join(
+                LogicalPlanBuilder::from(scan("orders"))
+                    .alias("h")
+                    .expect("alias")
+                    .build()
+                    .expect("build"),
+            )
+            .expect("cross join")
+            .build()
+            .expect("build");
+        assert!(
+            !scope_names_a_scanless_relation(&scope, &TableReference::bare("h"))
+                .expect("resolve h"),
+            "an ambiguous name must be refused, not resolved to the constant relation"
         );
     }
 }
