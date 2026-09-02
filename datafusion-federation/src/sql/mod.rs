@@ -1486,12 +1486,20 @@ mod tests {
              whole plan has to reach the engine as one statement; got {}: {statements:#?}",
             statements.len()
         );
-        // Non-vacuity: one statement that pushed none of the work would also be one
-        // statement. The correlated aggregate has to be in it.
+        // Non-vacuity: one statement that pushed only the correlated inner query
+        // would also be one statement, and would still be executed once per outer
+        // row with `keys.k` unbound. The outer scanless relation has to be *in* the
+        // statement, and the correlation bound against it.
         let pushed = statements[0].to_lowercase();
         assert!(
+            pushed.contains("union all") && pushed.contains("keys"),
+            "the statement has to carry the outer scanless relation, or the \
+             correlation is unbound and the inner query runs per outer row: {}",
+            statements[0]
+        );
+        assert!(
             pushed.contains("count(") && pushed.contains("l_orderkey"),
-            "the one statement has to carry the correlated aggregate, not just a bare \
+            "the statement has to carry the correlated aggregate, not just a bare \
              scan: {}",
             statements[0]
         );

@@ -693,7 +693,15 @@ fn scope_names_a_scanless_relation(scope: &LogicalPlan, relation: &TableReferenc
             matches += 1;
             scanless = matches == 1 && !plan_scans_anything(node)?;
         }
-        Ok(TreeNodeRecursion::Continue)
+        // A `SubqueryAlias` is a query block: it is itself a relation of this scope,
+        // and the relations *inside* it are not. Its name has just been counted, so
+        // stop here rather than descend and count a relation nothing outside it can
+        // refer to.
+        Ok(if matches!(node, LogicalPlan::SubqueryAlias(_)) {
+            TreeNodeRecursion::Jump
+        } else {
+            TreeNodeRecursion::Continue
+        })
     })?;
 
     Ok(matches == 1 && scanless)
@@ -901,9 +909,10 @@ mod tests {
         );
     }
 
-    /// A relation of that name reached only through a *nested* subquery is not the
+    /// A relation of that name reached only through a *nested* query block is not the
     /// binding: it is not visible at the reference's position, so counting it would
     /// federate the plan alone and leave that identifier unbound in the emitted SQL.
+    /// Two ways to nest one, an expression subquery and a derived table.
     #[test]
     fn a_relation_named_only_inside_a_nested_subquery_is_not_the_binding() {
         let scope = LogicalPlanBuilder::from(scan("orders"))
@@ -919,6 +928,18 @@ mod tests {
                 .expect("resolve h"),
             "an alias reused inside a nested subquery is not what the correlation binds \
              to, and treating it as one emits an unbound identifier"
+        );
+
+        // The same, nested in a derived table rather than an expression subquery.
+        let derived = LogicalPlanBuilder::from(scanless_relation("h"))
+            .alias("d")
+            .expect("derived alias")
+            .build()
+            .expect("build");
+        assert!(
+            !scope_names_a_scanless_relation(&derived, &TableReference::bare("h"))
+                .expect("resolve h"),
+            "an alias inside a derived table is not visible outside it"
         );
     }
 
