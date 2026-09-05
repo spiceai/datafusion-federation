@@ -353,9 +353,16 @@ fn gather_analyzers(
 
     plan.apply(|node| {
         if let LogicalPlan::TableScan(table) = node {
-            let provider = get_table_source(&table.source)
-                .expect("caller is virtual exec so this is valid")
-                .expect("caller is virtual exec so this is valid");
+            // A scan with no federated source of its own contributes no
+            // analyzers. That is reachable: a recursive CTE's recursive term
+            // refers to the CTE by name, which plans as a `TableScan` over a
+            // `CteWorkTable`, and the work table now travels *inside* the
+            // federated plan rather than forcing the boundary below it. It
+            // resolves in whichever engine runs the enclosing `RecursiveQuery`,
+            // so there is nothing to gather from it.
+            let Some(provider) = get_table_source(&table.source)? else {
+                return Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue);
+            };
             if let Some(source) =
                 (provider.as_ref() as &dyn std::any::Any).downcast_ref::<SQLTableSource>()
             {
@@ -1887,6 +1894,107 @@ mod tests {
                 "Federated SQL must not contain the denied filter predicate; got: {sql}"
             );
         }
+
+        Ok(())
+    }
+
+    /// A recursive CTE joined to a federated table federates as one statement.
+    ///
+    /// The recursive term refers to the CTE by name, and that reference is a
+    /// `TableScan` over a `CteWorkTable`. Before the work table was made
+    /// neutral it took the placeholder `NopFederationProvider`, and
+    /// `ScanResult::merge` turns two different `Distinct` providers into
+    /// `Ambiguous` — so the boundary fell *below* the join and only the bare
+    /// scan federated, even though the CTE reads no table at all and the remote
+    /// could run the whole statement.
+    #[tokio::test]
+    async fn a_recursive_cte_does_not_block_the_join_from_federating() -> Result<(), DataFusionError>
+    {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        };
+        let table = get_test_table_provider("t".into(), executor);
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", table).unwrap();
+
+        let plan = ctx
+            .sql(
+                "WITH RECURSIVE g AS ( \
+                   SELECT 1 AS n UNION ALL SELECT n + 1 AS n FROM g WHERE n < 3 \
+                 ) \
+                 SELECT t.a FROM t JOIN g ON t.a = g.n",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        // The whole statement is one federated sub-plan, so the node the
+        // analyzer produced sits at the root rather than under the join.
+        assert!(
+            matches!(
+                &plan,
+                LogicalPlan::Extension(ext) if ext.node.name() == "Federated"
+            ),
+            "the join must federate as a whole; got:\n{}",
+            plan.display_indent()
+        );
+
+        // And the recursive CTE went with it, rather than being left behind.
+        let mut recursive_terms = 0usize;
+        plan.apply(|node| {
+            if matches!(node, LogicalPlan::RecursiveQuery(_)) {
+                recursive_terms += 1;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(
+            recursive_terms,
+            0,
+            "the RecursiveQuery belongs inside the federated sub-plan, not \
+             above it: {}",
+            plan.display_indent()
+        );
+
+        // Then take it as far as the execution path does. The assertions above
+        // stop at the logical plan, and the first version of this change passed
+        // them while aborting the process a moment later: `gather_analyzers`
+        // walks every `TableScan` in the federated plan and used to `expect` a
+        // federated source from each, which a work table has not.
+        //
+        //   panicked at src/sql/mod.rs: caller is virtual exec so this is valid
+        //
+        // `final_sql` runs `gather_analyzers` before it unparses, so reaching it
+        // is what this asserts. The unparsing that follows is *expected* to fail
+        // here — the DataFusion this crate builds against cannot render `WITH
+        // RECURSIVE`, and the flag gating that is carried by the Spice fork — so
+        // the outcome under test is "returns at all" rather than "returns Ok".
+        let physical = ctx
+            .sql(
+                "WITH RECURSIVE g AS ( \
+                   SELECT 1 AS n UNION ALL SELECT n + 1 AS n FROM g WHERE n < 3 \
+                 ) \
+                 SELECT t.a FROM t JOIN g ON t.a = g.n",
+            )
+            .await?
+            .create_physical_plan()
+            .await?;
+
+        let mut saw_virtual_exec = false;
+        physical.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                saw_virtual_exec = true;
+                let vp = node
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .expect("sql_federation_exec is a VirtualExecutionPlan");
+                // Panicking here is the regression; either Result is acceptable.
+                let _ = vp.final_sql();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert!(
+            saw_virtual_exec,
+            "the statement has to federate for this to exercise gather_analyzers"
+        );
 
         Ok(())
     }
