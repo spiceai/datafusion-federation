@@ -353,9 +353,16 @@ fn gather_analyzers(
 
     plan.apply(|node| {
         if let LogicalPlan::TableScan(table) = node {
-            let provider = get_table_source(&table.source)
-                .expect("caller is virtual exec so this is valid")
-                .expect("caller is virtual exec so this is valid");
+            // A scan with no federated source of its own contributes no
+            // analyzers. That is reachable: a recursive CTE's recursive term
+            // refers to the CTE by name, which plans as a `TableScan` over a
+            // `CteWorkTable`, and the work table now travels *inside* the
+            // federated plan rather than forcing the boundary below it. It
+            // resolves in whichever engine runs the enclosing `RecursiveQuery`,
+            // so there is nothing to gather from it.
+            let Some(provider) = get_table_source(&table.source)? else {
+                return Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue);
+            };
             if let Some(source) =
                 (provider.as_ref() as &dyn std::any::Any).downcast_ref::<SQLTableSource>()
             {
@@ -1946,6 +1953,47 @@ mod tests {
             "the RecursiveQuery belongs inside the federated sub-plan, not \
              above it: {}",
             plan.display_indent()
+        );
+
+        // Then take it as far as the execution path does. The assertions above
+        // stop at the logical plan, and the first version of this change passed
+        // them while aborting the process a moment later: `gather_analyzers`
+        // walks every `TableScan` in the federated plan and used to `expect` a
+        // federated source from each, which a work table has not.
+        //
+        //   panicked at src/sql/mod.rs: caller is virtual exec so this is valid
+        //
+        // `final_sql` runs `gather_analyzers` before it unparses, so reaching it
+        // is what this asserts. The unparsing that follows is *expected* to fail
+        // here — the DataFusion this crate builds against cannot render `WITH
+        // RECURSIVE`, and the flag gating that is carried by the Spice fork — so
+        // the outcome under test is "returns at all" rather than "returns Ok".
+        let physical = ctx
+            .sql(
+                "WITH RECURSIVE g AS ( \
+                   SELECT 1 AS n UNION ALL SELECT n + 1 AS n FROM g WHERE n < 3 \
+                 ) \
+                 SELECT t.a FROM t JOIN g ON t.a = g.n",
+            )
+            .await?
+            .create_physical_plan()
+            .await?;
+
+        let mut saw_virtual_exec = false;
+        physical.apply(|node| {
+            if node.name() == "sql_federation_exec" {
+                saw_virtual_exec = true;
+                let vp = node
+                    .downcast_ref::<VirtualExecutionPlan>()
+                    .expect("sql_federation_exec is a VirtualExecutionPlan");
+                // Panicking here is the regression; either Result is acceptable.
+                let _ = vp.final_sql();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert!(
+            saw_virtual_exec,
+            "the statement has to federate for this to exercise gather_analyzers"
         );
 
         Ok(())
