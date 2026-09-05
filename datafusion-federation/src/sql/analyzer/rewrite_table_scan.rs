@@ -84,29 +84,39 @@ impl RewriteTableScanAnalyzer {
                                     t.update_data(|col| Expr::OuterReferenceColumn(field, col))
                                 })
                             }
-                            Expr::Alias(alias) => match &alias.relation {
-                                Some(relation) => {
-                                    let Some(rewrite) =
-                                        known_rewrites.get(relation).and_then(|rewrite| {
-                                            match rewrite {
-                                                MultiPartTableReference::TableReference(
-                                                    rewrite,
-                                                ) => Some(rewrite),
-                                                _ => None,
+                            Expr::Alias(alias) => {
+                                // An alias name can spell out the local table:
+                                // an optimizer that rewrites an expression pins
+                                // the expression's old display name here so the
+                                // schema does not change under it, and that name
+                                // is qualified. It has to move with the table for
+                                // the same reason `rewrite_column` moves a
+                                // qualifier that appears inside an unqualified
+                                // column's name — the reference above this node
+                                // is one of those, and renaming only one of the
+                                // two leaves the plan unresolvable.
+                                let name =
+                                    rewrite_qualifier_in_pinned_name(&alias.name, known_rewrites);
+                                let relation = alias.relation.as_ref().and_then(|relation| {
+                                    known_rewrites
+                                        .get(relation)
+                                        .and_then(|rewrite| match rewrite {
+                                            MultiPartTableReference::TableReference(rewrite) => {
+                                                Some(rewrite.clone())
                                             }
+                                            _ => None,
                                         })
-                                    else {
-                                        return Ok(Transformed::no(Expr::Alias(alias)));
-                                    };
+                                });
 
-                                    Ok(Transformed::yes(Expr::Alias(Alias::new(
-                                        *alias.expr,
-                                        Some(rewrite.clone()),
-                                        alias.name,
-                                    ))))
+                                if name.is_none() && relation.is_none() {
+                                    return Ok(Transformed::no(Expr::Alias(alias)));
                                 }
-                                None => Ok(Transformed::no(Expr::Alias(alias))),
-                            },
+                                Ok(Transformed::yes(Expr::Alias(Alias::new(
+                                    *alias.expr,
+                                    relation.or(alias.relation),
+                                    name.unwrap_or(alias.name),
+                                ))))
+                            }
                             Expr::Wildcard { qualifier, options } => {
                                 if let Some(rewrite) = qualifier
                                     .as_ref()
@@ -386,6 +396,57 @@ fn rewrite_unnest_options(
 /// Checks if any of the rewrites match any substring in col_name, and replace that part of the string if so.
 /// This handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
 /// Returns the rewritten name if any rewrite was applied, otherwise None.
+/// `name` with every *dotted* reference to a rewritten table moved to that
+/// table's remote name.
+///
+/// Dotted on purpose. This exists for a name an optimizer pinned with an alias
+/// — the display name of the expression it rewrote, which always spells
+/// `table.column` — and a plain alias a user wrote can be the table's own bare
+/// name, which must be left alone. [`rewrite_column_name`] rewrites a bare word
+/// too, which is right for a column name built from an expression and wrong
+/// here.
+fn rewrite_qualifier_in_pinned_name(
+    name: &str,
+    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
+) -> Option<String> {
+    let mut rewritten = name.to_string();
+    let mut changed = false;
+
+    for (table_ref, rewrite) in known_rewrites {
+        let MultiPartTableReference::TableReference(rewrite) = rewrite else {
+            continue;
+        };
+        let from = format!("{table_ref}.");
+        let to = format!("{rewrite}.");
+        if from == to || !rewritten.contains(&from) {
+            continue;
+        }
+
+        let mut out = String::with_capacity(rewritten.len());
+        let mut rest = rewritten.as_str();
+        while let Some(idx) = rest.find(&from) {
+            let (before, after) = rest.split_at(idx);
+            out.push_str(before);
+            // Only a reference of its own, never the tail of a longer name.
+            let follows_a_name = out
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.');
+            if follows_a_name {
+                out.push_str(&from);
+            } else {
+                out.push_str(&to);
+                changed = true;
+            }
+            rest = &after[from.len()..];
+        }
+        out.push_str(rest);
+        rewritten = out;
+    }
+
+    changed.then_some(rewritten)
+}
+
 fn rewrite_column_name(
     col_name: &str,
     known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
@@ -766,6 +827,45 @@ mod tests {
         for test in tests {
             test_sql(&ctx, test.0, test.1).await?;
         }
+
+        Ok(())
+    }
+
+    /// An optimizer pins an expression's display name with an alias when it
+    /// rewrites the expression, and that pinned name spells out the *local*
+    /// table. Rewriting the scan has to move it, or the name the plan above
+    /// refers to and the name the plan below produces stop being the same name.
+    ///
+    /// `rewrite_column` already rewrites a qualifier that appears inside an
+    /// unqualified column's *name* — that is what carries the reference above
+    /// the aggregate across. The alias underneath it was not given the same
+    /// treatment, so only one half of the rename happened and the plan no longer
+    /// resolved: `Schema error: No field named "sum(CASE WHEN remote_table.c …)"`,
+    /// suggesting the identical name under the other qualifier.
+    #[tokio::test]
+    async fn test_rewrite_table_scans_moves_a_pinned_name_with_its_table() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        // The optimizer pins the name here because it folds the comparison's
+        // literal to a `Date32`, which would otherwise rename the aggregate.
+        let plan = ctx
+            .sql("SELECT SUM(CASE WHEN CAST(c AS DATE) >= DATE '2026-08-31' THEN a ELSE 0 END) AS t FROM app_table")
+            .await?
+            .into_optimized_plan()?;
+
+        let known_rewrites = collect_known_rewrites(&plan)?;
+        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+        let unparsed_sql = plan_to_sql(&rewritten_plan)?.to_string();
+
+        assert!(
+            !unparsed_sql.contains("app_table"),
+            "the local table name survived the rewrite: {unparsed_sql}"
+        );
+        assert!(
+            unparsed_sql.contains("remote_table"),
+            "the remote table name is missing: {unparsed_sql}"
+        );
 
         Ok(())
     }
