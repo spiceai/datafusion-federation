@@ -95,8 +95,26 @@ impl RewriteTableScanAnalyzer {
                                 // column's name — the reference above this node
                                 // is one of those, and renaming only one of the
                                 // two leaves the plan unresolvable.
-                                let name =
-                                    rewrite_qualifier_in_pinned_name(&alias.name, known_rewrites);
+                                //
+                                // Only where the alias wraps a *computed*
+                                // expression. An alias over a plain column is one
+                                // a user wrote, and its name is part of the
+                                // query's output contract:
+                                // `SELECT a AS "app_table.a" FROM app_table` must
+                                // keep that column name whatever the scan is
+                                // rewritten to. An optimizer pins a name because
+                                // it rewrote the expression under it, and a plain
+                                // column is not something it rewrites.
+                                let pins_a_computed_name =
+                                    !matches!(alias.expr.as_ref(), Expr::Column(_));
+                                let name = pins_a_computed_name
+                                    .then(|| {
+                                        rewrite_qualifier_in_pinned_name(
+                                            &alias.name,
+                                            known_rewrites,
+                                        )
+                                    })
+                                    .flatten();
                                 let relation = alias.relation.as_ref().and_then(|relation| {
                                     known_rewrites
                                         .get(relation)
@@ -866,6 +884,39 @@ mod tests {
             unparsed_sql.contains("remote_table"),
             "the remote table name is missing: {unparsed_sql}"
         );
+
+        Ok(())
+    }
+
+    /// A user-written alias is part of the query's output contract, even when it
+    /// happens to spell a local table name. Only a name an optimizer *pinned* —
+    /// the display name of an expression it rewrote — moves with the table.
+    #[tokio::test]
+    async fn test_rewrite_table_scans_leaves_a_user_alias_alone() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        for (query, expected) in [
+            (
+                r#"SELECT a AS "app_table.a" FROM app_table"#,
+                r#"SELECT remote_table.a AS "app_table.a" FROM remote_table"#,
+            ),
+            (
+                // Unquoted on the way out because the name needs no quoting; the
+                // point is that it is still `app_table` and not `remote_table`.
+                r#"SELECT a AS "app_table" FROM app_table"#,
+                r#"SELECT remote_table.a AS app_table FROM remote_table"#,
+            ),
+        ] {
+            let plan = ctx.sql(query).await?.logical_plan().clone();
+            let known_rewrites = collect_known_rewrites(&plan)?;
+            let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+            let sql = plan_to_sql(&rewritten)?.to_string();
+            assert_eq!(
+                sql, expected,
+                "a user's alias must survive the scan rewrite: {query}"
+            );
+        }
 
         Ok(())
     }
