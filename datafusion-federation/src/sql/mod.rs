@@ -95,8 +95,11 @@ impl SQLFederationProvider {
         // A neutral work table permits recursion to join a remote candidate.
         // SQL executors still need a dialect capable of rendering that candidate
         // before federation replaces its local execution path.
+        // Probe only the unparser: final-SQL hooks may have side effects. A plan
+        // that needs a custom late rewrite to become renderable stays local.
         Ok(!recursive
-            || VirtualExecutionPlan::rewrite_plan_to_sql(plan.clone(), self.executor.as_ref())
+            || Unparser::new(self.executor.dialect().as_ref())
+                .plan_to_sql(plan)
                 .is_ok())
     }
 }
@@ -329,20 +332,12 @@ impl VirtualExecutionPlan {
     /// syntax. The remote plan is obtained separately, via
     /// [`SQLExecutor::explain_plan`], and attached as this node's child.
     fn final_sql(&self) -> Result<String> {
-        Self::rewrite_plan_to_sql(self.plan.clone(), self.executor.as_ref())
-    }
-
-    fn rewrite_plan_to_sql(plan: LogicalPlan, executor: &dyn SQLExecutor) -> Result<String> {
-        let known_rewrites = collect_known_rewrites(&plan)?;
-        let plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+        let known_rewrites = collect_known_rewrites(&self.plan)?;
+        let plan = RewriteTableScanAnalyzer::rewrite(self.plan.clone(), &known_rewrites)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
         let plan = apply_logical_optimizers(plan, logical_optimizers)?;
-        let ast = Unparser::new(executor.dialect().as_ref()).plan_to_sql(&plan)?;
-        let ast = if let Some(mut analyzer) = executor.ast_analyzer() {
-            analyzer.analyze(ast)?
-        } else {
-            ast
-        };
+        let ast = self.plan_to_statement(&plan)?;
+        let ast = self.rewrite_with_executor_ast_analyzer(ast)?;
         let mut ast = apply_ast_analyzers(ast, ast_analyzers)?;
         RewriteMultiTableReference::rewrite(&mut ast, known_rewrites);
         apply_sql_query_rewriters(ast.to_string(), sql_query_rewriters)
