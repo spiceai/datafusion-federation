@@ -8,7 +8,7 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{
         self, build_join_schema,
-        expr::{Alias, Exists, InSubquery},
+        expr::{Exists, InSubquery},
         Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
         SubqueryAlias, Union, Window,
     },
@@ -73,10 +73,26 @@ impl RewriteTableScanAnalyzer {
                     _ => plan,
                 };
 
+                let input_schemas = plan
+                    .inputs()
+                    .into_iter()
+                    .map(|input| Arc::clone(input.schema()))
+                    .collect::<Vec<_>>();
                 let plan = plan.map_expressions(|expr| {
                     expr.transform_up(|expr| {
                         #[expect(deprecated)]
                         match expr {
+                            // An unqualified output name already supplied by an
+                            // input is an alias, not a table reference embedded in
+                            // an expression name. Preserve it along with its alias.
+                            Expr::Column(col)
+                                if col.relation.is_none()
+                                    && input_schemas
+                                        .iter()
+                                        .any(|schema| schema.has_column(&col)) =>
+                            {
+                                Ok(Transformed::no(Expr::Column(col)))
+                            }
                             Expr::Column(col) => rewrite_column(col, known_rewrites)
                                 .map(|t| t.update_data(Expr::Column)),
                             Expr::OuterReferenceColumn(field, col) => {
@@ -84,29 +100,24 @@ impl RewriteTableScanAnalyzer {
                                     t.update_data(|col| Expr::OuterReferenceColumn(field, col))
                                 })
                             }
-                            Expr::Alias(alias) => match &alias.relation {
-                                Some(relation) => {
-                                    let Some(rewrite) =
-                                        known_rewrites.get(relation).and_then(|rewrite| {
-                                            match rewrite {
-                                                MultiPartTableReference::TableReference(
-                                                    rewrite,
-                                                ) => Some(rewrite),
-                                                _ => None,
+                            Expr::Alias(mut alias) => {
+                                let relation = alias.relation.as_ref().and_then(|relation| {
+                                    known_rewrites
+                                        .get(relation)
+                                        .and_then(|rewrite| match rewrite {
+                                            MultiPartTableReference::TableReference(rewrite) => {
+                                                Some(rewrite.clone())
                                             }
+                                            _ => None,
                                         })
-                                    else {
-                                        return Ok(Transformed::no(Expr::Alias(alias)));
-                                    };
+                                });
 
-                                    Ok(Transformed::yes(Expr::Alias(Alias::new(
-                                        *alias.expr,
-                                        Some(rewrite.clone()),
-                                        alias.name,
-                                    ))))
-                                }
-                                None => Ok(Transformed::no(Expr::Alias(alias))),
-                            },
+                                let Some(relation) = relation else {
+                                    return Ok(Transformed::no(Expr::Alias(alias)));
+                                };
+                                alias.relation = Some(relation);
+                                Ok(Transformed::yes(Expr::Alias(alias)))
+                            }
                             Expr::Wildcard { qualifier, options } => {
                                 if let Some(rewrite) = qualifier
                                     .as_ref()
@@ -337,12 +348,11 @@ fn rewrite_unnest_plan(
         .expr
         .into_iter()
         .map(|expr| match expr {
-            Expr::Alias(alias) => {
-                let name = match known_unnest_rewrites.get(&alias.name) {
-                    Some(name) => name,
-                    None => &alias.name,
-                };
-                Ok(Expr::Alias(Alias::new(*alias.expr, alias.relation, name)))
+            Expr::Alias(mut alias) => {
+                if let Some(name) = known_unnest_rewrites.get(&alias.name) {
+                    alias.name.clone_from(name);
+                }
+                Ok(Expr::Alias(alias))
             }
             _ => Ok(expr),
         })
@@ -383,9 +393,6 @@ fn rewrite_unnest_options(
     options
 }
 
-/// Checks if any of the rewrites match any substring in col_name, and replace that part of the string if so.
-/// This handles cases like "MAX(foo.df_table.a)" -> "MAX(remote_table.a)"
-/// Returns the rewritten name if any rewrite was applied, otherwise None.
 fn rewrite_column_name(
     col_name: &str,
     known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
@@ -496,6 +503,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::expr::Alias;
     use datafusion::physical_plan::PhysicalExpr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::plan_to_sql;
@@ -767,6 +775,124 @@ mod tests {
             test_sql(&ctx, test.0, test.1).await?;
         }
 
+        Ok(())
+    }
+
+    /// References to optimizer-pinned names must resolve after a scan rewrite,
+    /// including when type coercion changes the expression under the alias.
+    #[tokio::test]
+    async fn test_rewrite_table_scans_moves_a_pinned_name_with_its_table() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        // The optimizer pins the name here because it folds the comparison's
+        // literal to a `Date32`, which would otherwise rename the aggregate.
+        let plan = ctx
+            .sql("SELECT SUM(CASE WHEN CAST(c AS DATE) >= DATE '2026-08-31' THEN a ELSE 0 END) AS t FROM app_table")
+            .await?
+            .into_optimized_plan()?;
+
+        let known_rewrites = collect_known_rewrites(&plan)?;
+        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+        let unparsed_sql = plan_to_sql(&rewritten_plan)?.to_string();
+
+        assert!(
+            !unparsed_sql.contains("app_table"),
+            "the local table name survived the rewrite: {unparsed_sql}"
+        );
+        assert!(
+            unparsed_sql.contains("remote_table"),
+            "the remote table name is missing: {unparsed_sql}"
+        );
+
+        Ok(())
+    }
+
+    /// Alias names are part of the query's output contract, including names
+    /// containing a local table name or matching an expression's display name.
+    #[tokio::test]
+    async fn test_rewrite_table_scans_leaves_a_user_alias_alone() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        for (query, expected) in [
+            (
+                r#"SELECT a + 1 AS "app_table.a" FROM app_table"#,
+                r#"SELECT (remote_table.a + 1) AS "app_table.a" FROM remote_table"#,
+            ),
+            (
+                r#"SELECT SUM(a) AS "sum(app_table.a)" FROM app_table"#,
+                r#"SELECT sum(remote_table.a) AS "sum(app_table.a)" FROM remote_table"#,
+            ),
+            (
+                r#"SELECT a AS "app_table.a" FROM app_table"#,
+                r#"SELECT remote_table.a AS "app_table.a" FROM remote_table"#,
+            ),
+            (
+                // Unquoted on the way out because the name needs no quoting; the
+                // point is that it is still `app_table` and not `remote_table`.
+                r#"SELECT a AS "app_table" FROM app_table"#,
+                r#"SELECT remote_table.a AS app_table FROM remote_table"#,
+            ),
+        ] {
+            let plan = ctx.sql(query).await?.logical_plan().clone();
+            let known_rewrites = collect_known_rewrites(&plan)?;
+            let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+            let sql = plan_to_sql(&rewritten)?.to_string();
+            assert_eq!(
+                sql, expected,
+                "a user's alias must survive the scan rewrite: {query}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rewrite_table_scans_preserves_alias_metadata() -> Result<()> {
+        use datafusion::logical_expr::{col, expr::FieldMetadata, lit};
+
+        let metadata = FieldMetadata::from(HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "example.alias".to_string(),
+        )]));
+        let alias = Alias::new(col("app_table.a") + lit(1_i64), Some("app_table"), "value")
+            .with_metadata(Some(metadata));
+        let plan = LogicalPlanBuilder::scan("app_table", get_test_table_source(), None)?
+            .project(vec![Expr::Alias(alias)])?
+            .build()?;
+        let expected = plan.schema().field(0).metadata().clone();
+        let rewrites = collect_known_rewrites(&plan)?;
+        let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &rewrites)?;
+        assert_eq!(rewritten.schema().field(0).metadata(), &expected);
+        assert_eq!(rewritten.schema().field(0).name(), "value");
+        Ok(())
+    }
+
+    #[test]
+    fn test_rewrite_unnest_preserves_alias_metadata() -> Result<()> {
+        use datafusion::functions_nested::expr_fn::make_array;
+        use datafusion::logical_expr::{col, expr::FieldMetadata};
+
+        let metadata = FieldMetadata::from(HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "example.alias".to_string(),
+        )]));
+        let alias = Alias::new(col("app_table.b"), None::<TableReference>, "label")
+            .with_metadata(Some(metadata));
+        let plan = LogicalPlanBuilder::scan("app_table", get_test_table_source(), None)?
+            .project(vec![
+                make_array(vec![col("app_table.a")]).alias("items"),
+                Expr::Alias(alias),
+            ])?
+            .unnest_column("items")?
+            .build()?;
+        let expected = plan.schema().field(1).metadata().clone();
+        assert!(!expected.is_empty());
+        let rewrites = collect_known_rewrites(&plan)?;
+        let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &rewrites)?;
+        assert_eq!(rewritten.schema().field(1).metadata(), &expected);
+        assert_eq!(rewritten.schema().field(1).name(), "label");
         Ok(())
     }
 
