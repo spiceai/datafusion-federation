@@ -278,6 +278,28 @@ impl FederationAnalyzerRule {
             }
         }
 
+        // A recursive term can read remote tables before its work-table definition
+        // is in scope. Consider the complete CTE before attempting to split its terms.
+        if matches!(plan, LogicalPlan::RecursiveQuery(_)) {
+            if let ScanResult::Distinct(provider) =
+                self.scan_plan_recursively(plan, providers, plan)?
+            {
+                let prepared_plan = Self::optimize_for_provider(&provider, plan.clone(), config)?;
+                if let Some(FederationAnalyzerForLogicalPlan::With(analyzer)) =
+                    provider.analyzer(&prepared_plan)
+                {
+                    if !is_root {
+                        return Ok((None, ScanResult::Distinct(provider)));
+                    }
+                    let federated_plan =
+                        Self::wrap_federated_plan(prepared_plan, explain_context.as_deref())?;
+                    let optimized =
+                        analyzer.execute_and_check(federated_plan, config, |_, _| {})?;
+                    return Ok((Some(optimized), ScanResult::None));
+                }
+            }
+        }
+
         // Check if this plan node is a leaf that determines the FederationProvider
         let (leaf_provider, _) = get_leaf_provider(plan)?;
 
