@@ -7,7 +7,7 @@ mod schema;
 mod table;
 mod table_reference;
 
-use std::{fmt, sync::Arc, vec};
+use std::{collections::HashSet, fmt, sync::Arc, vec};
 
 use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
 use ast_analyzer::RewriteMultiTableReference;
@@ -83,21 +83,33 @@ impl SQLFederationProvider {
     }
 
     fn can_unparse_recursive_ctes(&self, plan: &LogicalPlan) -> Result<bool> {
-        let mut recursive = false;
+        let mut recursive_queries = HashSet::new();
+        let mut work_tables = HashSet::new();
         plan.apply_with_subqueries(|node| {
-            if matches!(node, LogicalPlan::RecursiveQuery(_)) {
-                recursive = true;
-                Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop)
-            } else {
-                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            match node {
+                LogicalPlan::RecursiveQuery(query) => {
+                    recursive_queries.insert(query.name.clone());
+                }
+                LogicalPlan::TableScan(scan)
+                    if crate::analyzer::is_cte_work_table(&scan.source)? =>
+                {
+                    work_tables.insert(scan.table_name.table().to_string());
+                }
+                _ => {}
             }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })?;
+        // A recursive term cannot execute remotely without its CTE definition.
+        // During local fallback, only its real remote scans may federate.
+        if !work_tables.is_subset(&recursive_queries) {
+            return Ok(false);
+        }
         // A neutral work table permits recursion to join a remote candidate.
         // SQL executors still need a dialect capable of rendering that candidate
         // before federation replaces its local execution path.
         // Probe only the unparser: final-SQL hooks may have side effects. A plan
         // that needs a custom late rewrite to become renderable stays local.
-        Ok(!recursive
+        Ok(recursive_queries.is_empty()
             || Unparser::new(self.executor.dialect().as_ref())
                 .plan_to_sql(plan)
                 .is_ok())
@@ -1955,6 +1967,36 @@ mod tests {
             "the supported table scan must still federate"
         );
         assert!(!statements[0].contains("RECURSIVE"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recursive_fallback_keeps_the_work_table_local() -> Result<()> {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: None,
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", get_test_table_provider("t".into(), executor))?;
+        let query = "WITH RECURSIVE g AS ( \
+                       SELECT 1 AS n UNION ALL \
+                       SELECT g.n + 1 AS n FROM g JOIN t ON t.a = g.n WHERE g.n < 3 \
+                     ) SELECT n FROM g";
+        let physical = ctx.sql(query).await?.create_physical_plan().await?;
+        let mut has_work_table = false;
+        let mut statements = vec![];
+        physical.apply(|node| {
+            has_work_table |= node.name() == "WorkTableExec";
+            if let Some(vp) = node.downcast_ref::<VirtualExecutionPlan>() {
+                statements.push(vp.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(statements, ["SELECT t.a, t.b, t.c FROM t"]);
+        assert!(
+            has_work_table,
+            "the recursive work table must execute locally"
+        );
         Ok(())
     }
 

@@ -1009,7 +1009,7 @@ mod tests {
 ///
 /// Federating one still requires the dialect to render `WITH RECURSIVE`; a
 /// dialect that cannot declines, as it does for any other plan it cannot unparse.
-fn is_cte_work_table(source: &Arc<dyn TableSource>) -> Result<bool> {
+pub(crate) fn is_cte_work_table(source: &Arc<dyn TableSource>) -> Result<bool> {
     Ok(source_as_provider(source)?
         .downcast_ref::<datafusion::datasource::cte_worktable::CteWorkTable>()
         .is_some())
