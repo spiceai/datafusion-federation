@@ -8,7 +8,7 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{
         self, build_join_schema,
-        expr::{Alias, Exists, InSubquery},
+        expr::{Exists, InSubquery},
         Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
         SubqueryAlias, Union, Window,
     },
@@ -348,12 +348,11 @@ fn rewrite_unnest_plan(
         .expr
         .into_iter()
         .map(|expr| match expr {
-            Expr::Alias(alias) => {
-                let name = match known_unnest_rewrites.get(&alias.name) {
-                    Some(name) => name,
-                    None => &alias.name,
-                };
-                Ok(Expr::Alias(Alias::new(*alias.expr, alias.relation, name)))
+            Expr::Alias(mut alias) => {
+                if let Some(name) = known_unnest_rewrites.get(&alias.name) {
+                    alias.name.clone_from(name);
+                }
+                Ok(Expr::Alias(alias))
             }
             _ => Ok(expr),
         })
@@ -504,6 +503,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::logical_expr::expr::Alias;
     use datafusion::physical_plan::PhysicalExpr;
     use datafusion::sql::unparser::dialect::Dialect;
     use datafusion::sql::unparser::plan_to_sql;
@@ -866,6 +866,33 @@ mod tests {
         let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &rewrites)?;
         assert_eq!(rewritten.schema().field(0).metadata(), &expected);
         assert_eq!(rewritten.schema().field(0).name(), "value");
+        Ok(())
+    }
+
+    #[test]
+    fn test_rewrite_unnest_preserves_alias_metadata() -> Result<()> {
+        use datafusion::functions_nested::expr_fn::make_array;
+        use datafusion::logical_expr::{col, expr::FieldMetadata};
+
+        let metadata = FieldMetadata::from(HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "example.alias".to_string(),
+        )]));
+        let alias = Alias::new(col("app_table.b"), None::<TableReference>, "label")
+            .with_metadata(Some(metadata));
+        let plan = LogicalPlanBuilder::scan("app_table", get_test_table_source(), None)?
+            .project(vec![
+                make_array(vec![col("app_table.a")]).alias("items"),
+                Expr::Alias(alias),
+            ])?
+            .unnest_column("items")?
+            .build()?;
+        let expected = plan.schema().field(1).metadata().clone();
+        assert!(!expected.is_empty());
+        let rewrites = collect_known_rewrites(&plan)?;
+        let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &rewrites)?;
+        assert_eq!(rewritten.schema().field(1).metadata(), &expected);
+        assert_eq!(rewritten.schema().field(1).name(), "label");
         Ok(())
     }
 
