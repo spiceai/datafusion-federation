@@ -19,7 +19,7 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{Extension, LogicalPlan},
+    logical_expr::{lit, Extension, LogicalPlan, LogicalPlanBuilder},
     optimizer::{
         optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer, OptimizerRule,
     },
@@ -85,10 +85,12 @@ impl SQLFederationProvider {
     fn can_unparse_recursive_ctes(&self, plan: &LogicalPlan) -> Result<bool> {
         let mut recursive_queries = HashSet::new();
         let mut work_tables = HashSet::new();
+        let mut needs_distinct = false;
         plan.apply_with_subqueries(|node| {
             match node {
                 LogicalPlan::RecursiveQuery(query) => {
                     recursive_queries.insert(query.name.clone());
+                    needs_distinct |= query.is_distinct;
                 }
                 LogicalPlan::TableScan(scan)
                     if crate::analyzer::is_cte_work_table(&scan.source)? =>
@@ -104,15 +106,24 @@ impl SQLFederationProvider {
         if !work_tables.is_subset(&recursive_queries) {
             return Ok(false);
         }
-        // A neutral work table permits recursion to join a remote candidate.
-        // SQL executors still need a dialect capable of rendering that candidate
-        // before federation replaces its local execution path.
-        // Probe only the unparser: final-SQL hooks may have side effects. A plan
-        // that needs a custom late rewrite to become renderable stays local.
-        Ok(recursive_queries.is_empty()
-            || Unparser::new(self.executor.dialect().as_ref())
-                .plan_to_sql(plan)
-                .is_ok())
+        if recursive_queries.is_empty() {
+            return Ok(true);
+        }
+        // Probe the recursive syntax alone. Table and expression rewrites belong
+        // to final SQL generation and must not run as a capability check.
+        let term = LogicalPlanBuilder::empty(true)
+            .project([lit(1).alias("n")])?
+            .build()?;
+        let probe = LogicalPlanBuilder::from(term.clone())
+            .to_recursive_query(
+                "federation_recursive_probe".to_string(),
+                term,
+                needs_distinct,
+            )?
+            .build()?;
+        Ok(Unparser::new(self.executor.dialect().as_ref())
+            .plan_to_sql(&probe)
+            .is_ok())
     }
 }
 
