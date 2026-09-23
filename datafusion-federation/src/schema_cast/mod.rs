@@ -1,5 +1,6 @@
 use async_stream::stream;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::Statistics;
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
@@ -70,6 +71,14 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// `SchemaCastScanExec` has no physical expressions of its own to visit.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.

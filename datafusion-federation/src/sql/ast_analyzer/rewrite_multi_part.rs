@@ -1,11 +1,8 @@
 use std::ops::ControlFlow;
 
 use datafusion::{
-    common::HashMap,
-    sql::{
-        sqlparser::ast::{self, Ident, ObjectName, ObjectNamePart, VisitMut, VisitorMut},
-        TableReference,
-    },
+    common::{HashMap, TableReference},
+    sql::sqlparser::ast::{self, Ident, ObjectName, ObjectNamePart, VisitMut, VisitorMut},
 };
 
 use crate::sql::table_reference::{MultiPartTableReference, MultiTableReference};

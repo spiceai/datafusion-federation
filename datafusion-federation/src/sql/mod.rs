@@ -14,12 +14,19 @@ use ast_analyzer::RewriteMultiTableReference;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
+    catalog::Session,
     common::DFSchema,
-    common::{tree_node::TreeNode, Statistics},
+    common::{
+        tree_node::{TreeNode, TreeNodeRecursion},
+        Statistics,
+    },
     config::ConfigOptions,
     error::{DataFusionError, Result},
-    execution::{context::SessionState, TaskContext},
-    logical_expr::{lit, Extension, LogicalPlan, LogicalPlanBuilder},
+    execution::TaskContext,
+    logical_expr::{
+        lit, physical_planning_context::PhysicalPlanningContext, Extension, LogicalPlan,
+        LogicalPlanBuilder,
+    },
     optimizer::{
         optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer, OptimizerRule,
     },
@@ -226,7 +233,8 @@ impl FederationPlanner for SQLFederationPlanner {
     async fn plan_federation(
         &self,
         node: &FederatedPlanNode,
-        _session_state: &SessionState,
+        _session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = Arc::new(node.plan().schema().as_arrow().clone());
         let plan = node.plan().clone();
@@ -561,6 +569,15 @@ impl ExecutionPlan for VirtualExecutionPlan {
         self.remote_plan.iter().collect()
     }
 
+    /// The federated subplan runs as opaque remote SQL text; there are no
+    /// local physical expressions to visit.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
@@ -650,6 +667,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
 #[allow(clippy::type_complexity)]
 #[cfg(test)]
 mod tests {
+    use datafusion::execution::context::SessionState;
     use std::any::Any;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

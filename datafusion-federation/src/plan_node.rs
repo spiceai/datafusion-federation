@@ -7,11 +7,13 @@ use std::{
 
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     common::DFSchemaRef,
     error::{DataFusionError, Result},
-    execution::context::{QueryPlanner, SessionState},
+    execution::context::QueryPlanner,
     logical_expr::{
-        Expr, Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+        physical_planning_context::PhysicalPlanningContext, Expr, Extension, LogicalPlan,
+        UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
     },
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
@@ -180,7 +182,7 @@ impl QueryPlanner for FederatedQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let annotated = Self::annotate_query_directives(logical_plan)?;
         let logical_plan = annotated.as_ref().unwrap_or(logical_plan);
@@ -190,7 +192,7 @@ impl QueryPlanner for FederatedQueryPlanner {
                 Arc::new(FederatedPlanner::new()),
             ]);
         physical_planner
-            .create_physical_plan(logical_plan, session_state)
+            .create_physical_plan(logical_plan, session)
             .await
     }
 }
@@ -200,7 +202,8 @@ pub trait FederationPlanner: Send + Sync {
     async fn plan_federation(
         &self,
         node: &FederatedPlanNode,
-        session_state: &SessionState,
+        session: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 }
 
@@ -252,7 +255,8 @@ impl ExtensionPlanner for FederatedPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let dc_node = node.as_any().downcast_ref::<FederatedPlanNode>();
         if let Some(fed_node) = dc_node {
@@ -263,7 +267,9 @@ impl ExtensionPlanner for FederatedPlanner {
             }
 
             let fed_planner = Arc::clone(&fed_node.planner);
-            let exec_plan = fed_planner.plan_federation(fed_node, session_state).await?;
+            let exec_plan = fed_planner
+                .plan_federation(fed_node, session, planning_ctx)
+                .await?;
             return Ok(Some(exec_plan));
         }
         Ok(None)

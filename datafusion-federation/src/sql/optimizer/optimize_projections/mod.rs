@@ -25,7 +25,8 @@ use datafusion::{
     },
     error::DataFusionError,
     logical_expr::{
-        expr::Alias, Aggregate, Distinct, LogicalPlan, Projection, TableScan, Unnest, Window,
+        expr::Alias, Aggregate, Distinct, LogicalPlan, Projection, TableScan, TableScanBuilder,
+        Unnest, Window,
     },
     optimizer::{optimizer::ApplyOrder, utils::NamePreserver, OptimizerConfig, OptimizerRule},
     prelude::Expr,
@@ -232,6 +233,7 @@ fn optimize_projections(
                 projection,
                 filters,
                 fetch,
+                statistics_requests,
                 projected_schema: _,
             } = table_scan;
 
@@ -241,7 +243,12 @@ fn optimize_projections(
                 Some(projection) => indices.into_mapped_indices(|idx| projection[idx]),
                 None => indices.into_inner(),
             };
-            return TableScan::try_new(table_name, source, Some(projection), filters, fetch)
+            return TableScanBuilder::new(table_name, source)
+                .with_projection(Some(projection))
+                .with_filters(filters)
+                .with_fetch(fetch)
+                .with_statistics_requests(statistics_requests)
+                .build()
                 .map(LogicalPlan::TableScan)
                 .map(Transformed::yes);
         }
@@ -743,7 +750,7 @@ mod tests {
 
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
-        common::{DFSchema, JoinType},
+        common::{DFSchema, JoinType, TableReference},
         error::DataFusionError,
         functions_aggregate::{
             count::{count, count_udaf},
@@ -754,7 +761,6 @@ mod tests {
         },
         optimizer::{Optimizer, OptimizerContext, OptimizerRule},
         prelude::{col, lit, Expr, ExprFunctionExt},
-        sql::TableReference,
     };
 
     type Result<T, E = DataFusionError> = std::result::Result<T, E>;

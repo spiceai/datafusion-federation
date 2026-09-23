@@ -8,12 +8,12 @@ use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    common::TableReference,
     config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
     logical_expr::{Expr, Extension, LogicalPlan, Projection, TableScan, TableSource},
     optimizer::analyzer::AnalyzerRule,
-    sql::TableReference,
 };
 use scan_result::ScanResult;
 use std::collections::HashMap;
@@ -808,8 +808,8 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{lit, DmlStatement, EmptyRelation, WriteOp};
+    use datafusion::common::TableReference;
     use datafusion::optimizer::analyzer::AnalyzerRule;
-    use datafusion::sql::TableReference;
     use std::sync::Arc;
 
     // Minimal TableSource needed to construct a DmlStatement.

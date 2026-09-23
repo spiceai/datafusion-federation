@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::{
     common::{
         tree_node::{Transformed, TreeNode},
-        Column, HashMap, RecursionUnnestOption, UnnestOptions,
+        Column, HashMap, RecursionUnnestOption, TableReference, UnnestOptions,
     },
     error::DataFusionError,
     logical_expr::{
@@ -12,7 +12,6 @@ use datafusion::{
         Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
         SubqueryAlias, Union, Window,
     },
-    sql::TableReference,
 };
 
 use crate::get_table_source;

@@ -20,7 +20,7 @@ pub fn replace_table_args_analyzer_rule(mut visitor: TableArgReplace) -> AstAnal
 ///
 /// ```rust
 /// use datafusion::sql::sqlparser::ast::{FunctionArg, Expr, Value};
-/// use datafusion::sql::TableReference;
+/// use datafusion::common::TableReference;
 /// use datafusion_federation::sql::ast_analyzer::TableArgReplace;
 ///
 /// let mut analyzer = TableArgReplace::default().with(
