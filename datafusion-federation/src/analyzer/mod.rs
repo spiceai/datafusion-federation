@@ -806,9 +806,9 @@ fn get_leaf_provider(
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::TableReference;
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{lit, DmlStatement, EmptyRelation, WriteOp};
-    use datafusion::common::TableReference;
     use datafusion::optimizer::analyzer::AnalyzerRule;
     use std::sync::Arc;
 
