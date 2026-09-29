@@ -15,7 +15,10 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
     common::DFSchema,
-    common::{tree_node::TreeNode, Statistics},
+    common::{
+        tree_node::{TreeNode, TreeNodeRecursion},
+        Statistics,
+    },
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
@@ -29,6 +32,7 @@ use datafusion::{
         filter_pushdown::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
+        apply_expression_roots,
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
@@ -559,6 +563,15 @@ impl ExecutionPlan for VirtualExecutionPlan {
         // display-only, and `with_new_children` below keeps it out of reach of
         // physical optimizer rules.
         self.remote_plan.iter().collect()
+    }
+
+    /// Visits the filters pushed down into this node; the executor applies them
+    /// inside `execute`.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(&self.filters, f)
     }
 
     fn with_new_children(
@@ -1167,7 +1180,7 @@ mod tests {
         });
 
         let expected = vec![
-            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) Table"#,
+            r#"SELECT a, b, c FROM "default"."table" UNION ALL SELECT a, b, c FROM "default"."Table"(1) Table"#,
         ];
 
         assert_eq!(

@@ -12,7 +12,7 @@ use datafusion::{
         Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
         SubqueryAlias, Union, Window,
     },
-    sql::TableReference,
+    common::TableReference,
 };
 
 use crate::get_table_source;
@@ -1018,7 +1018,7 @@ mod tests {
             ),
             (
                 "SELECT foo.df_table.a FROM foo.df_table",
-                r#"SELECT remote_table.a FROM "default".remote_table"#,
+                r#"SELECT a FROM "default".remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",

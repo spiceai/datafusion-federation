@@ -16,7 +16,7 @@ use std::{fmt, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
-    common::tree_node::{Transformed, TreeNode},
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     common::Statistics,
     config::ConfigOptions,
     error::{DataFusionError, Result},
@@ -26,7 +26,7 @@ use datafusion::{
     physical_plan::{
         execution_plan::SchedulingType,
         execution_plan::{Boundedness, EmissionType},
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
     },
 };
@@ -165,6 +165,14 @@ impl ExecutionPlan for RemotePlanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.children.iter().collect()
+    }
+
+    /// A display-only record of the remote plan; it holds no expressions.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

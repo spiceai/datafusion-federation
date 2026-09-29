@@ -57,7 +57,7 @@ impl RemoteTable {
     ///
     /// Examples:
     /// ```ignore
-    /// use datafusion::sql::TableReference;
+    /// use datafusion::common::TableReference;
     ///
     /// RemoteTable::new("myschema.table".try_into()?, schema);
     /// RemoteTable::new(r#"myschema."Table""#.try_into()?, schema);

@@ -1,7 +1,7 @@
 use datafusion::{
     common::{error::Result, tree_node::TreeNodeRecursion, HashMap},
     logical_expr::LogicalPlan,
-    sql::TableReference,
+    common::TableReference,
 };
 
 use crate::{

@@ -25,7 +25,8 @@ use datafusion::{
     },
     error::DataFusionError,
     logical_expr::{
-        expr::Alias, Aggregate, Distinct, LogicalPlan, Projection, TableScan, Unnest, Window,
+        expr::Alias, Aggregate, Distinct, LogicalPlan, Projection, TableScanBuilder, Unnest,
+        Window,
     },
     optimizer::{optimizer::ApplyOrder, utils::NamePreserver, OptimizerConfig, OptimizerRule},
     prelude::Expr,
@@ -226,22 +227,15 @@ fn optimize_projections(
             });
         }
         LogicalPlan::TableScan(table_scan) => {
-            let TableScan {
-                table_name,
-                source,
-                projection,
-                filters,
-                fetch,
-                projected_schema: _,
-            } = table_scan;
-
             // Get indices referred to in the original (schema with all fields)
             // given projected indices.
-            let projection = match &projection {
+            let projection = match &table_scan.projection {
                 Some(projection) => indices.into_mapped_indices(|idx| projection[idx]),
                 None => indices.into_inner(),
             };
-            return TableScan::try_new(table_name, source, Some(projection), filters, fetch)
+            return TableScanBuilder::from(table_scan)
+                .with_projection(Some(projection))
+                .build()
                 .map(LogicalPlan::TableScan)
                 .map(Transformed::yes);
         }
@@ -754,7 +748,7 @@ mod tests {
         },
         optimizer::{Optimizer, OptimizerContext, OptimizerRule},
         prelude::{col, lit, Expr, ExprFunctionExt},
-        sql::TableReference,
+        common::TableReference,
     };
 
     type Result<T, E = DataFusionError> = std::result::Result<T, E>;

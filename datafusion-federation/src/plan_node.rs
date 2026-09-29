@@ -9,9 +9,11 @@ use async_trait::async_trait;
 use datafusion::{
     common::DFSchemaRef,
     error::{DataFusionError, Result},
+    catalog::Session,
     execution::context::{QueryPlanner, SessionState},
     logical_expr::{
-        Expr, Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+        physical_planning_context::PhysicalPlanningContext, Expr, Extension, LogicalPlan,
+        UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
     },
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
@@ -180,7 +182,7 @@ impl QueryPlanner for FederatedQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let annotated = Self::annotate_query_directives(logical_plan)?;
         let logical_plan = annotated.as_ref().unwrap_or(logical_plan);
@@ -193,6 +195,19 @@ impl QueryPlanner for FederatedQueryPlanner {
             .create_physical_plan(logical_plan, session_state)
             .await
     }
+}
+
+/// [`FederationPlanner`] is planned against a concrete [`SessionState`], while
+/// DataFusion's planner hooks hand over a `&dyn Session`.
+fn as_session_state(session: &dyn Session) -> Result<&SessionState> {
+    session
+        .as_any()
+        .downcast_ref::<SessionState>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(
+                "Federated plans can only be planned with a SessionState".to_string(),
+            )
+        })
 }
 
 #[async_trait]
@@ -252,10 +267,12 @@ impl ExtensionPlanner for FederatedPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session_state: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let dc_node = node.as_any().downcast_ref::<FederatedPlanNode>();
         if let Some(fed_node) = dc_node {
+            let session_state = as_session_state(session_state)?;
             if !logical_inputs.is_empty() || !physical_inputs.is_empty() {
                 return Err(DataFusionError::Plan(
                     "Inconsistent number of inputs".into(),

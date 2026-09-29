@@ -13,7 +13,7 @@ use datafusion::{
     error::Result,
     logical_expr::{Expr, Extension, LogicalPlan, Projection, TableScan, TableSource},
     optimizer::analyzer::AnalyzerRule,
-    sql::TableReference,
+    common::TableReference,
 };
 use scan_result::ScanResult;
 use std::collections::HashMap;
@@ -809,7 +809,7 @@ mod tests {
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{lit, DmlStatement, EmptyRelation, WriteOp};
     use datafusion::optimizer::analyzer::AnalyzerRule;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use std::sync::Arc;
 
     // Minimal TableSource needed to construct a DmlStatement.
