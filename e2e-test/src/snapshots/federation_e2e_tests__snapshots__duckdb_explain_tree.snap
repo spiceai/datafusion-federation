@@ -61,16 +61,13 @@ description: "EXPLAIN FORMAT TREE SELECT id, name FROM measurements WHERE id > 1
 │   ss_string_ubigint(#1)   │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
-│          SEQ_SCAN         │
+│         SEQ_SCAN          │
 │    --------------------   │
 │   estimated cardinality:  │
 │             1             │
 │                           │
 │       filters: id>1       │
 │   projections: id, name   │
-│                           │
-│           table:          │
-│  memory.main.measurements │
-│                           │
+│    table: measurements    │
 │   type: Sequential Scan   │
 └───────────────────────────┘
