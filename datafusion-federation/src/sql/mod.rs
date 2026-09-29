@@ -1953,6 +1953,62 @@ mod tests {
         Ok(())
     }
 
+    /// A function the executor reports it cannot run must stay in the local plan:
+    /// the SQL sent to the source carries only the scan, and the function is
+    /// evaluated by DataFusion above it.
+    #[tokio::test]
+    async fn can_execute_plan_keeps_an_unsupported_function_local() -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: Some(Arc::new(|plan| {
+                plan.expressions().iter().any(|expr| {
+                    expr.exists(|e| {
+                        Ok(matches!(e, Expr::ScalarFunction(f) if f.name() == "upper"))
+                    })
+                    .unwrap_or(false)
+                })
+            })),
+        };
+
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", get_test_table_provider("t".into(), executor))?;
+
+        let physical_plan = ctx
+            .sql("SELECT upper(b) FROM t")
+            .await?
+            .create_physical_plan()
+            .await?;
+
+        let mut federation_sqls: Vec<String> = Vec::new();
+        physical_plan.apply(|node| {
+            if let Some(vp) = node.downcast_ref::<VirtualExecutionPlan>() {
+                federation_sqls.push(vp.final_sql()?);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        assert_eq!(
+            federation_sqls.len(),
+            1,
+            "the scan must still be federated: {federation_sqls:?}"
+        );
+        for sql in &federation_sqls {
+            assert!(
+                !sql.to_lowercase().contains("upper"),
+                "the unsupported function must not be pushed to the source; got: {sql}"
+            );
+        }
+        let display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            display.contains("ProjectionExec") && display.contains("upper"),
+            "the function must be evaluated locally:\n{display}"
+        );
+
+        Ok(())
+    }
+
     /// A dialect without recursive-CTE rendering keeps recursion local and
     /// executes only the supported scan remotely.
     #[tokio::test]
