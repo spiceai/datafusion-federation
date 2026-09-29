@@ -18,3 +18,24 @@ datafusion = "55"
 datafusion-federation = { path = "./datafusion-federation", version = "0.4.2" }
 futures = "0.3"
 tokio = { version = "1.41", features = ["full"] }
+
+[patch.crates-io]
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "8ee430737cb6999025d0b29672ec6cb92df19b6d" } # branch: spiceai-1.4.4-patches (DuckDB 1.4.4, arrow 59)
+
+# arrow-rs 59 with spice patches (ObjectVersionType + new_with_meta for Azure compatibility) — branch: spiceai-59-patches
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1e4a1d355a0b4c9ef917c5eec6ed2f88b670a0ff" }
