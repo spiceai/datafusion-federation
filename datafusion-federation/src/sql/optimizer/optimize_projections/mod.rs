@@ -25,8 +25,7 @@ use datafusion::{
     },
     error::DataFusionError,
     logical_expr::{
-        expr::Alias, Aggregate, Distinct, LogicalPlan, Projection, TableScanBuilder, Unnest,
-        Window,
+        expr::Alias, Aggregate, Distinct, LogicalPlan, Projection, TableScanBuilder, Unnest, Window,
     },
     optimizer::{optimizer::ApplyOrder, utils::NamePreserver, OptimizerConfig, OptimizerRule},
     prelude::Expr,
@@ -737,6 +736,7 @@ mod tests {
 
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
+        common::TableReference,
         common::{DFSchema, JoinType},
         error::DataFusionError,
         functions_aggregate::{
@@ -748,7 +748,6 @@ mod tests {
         },
         optimizer::{Optimizer, OptimizerContext, OptimizerRule},
         prelude::{col, lit, Expr, ExprFunctionExt},
-        common::TableReference,
     };
 
     type Result<T, E = DataFusionError> = std::result::Result<T, E>;

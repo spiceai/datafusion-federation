@@ -28,11 +28,11 @@ use datafusion::{
     },
     physical_expr::EquivalenceProperties,
     physical_plan::{
+        apply_expression_roots,
         execution_plan::{Boundedness, EmissionType},
         filter_pushdown::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
-        apply_expression_roots,
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
@@ -1962,10 +1962,8 @@ mod tests {
             compute_context: "ctx".into(),
             cannot_federate: Some(Arc::new(|plan| {
                 plan.expressions().iter().any(|expr| {
-                    expr.exists(|e| {
-                        Ok(matches!(e, Expr::ScalarFunction(f) if f.name() == "upper"))
-                    })
-                    .unwrap_or(false)
+                    expr.exists(|e| Ok(matches!(e, Expr::ScalarFunction(f) if f.name() == "upper")))
+                        .unwrap_or(false)
                 })
             })),
         };

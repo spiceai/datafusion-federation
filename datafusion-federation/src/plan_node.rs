@@ -7,9 +7,9 @@ use std::{
 
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     common::DFSchemaRef,
     error::{DataFusionError, Result},
-    catalog::Session,
     execution::context::{QueryPlanner, SessionState},
     logical_expr::{
         physical_planning_context::PhysicalPlanningContext, Expr, Extension, LogicalPlan,

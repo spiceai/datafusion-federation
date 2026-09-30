@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::{
+    common::TableReference,
     common::{
         tree_node::{Transformed, TreeNode},
         Column, HashMap, RecursionUnnestOption, UnnestOptions,
@@ -12,7 +13,6 @@ use datafusion::{
         Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
         SubqueryAlias, Union, Window,
     },
-    common::TableReference,
 };
 
 use crate::get_table_source;
