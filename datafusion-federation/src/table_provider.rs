@@ -165,6 +165,24 @@ impl TableProvider for FederatedTableProviderAdaptor {
     }
 }
 
+// FederatedTableProvider extends DataFusion's TableProvider trait
+// to allow grouping of TableScans of the same FederationProvider.
+#[async_trait]
+pub trait FederatedTableSource: TableSource {
+    /// Return the FederationProvider associated with this Table
+    fn federation_provider(&self) -> Arc<dyn FederationProvider>;
+}
+
+impl std::fmt::Debug for dyn FederatedTableSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "FederatedTableSource: {:?}",
+            self.federation_provider().name()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,23 +356,5 @@ mod tests {
             err.contains("FederatedTableProviderAdaptor cannot update"),
             "unexpected error: {err}"
         );
-    }
-}
-
-// FederatedTableProvider extends DataFusion's TableProvider trait
-// to allow grouping of TableScans of the same FederationProvider.
-#[async_trait]
-pub trait FederatedTableSource: TableSource {
-    /// Return the FederationProvider associated with this Table
-    fn federation_provider(&self) -> Arc<dyn FederationProvider>;
-}
-
-impl std::fmt::Debug for dyn FederatedTableSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "FederatedTableSource: {:?}",
-            self.federation_provider().name()
-        )
     }
 }

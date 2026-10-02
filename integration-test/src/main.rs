@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_federation::{sql::federation_analyzer_rule, FederatedQueryPlanner};
 use datafusion_table_providers::{
     duckdb::DuckDBTableFactory, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,

@@ -19,7 +19,7 @@ duckdb = ["dep:duckdb"]
 # workspace under `--all-features`, which is what lets integration-test's binary
 # link without a system libduckdb.
 [dependencies]
-duckdb = { version = "1.10503", features = ["bundled"], optional = true }
+duckdb = { version = "1.4.4", features = ["bundled"], optional = true }
 
 # Everything else is only ever used by the `#![cfg(test)]` crate body, so it does
 # not need building for `cargo check`/`cargo build`.

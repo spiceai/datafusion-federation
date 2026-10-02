@@ -8,12 +8,12 @@ use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    common::TableReference,
     config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
     logical_expr::{Expr, Extension, LogicalPlan, Projection, TableScan, TableSource},
     optimizer::analyzer::AnalyzerRule,
-    sql::TableReference,
 };
 use scan_result::ScanResult;
 use std::collections::HashMap;
@@ -802,14 +802,57 @@ fn get_leaf_provider(
     }
 }
 
+/// Whether this scan is a recursive CTE reading *itself*.
+///
+/// The recursive term of a `RecursiveQuery` refers to the CTE by name, and that
+/// reference is planned as a `TableScan` over a `CteWorkTable`. Treated like any
+/// other unfederated table it would take the placeholder provider above, and
+/// that placeholder is not neutral: `ScanResult::merge` leaves `None` alone but
+/// turns two *different* `Distinct` providers into `Ambiguous`. So a query
+/// joining a recursive CTE to a federated table merges
+/// `Distinct(remote).merge(Distinct(Nop))` into `Ambiguous`, the boundary falls
+/// below the join, and only the bare scan federates — even when the CTE reads no
+/// table at all and the remote could run the whole statement.
+///
+/// A work table is not a local table. The name resolves *inside* the enclosing
+/// `RecursiveQuery`, in whichever engine evaluates it, so it constrains the
+/// choice of engine no more than a `VALUES` list does — and a `VALUES` list is
+/// already neutral here, because it is not a `TableScan`. Answering `None` says
+/// exactly that, and leaves the enclosing `RecursiveQuery` free to federate on
+/// the strength of the tables it really reads.
+///
+/// Federating one still requires the dialect to render `WITH RECURSIVE`; a
+/// dialect that cannot declines, as it does for any other plan it cannot unparse.
+pub(crate) fn is_cte_work_table(source: &Arc<dyn TableSource>) -> Result<bool> {
+    Ok(source_as_provider(source)?
+        .downcast_ref::<datafusion::datasource::cte_worktable::CteWorkTable>()
+        .is_some())
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn get_table_source(
+    source: &Arc<dyn TableSource>,
+) -> Result<Option<Arc<dyn FederatedTableSource>>> {
+    // Unwrap TableSource
+    let source = source_as_provider(source)?;
+
+    // Get FederatedTableProviderAdaptor
+    let Some(wrapper) = source.downcast_ref::<FederatedTableProviderAdaptor>() else {
+        return Ok(None);
+    };
+
+    // Return original FederatedTableSource
+    Ok(Some(Arc::clone(&wrapper.source)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::TableReference;
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{lit, DmlStatement, EmptyRelation, WriteOp};
     use datafusion::optimizer::analyzer::AnalyzerRule;
-    use datafusion::sql::TableReference;
     use std::sync::Arc;
 
     // Minimal TableSource needed to construct a DmlStatement.
@@ -1008,47 +1051,4 @@ mod tests {
             "an ambiguous name must be refused, not resolved to the constant relation"
         );
     }
-}
-
-/// Whether this scan is a recursive CTE reading *itself*.
-///
-/// The recursive term of a `RecursiveQuery` refers to the CTE by name, and that
-/// reference is planned as a `TableScan` over a `CteWorkTable`. Treated like any
-/// other unfederated table it would take the placeholder provider above, and
-/// that placeholder is not neutral: `ScanResult::merge` leaves `None` alone but
-/// turns two *different* `Distinct` providers into `Ambiguous`. So a query
-/// joining a recursive CTE to a federated table merges
-/// `Distinct(remote).merge(Distinct(Nop))` into `Ambiguous`, the boundary falls
-/// below the join, and only the bare scan federates — even when the CTE reads no
-/// table at all and the remote could run the whole statement.
-///
-/// A work table is not a local table. The name resolves *inside* the enclosing
-/// `RecursiveQuery`, in whichever engine evaluates it, so it constrains the
-/// choice of engine no more than a `VALUES` list does — and a `VALUES` list is
-/// already neutral here, because it is not a `TableScan`. Answering `None` says
-/// exactly that, and leaves the enclosing `RecursiveQuery` free to federate on
-/// the strength of the tables it really reads.
-///
-/// Federating one still requires the dialect to render `WITH RECURSIVE`; a
-/// dialect that cannot declines, as it does for any other plan it cannot unparse.
-pub(crate) fn is_cte_work_table(source: &Arc<dyn TableSource>) -> Result<bool> {
-    Ok(source_as_provider(source)?
-        .downcast_ref::<datafusion::datasource::cte_worktable::CteWorkTable>()
-        .is_some())
-}
-
-#[allow(clippy::missing_errors_doc)]
-pub fn get_table_source(
-    source: &Arc<dyn TableSource>,
-) -> Result<Option<Arc<dyn FederatedTableSource>>> {
-    // Unwrap TableSource
-    let source = source_as_provider(source)?;
-
-    // Get FederatedTableProviderAdaptor
-    let Some(wrapper) = source.downcast_ref::<FederatedTableProviderAdaptor>() else {
-        return Ok(None);
-    };
-
-    // Return original FederatedTableSource
-    Ok(Some(Arc::clone(&wrapper.source)))
 }
