@@ -269,8 +269,8 @@ impl FederationAnalyzerRule {
                                     match relation_binding(scope, table)? {
                                         // The subquery scans the relation itself, so the
                                         // reference is bound in the statement it becomes.
-                                        RelationBinding::Scanning => {
-                                            if let Some(plan_result) = providers.get(table) {
+                                        RelationBinding::Scanning(defined) => {
+                                            if let Some(plan_result) = providers.get(&defined) {
                                                 sole_provider.merge(ScanResult::Distinct(
                                                     Arc::clone(plan_result),
                                                 ));
@@ -825,19 +825,20 @@ enum RelationBinding {
     Duplicate,
     /// Defined once, by a relation that scans nothing.
     Scanless,
-    /// Defined once, by a relation that scans a table.
-    Scanning,
+    /// Defined once, by a relation that scans a table, under this name: the
+    /// relation's own, which is what the provider map knows it by.
+    Scanning(TableReference),
 }
 
 /// How `scope` defines `relation` at the position of a correlated reference to it.
 ///
 /// A unique match is required, and a duplicate name is refused rather than
-/// resolved. Names are compared with [`TableReference::resolved_eq`], so a bare
-/// reference and a qualified relation of that table collide deliberately:
-/// over-matching costs a refusal, where binding a correlation to the wrong
-/// relation of the same name would return wrong rows with no error. Conflicting
-/// qualifiers never match, so `schema_b.foo` does not bind a reference to
-/// `schema_a.foo`.
+/// resolved: binding a correlation to the wrong relation of the same name would
+/// return wrong rows with no error, where refusing costs only the pushdown. A
+/// relation matches when the reference names it ([`reference_names`]): a bare
+/// reference matches a qualified relation of that table, but a qualified
+/// reference matches only a relation that carries the same qualifiers, so neither
+/// `schema_b.foo` nor an alias `foo` binds a reference to `schema_a.foo`.
 ///
 /// The walk is `apply`, not `apply_with_subqueries`: the relation a correlated
 /// reference binds to is in the candidate's own `FROM`, reached through its inputs.
@@ -848,16 +849,18 @@ enum RelationBinding {
 fn relation_binding(scope: &LogicalPlan, relation: &TableReference) -> Result<RelationBinding> {
     let mut matches = 0usize;
     let mut scans = false;
+    let mut matched = None;
 
     scope.apply(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
-        let named = match node {
-            LogicalPlan::SubqueryAlias(alias) => alias.alias.resolved_eq(relation),
-            LogicalPlan::TableScan(scan) => scan.table_name.resolved_eq(relation),
-            _ => false,
+        let name = match node {
+            LogicalPlan::SubqueryAlias(alias) => Some(&alias.alias),
+            LogicalPlan::TableScan(scan) => Some(&scan.table_name),
+            _ => None,
         };
-        if named {
+        if let Some(name) = name.filter(|name| reference_names(relation, name)) {
             matches += 1;
             scans = plan_scans_anything(node)?;
+            matched = Some(name.clone());
         }
         // Stop at each query block. A `SubqueryAlias` is itself a relation of this
         // scope and the relations inside it are not, and a `Union`'s branches are
@@ -874,12 +877,27 @@ fn relation_binding(scope: &LogicalPlan, relation: &TableReference) -> Result<Re
         )
     })?;
 
-    Ok(match (matches, scans) {
+    Ok(match (matches, matched) {
         (0, _) => RelationBinding::Undefined,
-        (1, false) => RelationBinding::Scanless,
-        (1, true) => RelationBinding::Scanning,
+        (1, Some(defined)) if scans => RelationBinding::Scanning(defined),
+        (1, Some(_)) => RelationBinding::Scanless,
         _ => RelationBinding::Duplicate,
     })
+}
+
+/// Whether a correlated reference to `reference` names the relation `defined`:
+/// the table names agree, and every qualifier the reference carries, the
+/// relation carries with the same value. A bare `foo` names `schema_b.foo`, but
+/// `schema_a.foo` names neither `schema_b.foo` nor an alias `foo`, which no
+/// qualified name reaches.
+fn reference_names(reference: &TableReference, defined: &TableReference) -> bool {
+    reference.table() == defined.table()
+        && reference
+            .schema()
+            .is_none_or(|schema| defined.schema() == Some(schema))
+        && reference
+            .catalog()
+            .is_none_or(|catalog| defined.catalog() == Some(catalog))
 }
 
 /// Whether any `TableScan` appears in `plan`, including inside its subquery
@@ -1184,22 +1202,48 @@ mod tests {
     /// reference to `schema_a.foo` as bound, or the reference is emitted unbound.
     #[test]
     fn a_correlated_reference_binds_only_a_relation_whose_qualifiers_agree() {
-        let scope = scan("schema_b.foo");
-        for (reference, expected) in [
+        let qualified = scan("schema_b.foo");
+        let aliased = LogicalPlanBuilder::from(scan("bar"))
+            .alias("foo")
+            .expect("alias")
+            .build()
+            .expect("build");
+        for (scope, label, reference, expected) in [
             (
+                &qualified,
+                "a scan of schema_b.foo",
                 TableReference::partial("schema_b", "foo"),
-                RelationBinding::Scanning,
+                RelationBinding::Scanning(TableReference::partial("schema_b", "foo")),
             ),
-            (TableReference::bare("foo"), RelationBinding::Scanning),
             (
+                &qualified,
+                "a scan of schema_b.foo",
+                TableReference::bare("foo"),
+                RelationBinding::Scanning(TableReference::partial("schema_b", "foo")),
+            ),
+            (
+                &qualified,
+                "a scan of schema_b.foo",
+                TableReference::partial("schema_a", "foo"),
+                RelationBinding::Undefined,
+            ),
+            (
+                &aliased,
+                "bar AS foo",
+                TableReference::bare("foo"),
+                RelationBinding::Scanning(TableReference::bare("foo")),
+            ),
+            (
+                &aliased,
+                "bar AS foo",
                 TableReference::partial("schema_a", "foo"),
                 RelationBinding::Undefined,
             ),
         ] {
             assert_eq!(
-                relation_binding(&scope, &reference).expect("resolve the reference"),
+                relation_binding(scope, &reference).expect("resolve the reference"),
                 expected,
-                "binding of {reference} against a scan of schema_b.foo"
+                "binding of {reference} against {label}"
             );
         }
     }

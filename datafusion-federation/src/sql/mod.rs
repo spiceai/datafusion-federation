@@ -2588,6 +2588,80 @@ mod tests {
         Ok(())
     }
 
+    /// A local alias binds a correlated reference only if the reference names it:
+    /// in `SELECT … FROM schema_a.foo WHERE b LIKE '%x' AND EXISTS (SELECT foo.a FROM
+    /// bar AS foo WHERE foo.b = schema_a.foo.b)` the alias `foo` cannot be named
+    /// `schema_a.foo`, so the reference is to the enclosing query and the
+    /// subquery's correlation stays local.
+    #[tokio::test]
+    async fn a_bare_alias_does_not_bind_a_schema_qualified_correlated_reference(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::datasource::provider_as_source;
+        use datafusion::logical_expr::expr_fn::{col, exists, out_ref_col};
+        use datafusion::logical_expr::InvariantLevel;
+
+        let executor = executor_refusing_like();
+        let source =
+            |name: &str| provider_as_source(get_test_table_provider(name.into(), executor.clone()));
+        let correlated = LogicalPlanBuilder::scan("bar", source("bar"), None)?
+            .alias("foo")?
+            .filter(col("foo.b").eq(out_ref_col(DataType::Utf8, "schema_a.foo.b")))?
+            .project(vec![col("foo.a")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::scan("schema_a.foo", source("schema_a.foo"), None)?
+            .filter(col("schema_a.foo.b").like(lit("%x")))?
+            .filter(exists(Arc::new(correlated)))?
+            .project(vec![col("schema_a.foo.a")])?
+            .build()?;
+        let analyzed = FederationAnalyzerRule::new()
+            .with_optimizer(Optimizer::with_rules(vec![]))
+            .analyze(plan, &ConfigOptions::default())?;
+
+        analyzed.check_invariants(InvariantLevel::Executable)?;
+        let (outer_refs, _) = federated_outer_refs_and_tables(&analyzed)?;
+        assert_eq!(
+            outer_refs,
+            Vec::<String>::new(),
+            "no federated statement may carry a correlation it does not bind; plan:\n{analyzed}"
+        );
+
+        Ok(())
+    }
+
+    /// A bare correlated reference binds the qualified relation it names, and the
+    /// provider is looked up under that relation's own name: in `t2.a IN (SELECT
+    /// foo.a FROM schema_b.foo WHERE EXISTS (SELECT t5.a FROM t5 WHERE t5.b =
+    /// foo.b))` the `IN` subquery federates as one statement.
+    #[tokio::test]
+    async fn a_bare_correlated_reference_to_a_qualified_relation_federates_as_one_statement(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::logical_expr::expr_fn::{col, exists, in_subquery, out_ref_col};
+        use datafusion::logical_expr::InvariantLevel;
+
+        let predicate = |source: &dyn Fn(&str) -> Arc<dyn TableSource>| -> Result<Expr> {
+            let innermost = LogicalPlanBuilder::scan("t5", source("t5"), None)?
+                .filter(col("t5.b").eq(out_ref_col(DataType::Utf8, "foo.b")))?
+                .project(vec![col("t5.a")])?
+                .build()?;
+            let standalone =
+                LogicalPlanBuilder::scan("schema_b.foo", source("schema_b.foo"), None)?
+                    .filter(exists(Arc::new(innermost)))?
+                    .project(vec![col("schema_b.foo.a")])?
+                    .build()?;
+            Ok(in_subquery(col("t2.a"), Arc::new(standalone)))
+        };
+
+        let analyzed = analyze_partly_federated(&executor_refusing_like(), predicate)?;
+        analyzed.check_invariants(InvariantLevel::Executable)?;
+        assert_eq!(
+            federated_statement_tables(&analyzed)?,
+            vec![vec!["foo", "t5"], vec!["t1"], vec!["t2"]],
+            "the IN subquery must federate as one statement; plan:\n{analyzed}"
+        );
+
+        Ok(())
+    }
+
     // ── empty projection: the `SELECT 1` placeholder ─────────────────────────
 
     /// Records the SQL and schema it is asked to execute, and answers with
