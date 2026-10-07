@@ -185,7 +185,7 @@ mod test {
     use super::*;
     use datafusion::arrow::array::{Decimal128Array, LargeStringArray, RecordBatchOptions};
     use datafusion::arrow::{
-        array::{Int32Array, StringArray},
+        array::{Int32Array, Int64Array, StringArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
     use datafusion::assert_batches_eq;
@@ -295,6 +295,50 @@ mod test {
         let result = try_cast_to(batch, schema).expect("converted");
         let expected = ["++", "++", "++"];
         assert_batches_eq!(expected, &[result]);
+    }
+
+    /// The cast never drops columns, not even for an empty projection's `SELECT 1`
+    /// placeholder: `VirtualExecutionPlan` asks the executor for the placeholder
+    /// and reduces it to the row count itself.
+    #[test]
+    fn test_placeholder_column_against_an_empty_schema_is_an_error() {
+        let placeholder = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 1, 1]))],
+        )
+        .expect("placeholder batch");
+
+        let result = try_cast_to(placeholder, SchemaRef::new(Schema::empty()));
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnexpectedNumberOfColumns {
+                    expected: 0,
+                    found: 1
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_column_count_mismatch_is_an_error() {
+        let result = try_cast_to(
+            batch_input(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnexpectedNumberOfColumns {
+                    expected: 1,
+                    found: 3
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     /// Casting Decimal128(38,9) → Decimal128(38,27) must return an error when
