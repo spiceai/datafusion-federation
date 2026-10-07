@@ -13,7 +13,10 @@ use analyzer::{collect_known_rewrites, RewriteTableScanAnalyzer};
 use ast_analyzer::RewriteMultiTableReference;
 use async_trait::async_trait;
 use datafusion::{
-    arrow::datatypes::{Schema, SchemaRef},
+    arrow::{
+        array::{RecordBatch, RecordBatchOptions},
+        datatypes::{DataType, Field, Schema, SchemaRef},
+    },
     common::DFSchema,
     common::{
         tree_node::{TreeNode, TreeNodeRecursion},
@@ -34,11 +37,13 @@ use datafusion::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
         metrics::MetricsSet,
+        stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
     },
     sql::{sqlparser::ast::Statement, unparser::Unparser},
 };
+use futures::StreamExt;
 use optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation};
 
 pub use ast_analyzer::{AstAnalyzer, AstAnalyzerRule};
@@ -586,8 +591,36 @@ impl ExecutionPlan for VirtualExecutionPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        self.executor
-            .execute(&self.final_sql()?, self.schema(), &self.filters)
+        let sql = self.final_sql()?;
+        let schema = self.schema();
+        if !schema.fields().is_empty() || self.executor.dialect().supports_empty_select_list() {
+            return self.executor.execute(&sql, schema, &self.filters);
+        }
+
+        // A plan with no output column, such as a scan that only feeds `count(*)`,
+        // unparses as `SELECT 1` for a dialect without an empty select list, so
+        // the remote engine answers with that one placeholder column. Ask the
+        // executor for the column the SQL returns, then keep only the row count
+        // the plan's empty schema describes.
+        let placeholder = Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, true)]));
+        let rows = self.executor.execute(&sql, placeholder, &self.filters)?;
+        let output_schema = Arc::clone(&schema);
+        let rows = rows.map(move |batch| {
+            let batch = batch?;
+            if batch.num_columns() != 1 {
+                return Err(DataFusionError::Execution(format!(
+                    "Remote query for an empty projection returned {} columns, expected the 1 placeholder column of `{sql}`",
+                    batch.num_columns()
+                )));
+            }
+            let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+            Ok(RecordBatch::try_new_with_options(
+                Arc::clone(&output_schema),
+                vec![],
+                &options,
+            )?)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows)))
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -2294,6 +2327,176 @@ mod tests {
             updated_vp.filters.len(),
             2,
             "Inexact: both filters must be stored on the node for execute()"
+        );
+    }
+
+    // ── empty projection: the `SELECT 1` placeholder ─────────────────────────
+
+    /// Records the SQL and schema it is asked to execute, and answers with
+    /// `columns` `Int64` columns over three rows.
+    struct PlaceholderExecutor {
+        dialect: Arc<dyn Dialect>,
+        columns: usize,
+        requests: Arc<std::sync::Mutex<Vec<(String, SchemaRef)>>>,
+    }
+
+    impl std::fmt::Debug for PlaceholderExecutor {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("PlaceholderExecutor")
+                .field("columns", &self.columns)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl SQLExecutor for PlaceholderExecutor {
+        fn name(&self) -> &str {
+            "PlaceholderExecutor"
+        }
+        fn compute_context(&self) -> Option<String> {
+            Some("ctx".into())
+        }
+        fn dialect(&self) -> Arc<dyn Dialect> {
+            Arc::clone(&self.dialect)
+        }
+        fn execute(
+            &self,
+            query: &str,
+            schema: SchemaRef,
+            _filters: &[Arc<dyn PhysicalExpr>],
+        ) -> Result<SendableRecordBatchStream> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push((query.to_string(), Arc::clone(&schema)));
+            let answer = Arc::new(Schema::new(
+                (0..self.columns)
+                    .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let columns = (0..self.columns)
+                .map(|_| {
+                    Arc::new(datafusion::arrow::array::Int64Array::from(vec![1, 1, 1]))
+                        as datafusion::arrow::array::ArrayRef
+                })
+                .collect();
+            let options =
+                datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(3));
+            let batch = datafusion::arrow::array::RecordBatch::try_new_with_options(
+                answer, columns, &options,
+            )?;
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter(vec![Ok(batch)]),
+                ),
+            ))
+        }
+        async fn table_names(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn get_table_schema(&self, _table_name: &str) -> Result<SchemaRef> {
+            unimplemented!()
+        }
+    }
+
+    /// A scan of `t` that needs none of its columns, as for `count(*)`.
+    fn empty_projection_plan(
+        dialect: Arc<dyn Dialect>,
+        columns: usize,
+    ) -> (
+        VirtualExecutionPlan,
+        Arc<std::sync::Mutex<Vec<(String, SchemaRef)>>>,
+    ) {
+        let provider = get_test_table_provider(
+            "t".to_string(),
+            TestExecutor {
+                compute_context: "ctx".into(),
+                cannot_federate: None,
+            },
+        );
+        let source = datafusion::datasource::provider_as_source(provider);
+        let plan = LogicalPlanBuilder::scan("t", source, Some(vec![]))
+            .expect("scan")
+            .build()
+            .expect("plan");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = PlaceholderExecutor {
+            dialect,
+            columns,
+            requests: Arc::clone(&requests),
+        };
+        let vp = VirtualExecutionPlan::new(
+            plan,
+            Arc::new(executor),
+            Statistics::new_unknown(&Schema::empty()),
+            None,
+        );
+        (vp, requests)
+    }
+
+    /// A dialect without an empty select list unparses the scan as `SELECT 1`.
+    /// The executor is asked for that placeholder column, and the plan answers
+    /// with the row count and no column, as its empty schema declares.
+    #[tokio::test]
+    async fn empty_projection_asks_for_the_placeholder_and_keeps_the_rows() {
+        let (vp, requests) =
+            empty_projection_plan(Arc::new(unparser::dialect::DefaultDialect {}), 1);
+
+        let stream = vp
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        assert_eq!(stream.schema().fields().len(), 0);
+        let batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("batches");
+
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "SELECT 1 FROM t");
+        assert_eq!(requests[0].1.fields().len(), 1);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    /// A dialect with an empty select list returns no column, so the executor is
+    /// asked for the plan's own empty schema.
+    #[tokio::test]
+    async fn empty_projection_keeps_an_empty_select_list_where_the_dialect_has_one() {
+        let (vp, requests) =
+            empty_projection_plan(Arc::new(unparser::dialect::PostgreSqlDialect {}), 0);
+
+        let stream = vp
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("batches");
+
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests[0].0, r#"SELECT FROM "t""#);
+        assert_eq!(requests[0].1.fields().len(), 0);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    /// Anything but the one placeholder column is an error, not a row count.
+    #[tokio::test]
+    async fn empty_projection_rejects_an_answer_that_is_not_the_placeholder() {
+        let (vp, _requests) =
+            empty_projection_plan(Arc::new(unparser::dialect::DefaultDialect {}), 2);
+
+        let stream = vp
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let error = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect_err("two columns are not the placeholder");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected the 1 placeholder column"),
+            "{error}"
         );
     }
 }

@@ -71,16 +71,6 @@ impl std::fmt::Display for Error {
 pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Result<RecordBatch> {
     let actual_schema = record_batch.schema();
 
-    // An empty projection is unparsed as `SELECT 1`, because most dialects
-    // reject an empty select list, so the remote engine answers it with a
-    // placeholder column. Only the row count is wanted: keep the rows and drop
-    // the columns.
-    if expected_schema.fields().is_empty() {
-        let options = RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows()));
-        return RecordBatch::try_new_with_options(expected_schema, vec![], &options)
-            .map_err(|source| Error::UnableToConvertRecordBatch { source });
-    }
-
     if actual_schema.fields().len() != expected_schema.fields().len() {
         tracing::debug!(
             actual_schema = ?actual_schema,
@@ -307,23 +297,29 @@ mod test {
         assert_batches_eq!(expected, &[result]);
     }
 
-    /// An empty projection is unparsed as `SELECT 1`, so the remote engine
-    /// answers with one placeholder column. Casting that to the empty projected
-    /// schema keeps every row and drops the column.
+    /// The cast never drops columns, not even for an empty projection's `SELECT 1`
+    /// placeholder: `VirtualExecutionPlan` asks the executor for the placeholder
+    /// and reduces it to the row count itself.
     #[test]
-    fn test_empty_projection_placeholder_keeps_row_count() {
+    fn test_placeholder_column_against_an_empty_schema_is_an_error() {
         let placeholder = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, false)])),
             vec![Arc::new(Int64Array::from(vec![1, 1, 1]))],
         )
         .expect("placeholder batch");
-        let expected_schema = SchemaRef::new(Schema::empty());
 
-        let result = try_cast_to(placeholder, Arc::clone(&expected_schema)).expect("converted");
+        let result = try_cast_to(placeholder, SchemaRef::new(Schema::empty()));
 
-        assert_eq!(result.schema(), expected_schema);
-        assert_eq!(result.num_columns(), 0);
-        assert_eq!(result.num_rows(), 3);
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnexpectedNumberOfColumns {
+                    expected: 0,
+                    found: 1
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
