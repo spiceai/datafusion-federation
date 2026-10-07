@@ -772,10 +772,12 @@ enum RelationBinding {
 /// How `scope` defines `relation` at the position of a correlated reference to it.
 ///
 /// A unique match is required, and a duplicate name is refused rather than
-/// resolved. Names are compared on the last segment, so a qualified scan and a
-/// bare reference to it collide deliberately: over-matching costs a refusal, where
-/// binding a correlation to the wrong relation of the same name would return wrong
-/// rows with no error.
+/// resolved. Names are compared with [`TableReference::resolved_eq`], so a bare
+/// reference and a qualified relation of that table collide deliberately:
+/// over-matching costs a refusal, where binding a correlation to the wrong
+/// relation of the same name would return wrong rows with no error. Conflicting
+/// qualifiers never match, so `schema_b.foo` does not bind a reference to
+/// `schema_a.foo`.
 ///
 /// The walk is `apply`, not `apply_with_subqueries`: the relation a correlated
 /// reference binds to is in the candidate's own `FROM`, reached through its inputs.
@@ -784,14 +786,13 @@ enum RelationBinding {
 /// alias — and the plan would then be federated alone, with that identifier unbound
 /// in the emitted SQL.
 fn relation_binding(scope: &LogicalPlan, relation: &TableReference) -> Result<RelationBinding> {
-    let wanted = relation.table();
     let mut matches = 0usize;
     let mut scans = false;
 
     scope.apply(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
         let named = match node {
-            LogicalPlan::SubqueryAlias(alias) => alias.alias.table() == wanted,
-            LogicalPlan::TableScan(scan) => scan.table_name.table() == wanted,
+            LogicalPlan::SubqueryAlias(alias) => alias.alias.resolved_eq(relation),
+            LogicalPlan::TableScan(scan) => scan.table_name.resolved_eq(relation),
             _ => false,
         };
         if named {
@@ -1114,6 +1115,32 @@ mod tests {
                 .expect("resolve h"),
             "an alias inside a derived table is not visible outside it"
         );
+    }
+
+    /// A relation binds a correlated reference only if their qualifiers agree: a bare
+    /// reference matches the qualified relation, a conflicting schema never does. A
+    /// subquery federated on its own that scans `schema_b.foo` must not take a
+    /// reference to `schema_a.foo` as bound, or the reference is emitted unbound.
+    #[test]
+    fn a_correlated_reference_binds_only_a_relation_whose_qualifiers_agree() {
+        let scope = scan("schema_b.foo");
+        for (reference, expected) in [
+            (
+                TableReference::partial("schema_b", "foo"),
+                RelationBinding::Scanning,
+            ),
+            (TableReference::bare("foo"), RelationBinding::Scanning),
+            (
+                TableReference::partial("schema_a", "foo"),
+                RelationBinding::Unbound,
+            ),
+        ] {
+            assert_eq!(
+                relation_binding(&scope, &reference).expect("resolve the reference"),
+                expected,
+                "binding of {reference} against a scan of schema_b.foo"
+            );
+        }
     }
 
     /// Two relations of one name are refused rather than resolved. Binding the
