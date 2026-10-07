@@ -2503,6 +2503,91 @@ mod tests {
         Ok(())
     }
 
+    /// Each federated statement's scanned tables (sorted), in plan order.
+    fn federated_statement_tables(plan: &LogicalPlan) -> Result<Vec<Vec<String>>> {
+        let mut statements = vec![];
+        plan.apply_with_subqueries(|node| {
+            let LogicalPlan::Extension(Extension { node }) = node else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>() else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let mut tables = vec![];
+            federated.plan().apply_with_subqueries(|inner| {
+                if let LogicalPlan::TableScan(scan) = inner {
+                    tables.push(scan.table_name.table().to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            tables.sort();
+            statements.push(tables);
+            Ok(TreeNodeRecursion::Jump)
+        })?;
+        Ok(statements)
+    }
+
+    /// A subquery federated on its own may nest correlated subqueries of its own:
+    /// `t2.a IN (SELECT t3.a FROM t3 WHERE EXISTS (SELECT t4.a FROM t4 WHERE
+    /// t4.b = t3.b AND EXISTS (SELECT t5.a FROM t5 WHERE t5.b = <innermost>)))`.
+    /// With `t4.b` the innermost reference binds to `t4`, which the middle query
+    /// defines, so every correlation is bound inside the `IN` subquery and it
+    /// federates as one statement. With `t1.b` it binds outside the `IN` subquery,
+    /// so that correlation stays local.
+    #[tokio::test]
+    async fn a_subquery_federated_alone_binds_its_nested_correlations_to_their_own_query_blocks(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::logical_expr::expr_fn::{col, exists, in_subquery, out_ref_col};
+        use datafusion::logical_expr::InvariantLevel;
+
+        let nested = |innermost_reference: &'static str| {
+            move |source: &dyn Fn(&str) -> Arc<dyn TableSource>| -> Result<Expr> {
+                let innermost = LogicalPlanBuilder::scan("t5", source("t5"), None)?
+                    .filter(col("t5.b").eq(out_ref_col(DataType::Utf8, innermost_reference)))?
+                    .project(vec![col("t5.a")])?
+                    .build()?;
+                let middle = LogicalPlanBuilder::scan("t4", source("t4"), None)?
+                    .filter(
+                        col("t4.b")
+                            .eq(out_ref_col(DataType::Utf8, "t3.b"))
+                            .and(exists(Arc::new(innermost))),
+                    )?
+                    .project(vec![col("t4.a")])?
+                    .build()?;
+                let standalone = LogicalPlanBuilder::scan("t3", source("t3"), None)?
+                    .filter(exists(Arc::new(middle)))?
+                    .project(vec![col("t3.a")])?
+                    .build()?;
+                Ok(in_subquery(col("t2.a"), Arc::new(standalone)))
+            }
+        };
+
+        let executor = executor_refusing_like();
+        let bound_inside = analyze_partly_federated(&executor, nested("t4.b"))?;
+        bound_inside.check_invariants(InvariantLevel::Executable)?;
+        assert_eq!(
+            federated_statement_tables(&bound_inside)?,
+            vec![vec!["t3", "t4", "t5"], vec!["t1"], vec!["t2"]],
+            "the IN subquery must federate as one statement; plan:\n{bound_inside}"
+        );
+
+        let bound_outside = analyze_partly_federated(&executor, nested("t1.b"))?;
+        bound_outside.check_invariants(InvariantLevel::Executable)?;
+        let (outer_refs, _) = federated_outer_refs_and_tables(&bound_outside)?;
+        assert_eq!(
+            outer_refs,
+            Vec::<String>::new(),
+            "no federated statement may carry a correlation it does not bind; plan:\n{bound_outside}"
+        );
+        assert_eq!(
+            federated_statement_tables(&bound_outside)?,
+            vec![vec!["t5"], vec!["t4"], vec!["t3"], vec!["t1"], vec!["t2"]],
+            "every scan still federates, each on its own; plan:\n{bound_outside}"
+        );
+
+        Ok(())
+    }
+
     // ── empty projection: the `SELECT 1` placeholder ─────────────────────────
 
     /// Records the SQL and schema it is asked to execute, and answers with
