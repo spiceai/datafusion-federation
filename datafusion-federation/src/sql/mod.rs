@@ -2296,4 +2296,104 @@ mod tests {
             "Inexact: both filters must be stored on the node for execute()"
         );
     }
+
+    /// A correlated scalar subquery whose enclosing query is only partly federated
+    /// is analyzed on its own. Its outer reference names a relation the statement it
+    /// would be federated as does not scan, so federating it whole emits that
+    /// reference unbound and hides the aggregate `DataFusion` requires above a
+    /// correlated scalar subquery: the plan fails with "Correlated scalar subquery
+    /// must be aggregated to return at most one row". TPC-H Q2 reaches this shape on
+    /// a source that runs every table but refuses the outer query's `LIKE`.
+    ///
+    /// The correlation has to stay with the enclosing query, which binds it; every
+    /// scan, the subquery's included, still federates.
+    #[tokio::test]
+    async fn a_correlated_subquery_federated_alone_keeps_its_correlation_local(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::datasource::provider_as_source;
+        use datafusion::functions_aggregate::expr_fn::min;
+        use datafusion::logical_expr::expr_fn::{col, out_ref_col, scalar_subquery};
+        use datafusion::logical_expr::{InvariantLevel, JoinType};
+
+        let refuses_like: Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync> = Arc::new(|plan| {
+            plan.expressions().iter().any(|e| {
+                e.exists(|e| Ok(matches!(e, Expr::Like(_))))
+                    .unwrap_or(false)
+            })
+        });
+        let executor = TestExecutor {
+            compute_context: "a".into(),
+            cannot_federate: Some(refuses_like),
+        };
+        let source =
+            |name: &str| provider_as_source(get_test_table_provider(name.into(), executor.clone()));
+
+        // SELECT t2.a FROM t1 JOIN t2 ON t1.a = t2.a
+        // WHERE t1.b LIKE '%x' AND t2.a = (SELECT min(t3.a) FROM t3 WHERE t3.b = t1.b)
+        // with the LIKE already below the join, where filter pushdown leaves it.
+        let correlated = LogicalPlanBuilder::scan("t3", source("t3"), None)?
+            .filter(col("t3.b").eq(out_ref_col(DataType::Utf8, "t1.b")))?
+            .aggregate(Vec::<Expr>::new(), vec![min(col("t3.a"))])?
+            .build()?;
+        let plan = LogicalPlanBuilder::scan("t1", source("t1"), None)?
+            .filter(col("t1.b").like(lit("%x")))?
+            .join(
+                LogicalPlanBuilder::scan("t2", source("t2"), None)?.build()?,
+                JoinType::Inner,
+                (vec!["t1.a"], vec!["t2.a"]),
+                None,
+            )?
+            .filter(col("t2.a").eq(scalar_subquery(Arc::new(correlated))))?
+            .project(vec![col("t2.a")])?
+            .build()?;
+
+        // No pre-federation pushdown, so the analyzer sees the shape above.
+        let analyzed = FederationAnalyzerRule::new()
+            .with_optimizer(Optimizer::with_rules(vec![]))
+            .analyze(plan, &ConfigOptions::default())?;
+
+        analyzed.check_invariants(InvariantLevel::Executable)?;
+
+        // Every outer reference inside a federated statement, and every table a
+        // federated statement scans.
+        let mut federated_outer_refs = vec![];
+        let mut federated_tables = vec![];
+        analyzed.apply_with_subqueries(|node| {
+            let LogicalPlan::Extension(Extension { node }) = node else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>() else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            federated.plan().apply_with_subqueries(|inner| {
+                if let LogicalPlan::TableScan(scan) = inner {
+                    federated_tables.push(scan.table_name.table().to_string());
+                }
+                for expr in inner.expressions() {
+                    expr.apply(|e| {
+                        if let Expr::OuterReferenceColumn(_, column) = e {
+                            federated_outer_refs.push(column.flat_name());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            Ok(TreeNodeRecursion::Jump)
+        })?;
+        assert_eq!(
+            federated_outer_refs,
+            Vec::<String>::new(),
+            "no federated statement may carry a correlation it does not bind; plan:\n{analyzed}"
+        );
+        federated_tables.sort();
+        assert_eq!(
+            federated_tables,
+            vec!["t1", "t2", "t3"],
+            "every scan still federates; only the refused LIKE and the correlation stay local; \
+             plan:\n{analyzed}"
+        );
+
+        Ok(())
+    }
 }
