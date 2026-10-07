@@ -71,6 +71,16 @@ impl std::fmt::Display for Error {
 pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Result<RecordBatch> {
     let actual_schema = record_batch.schema();
 
+    // An empty projection is unparsed as `SELECT 1`, because most dialects
+    // reject an empty select list, so the remote engine answers it with a
+    // placeholder column. Only the row count is wanted: keep the rows and drop
+    // the columns.
+    if expected_schema.fields().is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows()));
+        return RecordBatch::try_new_with_options(expected_schema, vec![], &options)
+            .map_err(|source| Error::UnableToConvertRecordBatch { source });
+    }
+
     if actual_schema.fields().len() != expected_schema.fields().len() {
         tracing::debug!(
             actual_schema = ?actual_schema,
@@ -185,7 +195,7 @@ mod test {
     use super::*;
     use datafusion::arrow::array::{Decimal128Array, LargeStringArray, RecordBatchOptions};
     use datafusion::arrow::{
-        array::{Int32Array, StringArray},
+        array::{Int32Array, Int64Array, StringArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
     use datafusion::assert_batches_eq;
@@ -295,6 +305,44 @@ mod test {
         let result = try_cast_to(batch, schema).expect("converted");
         let expected = ["++", "++", "++"];
         assert_batches_eq!(expected, &[result]);
+    }
+
+    /// An empty projection is unparsed as `SELECT 1`, so the remote engine
+    /// answers with one placeholder column. Casting that to the empty projected
+    /// schema keeps every row and drops the column.
+    #[test]
+    fn test_empty_projection_placeholder_keeps_row_count() {
+        let placeholder = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 1, 1]))],
+        )
+        .expect("placeholder batch");
+        let expected_schema = SchemaRef::new(Schema::empty());
+
+        let result = try_cast_to(placeholder, Arc::clone(&expected_schema)).expect("converted");
+
+        assert_eq!(result.schema(), expected_schema);
+        assert_eq!(result.num_columns(), 0);
+        assert_eq!(result.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_column_count_mismatch_is_an_error() {
+        let result = try_cast_to(
+            batch_input(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnexpectedNumberOfColumns {
+                    expected: 1,
+                    found: 3
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     /// Casting Decimal128(38,9) → Decimal128(38,27) must return an error when
