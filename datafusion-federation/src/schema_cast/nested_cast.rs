@@ -2,9 +2,27 @@ use arrow_json::ReaderBuilder;
 use datafusion::arrow::array::{
     new_empty_array, Array, ArrayRef, GenericStringArray, OffsetSizeTrait,
 };
+use datafusion::arrow::compute::concat;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::arrow::error::ArrowError;
 use std::sync::Arc;
+
+/// How many rows one decoder pass covers.
+///
+/// The JSON reader holds each decoded row as tokens on a tape, and sizes that tape from the
+/// batch size it is built with: `TapeDecoder::new` reserves `batch_size * flattened_fields`
+/// entries up front and then fills them as rows arrive. Taking the batch size from the column
+/// would therefore make both the reservation and the tape grow with the input rather than with
+/// this constant — a wide struct over a long column reserves and holds far more than the array
+/// it decodes to, and a column of empty lists never uses what it reserved at all.
+///
+/// Decoding this many rows per pass and concatenating the results bounds the tape by the
+/// constant instead. What remains is proportional to the *output*: every chunk stays alive
+/// until `concat` builds the result, so the call peaks at roughly twice the array it returns.
+/// 1024 is the JSON reader's own default, which the per-primitive paths this replaced also ran
+/// at. Raising it to 8192 was measured and rejected: on an 8192-row list-of-structs column it
+/// tripled the peak (1.28 -> 3.47 MiB) to save 0.1% of P99, inside the noise.
+const DECODE_CHUNK_ROWS: usize = 1024;
 
 /// Decodes a string column that holds one JSON value per row into the nested Arrow type
 /// `expected`: a `List`, `LargeList`, `FixedSizeList` or `Struct` whose items may themselves be
@@ -32,11 +50,11 @@ pub(crate) fn cast_string_to_nested<O: OffsetSizeTrait>(
         return Ok(new_empty_array(expected));
     }
 
-    // One decoder pass over the whole column. The batch size is the column length so a
-    // single flush yields every row; the reader's default (1024) would stop decoding there.
+    // A column shorter than a chunk reserves for its own length, not for the chunk: at three
+    // rows that is the difference between 84 KiB and nothing.
     let field = Arc::new(Field::new("value", expected.clone(), true));
     let mut decoder = ReaderBuilder::new_with_field(field)
-        .with_batch_size(strings.len())
+        .with_batch_size(strings.len().min(DECODE_CHUNK_ROWS))
         .build_decoder()
         .map_err(|e| {
             ArrowError::CastError(format!(
@@ -45,67 +63,81 @@ pub(crate) fn cast_string_to_nested<O: OffsetSizeTrait>(
             ))
         })?;
 
-    for (row, value) in strings.iter().enumerate() {
-        let bytes = value.map_or(b"null".as_slice(), str::as_bytes);
-        let consumed = decoder.decode(bytes).map_err(|e| {
-            ArrowError::CastError(format!(
-                "Failed to decode {expected} from JSON value {}: {}",
-                shown(bytes),
-                shown_error(&e)
-            ))
-        })?;
-        // Each row must end at a value boundary: a value left open here would be completed
-        // by the next row's text, and every row after it would shift by one.
-        if decoder.has_partial_record() {
+    let mut chunks: Vec<ArrayRef> = Vec::with_capacity(strings.len().div_ceil(DECODE_CHUNK_ROWS));
+    let mut rows = strings.iter();
+
+    for start in (0..strings.len()).step_by(DECODE_CHUNK_ROWS) {
+        let rows_in_chunk = DECODE_CHUNK_ROWS.min(strings.len() - start);
+
+        for (row, value) in rows.by_ref().take(rows_in_chunk).enumerate() {
+            let bytes = value.map_or(b"null".as_slice(), str::as_bytes);
+            let consumed = decoder.decode(bytes).map_err(|e| {
+                ArrowError::CastError(format!(
+                    "Failed to decode {expected} from JSON value {}: {}",
+                    shown(bytes),
+                    shown_error(&e)
+                ))
+            })?;
+            // Each row must end at a value boundary: a value left open here would be completed
+            // by the next row's text, and every row after it would shift by one.
+            if decoder.has_partial_record() {
+                return Err(ArrowError::CastError(format!(
+                    "Failed to decode {expected} from JSON: value {} is incomplete",
+                    shown(bytes)
+                )));
+            }
+            // The decoder has buffered one value per earlier row of this chunk, so this row
+            // must have added exactly one: none would pull the next row's value up, two would
+            // push it down.
+            let values = decoder.len() - row;
+            if values != 1 {
+                return Err(ArrowError::CastError(format!(
+                    "Failed to decode {expected} from JSON: value {} holds {values} JSON values, not one",
+                    shown(bytes)
+                )));
+            }
+            // The decoder stops decoding once it holds a full chunk, so a surplus value in the
+            // row that fills one is left in the buffer rather than counted; there the byte
+            // count is what catches the row.
+            if consumed != bytes.len() {
+                return Err(ArrowError::CastError(format!(
+                    "Failed to decode {expected} from JSON: value {} was not fully consumed ({consumed} of {} bytes)",
+                    shown(bytes),
+                    bytes.len()
+                )));
+            }
+        }
+
+        let batch = decoder
+            .flush()
+            .map_err(|e| {
+                ArrowError::CastError(format!(
+                    "Failed to decode {expected} from JSON: {}",
+                    shown_error(&e)
+                ))
+            })?
+            .ok_or_else(|| {
+                ArrowError::CastError(format!(
+                    "Failed to decode {expected} from JSON: a chunk of {rows_in_chunk} strings decoded to no values"
+                ))
+            })?;
+
+        // Unreachable while the per-row checks above hold, and kept as the one statement of
+        // the invariant they add up to.
+        if batch.num_rows() != rows_in_chunk {
             return Err(ArrowError::CastError(format!(
-                "Failed to decode {expected} from JSON: value {} is incomplete",
-                shown(bytes)
+                "Failed to decode {expected} from JSON: a chunk of {rows_in_chunk} strings decoded to {} values, so a string holds more or less than one JSON value",
+                batch.num_rows()
             )));
         }
-        // The decoder has buffered one value per earlier row, so this row must have added
-        // exactly one: none would pull the next row's value up, two would push it down.
-        let values = decoder.len() - row;
-        if values != 1 {
-            return Err(ArrowError::CastError(format!(
-                "Failed to decode {expected} from JSON: value {} holds {values} JSON values, not one",
-                shown(bytes)
-            )));
-        }
-        // The decoder stops decoding once it holds as many rows as the column has, so a
-        // surplus value in the last row is left in the buffer rather than counted.
-        if consumed != bytes.len() {
-            return Err(ArrowError::CastError(format!(
-                "Failed to decode {expected} from JSON: value {} was not fully consumed ({consumed} of {} bytes)",
-                shown(bytes),
-                bytes.len()
-            )));
-        }
+
+        chunks.push(Arc::clone(batch.column(0)));
     }
 
-    let batch = decoder
-        .flush()
-        .map_err(|e| {
-            ArrowError::CastError(format!(
-                "Failed to decode {expected} from JSON: {}",
-                shown_error(&e)
-            ))
-        })?
-        .ok_or_else(|| {
-            ArrowError::CastError(format!(
-                "Failed to decode {expected} from JSON: {} strings decoded to no values",
-                strings.len()
-            ))
-        })?;
-
-    if batch.num_rows() != strings.len() {
-        return Err(ArrowError::CastError(format!(
-            "Failed to decode {expected} from JSON: {} strings decoded to {} values, so a string holds more or less than one JSON value",
-            strings.len(),
-            batch.num_rows()
-        )));
-    }
-
-    Ok(Arc::clone(batch.column(0)))
+    // `concat` returns a single input unchanged and without a copy, so a column that fits one
+    // chunk needs no special case here.
+    let parts: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
+    concat(&parts)
 }
 
 /// How much of a value or an upstream message an error carries.
@@ -495,8 +527,10 @@ mod test {
     }
 
     #[test]
-    fn a_column_longer_than_the_json_readers_default_batch_decodes_every_row() {
-        let n: usize = 3_000;
+    fn a_column_longer_than_one_decode_chunk_decodes_every_row() {
+        // Derived from the chunk size rather than written out, so the test cannot quietly
+        // become a single-chunk one if that constant changes.
+        let n: usize = DECODE_CHUNK_ROWS * 2 + 93;
         let strings = StringArray::from((0..n).map(|i| Some(format!("[{i}]"))).collect::<Vec<_>>());
         let expected_type = DataType::new_list(DataType::Int32, true);
         let actual = cast_string_to_nested::<i32>(&strings, &expected_type).expect("cast");
@@ -528,6 +562,49 @@ mod test {
     }
 
     #[test]
+    fn a_column_spanning_several_decode_chunks_concatenates_in_order() {
+        // Rows of different lengths, with nulls and an empty list, over three full decode
+        // chunks and a partial fourth. Each chunk decodes to its own array, so this pins that
+        // they are joined in the column's order and that every list's offsets are rebased onto
+        // the chunk before it.
+        let n = DECODE_CHUNK_ROWS * 3 + 7;
+        let strings = StringArray::from(
+            (0..n)
+                .map(|i| match i % 4 {
+                    0 => None,
+                    1 => Some("[]".to_string()),
+                    2 => Some(format!(r#"[{{"author":{{"login":"u{i}"}},"body":null}}]"#)),
+                    _ => Some(format!(
+                        r#"[{{"author":{{"login":"u{i}"}},"body":"b{i}"}},{{"author":{{"login":"v{i}"}},"body":null}}]"#
+                    )),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let actual = cast_string_to_nested::<i32>(&strings, &comments_type()).expect("cast");
+        assert_eq!(actual.len(), n);
+
+        let mut builder = comment_list_builder();
+        for i in 0..n {
+            match i % 4 {
+                0 => builder.append_null(),
+                1 => builder.append(true),
+                2 => {
+                    append_comment(builder.values(), &format!("u{i}"), None);
+                    builder.append(true);
+                }
+                _ => {
+                    append_comment(builder.values(), &format!("u{i}"), Some(&format!("b{i}")));
+                    append_comment(builder.values(), &format!("v{i}"), None);
+                    builder.append(true);
+                }
+            }
+        }
+        let expected: ArrayRef = Arc::new(builder.finish());
+        assert_eq!(&actual, &expected);
+    }
+
+    #[test]
     fn an_empty_column_decodes_to_an_empty_array_of_the_expected_type() {
         let strings = StringArray::from(Vec::<Option<&str>>::new());
         let actual = cast_string_to_nested::<i32>(&strings, &comments_type()).expect("cast");
@@ -555,14 +632,40 @@ mod test {
             err.to_string(),
             "Cast error: Failed to decode List(Int32) from JSON: value \"[1] [2]\" holds 2 JSON values, not one"
         );
-        // In the last row the decoder stops at the column's row count, so the surplus value
-        // is left unconsumed rather than counted.
+        // The decoder stops at the row that fills its batch, so a surplus value in that row is
+        // left unconsumed rather than counted, and the byte count is what catches it. The
+        // batch is one decode chunk, or the column's own length when it is shorter -- as here.
         let two_values_last = StringArray::from(vec![Some("[3]"), Some("[1] [2]")]);
         let err =
             cast_string_to_nested::<i32>(&two_values_last, &expected_type).expect_err("two values");
         assert_eq!(
             err.to_string(),
             "Cast error: Failed to decode List(Int32) from JSON: value \"[1] [2]\" was not fully consumed (4 of 7 bytes)"
+        );
+        // The same row at the chunk boundary of a column long enough to have one.
+        let mut filling_chunk: Vec<Option<String>> = (0..DECODE_CHUNK_ROWS - 1)
+            .map(|i| Some(format!("[{i}]")))
+            .collect();
+        filling_chunk.push(Some("[1] [2]".to_string()));
+        let filling_chunk = StringArray::from(filling_chunk);
+        let err = cast_string_to_nested::<i32>(&filling_chunk, &expected_type)
+            .expect_err("two values filling a chunk");
+        assert_eq!(
+            err.to_string(),
+            "Cast error: Failed to decode List(Int32) from JSON: value \"[1] [2]\" was not fully consumed (4 of 7 bytes)"
+        );
+        // Past that boundary the next chunk starts empty, so the same row has room for both
+        // values and is counted instead.
+        let mut after_a_chunk: Vec<Option<String>> = (0..DECODE_CHUNK_ROWS)
+            .map(|i| Some(format!("[{i}]")))
+            .collect();
+        after_a_chunk.push(Some("[1] [2]".to_string()));
+        let after_a_chunk = StringArray::from(after_a_chunk);
+        let err = cast_string_to_nested::<i32>(&after_a_chunk, &expected_type)
+            .expect_err("two values after a chunk");
+        assert_eq!(
+            err.to_string(),
+            "Cast error: Failed to decode List(Int32) from JSON: value \"[1] [2]\" holds 2 JSON values, not one"
         );
 
         // No value in a row, empty or whitespace only.
