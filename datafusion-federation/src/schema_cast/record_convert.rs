@@ -9,8 +9,7 @@ use super::{
     intervals_cast::{
         cast_interval_monthdaynano_to_daytime, cast_interval_monthdaynano_to_yearmonth,
     },
-    lists_cast::{cast_string_to_fixed_size_list, cast_string_to_large_list, cast_string_to_list},
-    struct_cast::cast_string_to_struct,
+    nested_cast::cast_string_to_nested,
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -106,42 +105,22 @@ pub fn try_cast_to(record_batch: RecordBatch, expected_schema: SchemaRef) -> Res
             };
 
             match (record_batch_col.data_type(), expected_field.data_type()) {
-                (DataType::Utf8, DataType::List(item_type)) => {
-                    cast_string_to_list::<i32>(record_batch_col, item_type).map_err(make_err)
-                }
-                (DataType::Utf8, DataType::LargeList(item_type)) => {
-                    cast_string_to_large_list::<i32>(record_batch_col, item_type).map_err(make_err)
-                }
-                (DataType::Utf8, DataType::FixedSizeList(item_type, value_length)) => {
-                    cast_string_to_fixed_size_list::<i32>(
-                        record_batch_col,
-                        item_type,
-                        *value_length,
-                    )
-                    .map_err(make_err)
-                }
-                (DataType::Utf8, DataType::Struct(_)) => {
-                    cast_string_to_struct::<i32>(record_batch_col, expected_field.clone())
-                        .map_err(make_err)
-                }
-                (DataType::LargeUtf8, DataType::List(item_type)) => {
-                    cast_string_to_list::<i64>(record_batch_col, item_type).map_err(make_err)
-                }
-                (DataType::LargeUtf8, DataType::LargeList(item_type)) => {
-                    cast_string_to_large_list::<i64>(record_batch_col, item_type).map_err(make_err)
-                }
-                (DataType::LargeUtf8, DataType::FixedSizeList(item_type, value_length)) => {
-                    cast_string_to_fixed_size_list::<i64>(
-                        record_batch_col,
-                        item_type,
-                        *value_length,
-                    )
-                    .map_err(make_err)
-                }
-                (DataType::LargeUtf8, DataType::Struct(_)) => {
-                    cast_string_to_struct::<i64>(record_batch_col, expected_field.clone())
-                        .map_err(make_err)
-                }
+                (
+                    DataType::Utf8,
+                    DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::Struct(_),
+                ) => cast_string_to_nested::<i32>(record_batch_col, expected_field.data_type())
+                    .map_err(make_err),
+                (
+                    DataType::LargeUtf8,
+                    DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::Struct(_),
+                ) => cast_string_to_nested::<i64>(record_batch_col, expected_field.data_type())
+                    .map_err(make_err),
                 (
                     DataType::Interval(IntervalUnit::MonthDayNano),
                     DataType::Interval(IntervalUnit::YearMonth),
