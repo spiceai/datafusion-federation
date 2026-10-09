@@ -712,7 +712,7 @@ mod tests {
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::expr::Alias;
-    use datafusion::logical_expr::{LogicalPlanBuilder, Projection};
+    use datafusion::logical_expr::{LogicalPlanBuilder, Projection, TableSource};
     use datafusion::optimizer::eliminate_filter::EliminateFilter;
     use datafusion::optimizer::OptimizerRule;
     use datafusion::prelude::{lit, Expr};
@@ -2328,6 +2328,338 @@ mod tests {
             2,
             "Inexact: both filters must be stored on the node for execute()"
         );
+    }
+
+    /// A source that refuses any plan with a `LIKE`, as Spice's `SQLite` does.
+    fn executor_refusing_like() -> TestExecutor {
+        let refuses_like: Arc<dyn Fn(&LogicalPlan) -> bool + Send + Sync> = Arc::new(|plan| {
+            plan.expressions().iter().any(|e| {
+                e.exists(|e| Ok(matches!(e, Expr::Like(_))))
+                    .unwrap_or(false)
+            })
+        });
+        TestExecutor {
+            compute_context: "a".into(),
+            cannot_federate: Some(refuses_like),
+        }
+    }
+
+    /// `SELECT t2.a FROM t1 JOIN t2 ON t1.a = t2.a WHERE t1.b LIKE '%x' AND <predicate>`,
+    /// with the `LIKE` already below the join, where filter pushdown leaves it, so only
+    /// part of the join federates. Analyzed with no pre-federation pushdown, so the
+    /// analyzer sees that shape.
+    fn analyze_partly_federated(
+        executor: &TestExecutor,
+        predicate: impl FnOnce(&dyn Fn(&str) -> Arc<dyn TableSource>) -> Result<Expr>,
+    ) -> Result<LogicalPlan> {
+        use datafusion::datasource::provider_as_source;
+        use datafusion::logical_expr::expr_fn::col;
+        use datafusion::logical_expr::JoinType;
+
+        let source =
+            |name: &str| provider_as_source(get_test_table_provider(name.into(), executor.clone()));
+        let plan = LogicalPlanBuilder::scan("t1", source("t1"), None)?
+            .filter(col("t1.b").like(lit("%x")))?
+            .join(
+                LogicalPlanBuilder::scan("t2", source("t2"), None)?.build()?,
+                JoinType::Inner,
+                (vec!["t1.a"], vec!["t2.a"]),
+                None,
+            )?
+            .filter(predicate(&source)?)?
+            .project(vec![col("t2.a")])?
+            .build()?;
+        FederationAnalyzerRule::new()
+            .with_optimizer(Optimizer::with_rules(vec![]))
+            .analyze(plan, &ConfigOptions::default())
+    }
+
+    /// Every outer reference inside a federated statement, and every table a
+    /// federated statement scans (sorted).
+    fn federated_outer_refs_and_tables(plan: &LogicalPlan) -> Result<(Vec<String>, Vec<String>)> {
+        let mut outer_refs = vec![];
+        let mut tables = vec![];
+        plan.apply_with_subqueries(|node| {
+            let LogicalPlan::Extension(Extension { node }) = node else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>() else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            federated.plan().apply_with_subqueries(|inner| {
+                if let LogicalPlan::TableScan(scan) = inner {
+                    tables.push(scan.table_name.table().to_string());
+                }
+                for expr in inner.expressions() {
+                    expr.apply(|e| {
+                        if let Expr::OuterReferenceColumn(_, column) = e {
+                            outer_refs.push(column.flat_name());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            Ok(TreeNodeRecursion::Jump)
+        })?;
+        tables.sort();
+        Ok((outer_refs, tables))
+    }
+
+    /// A correlated scalar subquery whose enclosing query is only partly federated
+    /// is analyzed on its own. Its outer reference names a relation the statement it
+    /// would be federated as does not scan, so federating it whole emits that
+    /// reference unbound and hides the aggregate `DataFusion` requires above a
+    /// correlated scalar subquery: the plan fails with "Correlated scalar subquery
+    /// must be aggregated to return at most one row". TPC-H Q2 reaches this shape on
+    /// a source that runs every table but refuses the outer query's `LIKE`.
+    ///
+    /// The correlation has to stay with the enclosing query, which binds it; every
+    /// scan, the subquery's included, still federates.
+    #[tokio::test]
+    async fn a_correlated_subquery_federated_alone_keeps_its_correlation_local(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::functions_aggregate::expr_fn::min;
+        use datafusion::logical_expr::expr_fn::{col, out_ref_col, scalar_subquery};
+        use datafusion::logical_expr::InvariantLevel;
+
+        // ... AND t2.a = (SELECT min(t3.a) FROM t3 WHERE t3.b = t1.b)
+        let analyzed = analyze_partly_federated(&executor_refusing_like(), |source| {
+            let correlated = LogicalPlanBuilder::scan("t3", source("t3"), None)?
+                .filter(col("t3.b").eq(out_ref_col(DataType::Utf8, "t1.b")))?
+                .aggregate(Vec::<Expr>::new(), vec![min(col("t3.a"))])?
+                .build()?;
+            Ok(col("t2.a").eq(scalar_subquery(Arc::new(correlated))))
+        })?;
+
+        analyzed.check_invariants(InvariantLevel::Executable)?;
+        let (outer_refs, tables) = federated_outer_refs_and_tables(&analyzed)?;
+        assert_eq!(
+            outer_refs,
+            Vec::<String>::new(),
+            "no federated statement may carry a correlation it does not bind; plan:\n{analyzed}"
+        );
+        assert_eq!(
+            tables,
+            vec!["t1", "t2", "t3"],
+            "every scan still federates; only the refused LIKE and the correlation stay local; \
+             plan:\n{analyzed}"
+        );
+
+        Ok(())
+    }
+
+    /// The same partial federation with a correlated `IN` and a correlated `EXISTS`.
+    /// Neither has the scalar subquery's one-row check to fail on, so federating the
+    /// subquery whole planned without complaint: the correlation was hidden inside the
+    /// federated statement, where decorrelation cannot see it and the remote engine
+    /// cannot bind it.
+    #[tokio::test]
+    async fn correlated_in_and_exists_subqueries_federated_alone_keep_their_correlation_local(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::logical_expr::expr_fn::{col, exists, in_subquery, out_ref_col};
+        use datafusion::logical_expr::InvariantLevel;
+
+        // ... AND t2.a IN (SELECT t3.a FROM t3 WHERE t3.b = t1.b)
+        let in_correlated = |source: &dyn Fn(&str) -> Arc<dyn TableSource>| -> Result<Expr> {
+            let correlated = LogicalPlanBuilder::scan("t3", source("t3"), None)?
+                .filter(col("t3.b").eq(out_ref_col(DataType::Utf8, "t1.b")))?
+                .project(vec![col("t3.a")])?
+                .build()?;
+            Ok(in_subquery(col("t2.a"), Arc::new(correlated)))
+        };
+        // ... AND EXISTS (SELECT t3.a FROM t3 WHERE t3.b = t1.b)
+        let exists_correlated = |source: &dyn Fn(&str) -> Arc<dyn TableSource>| -> Result<Expr> {
+            let correlated = LogicalPlanBuilder::scan("t3", source("t3"), None)?
+                .filter(col("t3.b").eq(out_ref_col(DataType::Utf8, "t1.b")))?
+                .project(vec![col("t3.a")])?
+                .build()?;
+            Ok(exists(Arc::new(correlated)))
+        };
+
+        let executor = executor_refusing_like();
+        for (form, analyzed) in [
+            ("IN", analyze_partly_federated(&executor, in_correlated)?),
+            (
+                "EXISTS",
+                analyze_partly_federated(&executor, exists_correlated)?,
+            ),
+        ] {
+            analyzed.check_invariants(InvariantLevel::Executable)?;
+            let (outer_refs, tables) = federated_outer_refs_and_tables(&analyzed)?;
+            assert_eq!(
+                outer_refs,
+                Vec::<String>::new(),
+                "{form}: no federated statement may carry a correlation it does not bind; \
+                 plan:\n{analyzed}"
+            );
+            assert_eq!(
+                tables,
+                vec!["t1", "t2", "t3"],
+                "{form}: every scan still federates; plan:\n{analyzed}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Each federated statement's scanned tables (sorted), in plan order.
+    fn federated_statement_tables(plan: &LogicalPlan) -> Result<Vec<Vec<String>>> {
+        let mut statements = vec![];
+        plan.apply_with_subqueries(|node| {
+            let LogicalPlan::Extension(Extension { node }) = node else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let Some(federated) = node.as_any().downcast_ref::<FederatedPlanNode>() else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let mut tables = vec![];
+            federated.plan().apply_with_subqueries(|inner| {
+                if let LogicalPlan::TableScan(scan) = inner {
+                    tables.push(scan.table_name.table().to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            tables.sort();
+            statements.push(tables);
+            Ok(TreeNodeRecursion::Jump)
+        })?;
+        Ok(statements)
+    }
+
+    /// A subquery federated on its own may nest correlated subqueries of its own:
+    /// `t2.a IN (SELECT t3.a FROM t3 WHERE EXISTS (SELECT t4.a FROM t4 WHERE
+    /// t4.b = t3.b AND EXISTS (SELECT t5.a FROM t5 WHERE t5.b = <innermost>)))`.
+    /// With `t4.b` the innermost reference binds to `t4`, which the middle query
+    /// defines, so every correlation is bound inside the `IN` subquery and it
+    /// federates as one statement. With `t1.b` it binds outside the `IN` subquery,
+    /// so that correlation stays local.
+    #[tokio::test]
+    async fn a_subquery_federated_alone_binds_its_nested_correlations_to_their_own_query_blocks(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::logical_expr::expr_fn::{col, exists, in_subquery, out_ref_col};
+        use datafusion::logical_expr::InvariantLevel;
+
+        let nested = |innermost_reference: &'static str| {
+            move |source: &dyn Fn(&str) -> Arc<dyn TableSource>| -> Result<Expr> {
+                let innermost = LogicalPlanBuilder::scan("t5", source("t5"), None)?
+                    .filter(col("t5.b").eq(out_ref_col(DataType::Utf8, innermost_reference)))?
+                    .project(vec![col("t5.a")])?
+                    .build()?;
+                let middle = LogicalPlanBuilder::scan("t4", source("t4"), None)?
+                    .filter(
+                        col("t4.b")
+                            .eq(out_ref_col(DataType::Utf8, "t3.b"))
+                            .and(exists(Arc::new(innermost))),
+                    )?
+                    .project(vec![col("t4.a")])?
+                    .build()?;
+                let standalone = LogicalPlanBuilder::scan("t3", source("t3"), None)?
+                    .filter(exists(Arc::new(middle)))?
+                    .project(vec![col("t3.a")])?
+                    .build()?;
+                Ok(in_subquery(col("t2.a"), Arc::new(standalone)))
+            }
+        };
+
+        let executor = executor_refusing_like();
+        let bound_inside = analyze_partly_federated(&executor, nested("t4.b"))?;
+        bound_inside.check_invariants(InvariantLevel::Executable)?;
+        assert_eq!(
+            federated_statement_tables(&bound_inside)?,
+            vec![vec!["t3", "t4", "t5"], vec!["t1"], vec!["t2"]],
+            "the IN subquery must federate as one statement; plan:\n{bound_inside}"
+        );
+
+        let bound_outside = analyze_partly_federated(&executor, nested("t1.b"))?;
+        bound_outside.check_invariants(InvariantLevel::Executable)?;
+        let (outer_refs, _) = federated_outer_refs_and_tables(&bound_outside)?;
+        assert_eq!(
+            outer_refs,
+            Vec::<String>::new(),
+            "no federated statement may carry a correlation it does not bind; plan:\n{bound_outside}"
+        );
+        assert_eq!(
+            federated_statement_tables(&bound_outside)?,
+            vec![vec!["t5"], vec!["t4"], vec!["t3"], vec!["t1"], vec!["t2"]],
+            "every scan still federates, each on its own; plan:\n{bound_outside}"
+        );
+
+        Ok(())
+    }
+
+    /// A local alias binds a correlated reference only if the reference names it:
+    /// in `SELECT … FROM schema_a.foo WHERE b LIKE '%x' AND EXISTS (SELECT foo.a FROM
+    /// bar AS foo WHERE foo.b = schema_a.foo.b)` the alias `foo` cannot be named
+    /// `schema_a.foo`, so the reference is to the enclosing query and the
+    /// subquery's correlation stays local.
+    #[tokio::test]
+    async fn a_bare_alias_does_not_bind_a_schema_qualified_correlated_reference(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::datasource::provider_as_source;
+        use datafusion::logical_expr::expr_fn::{col, exists, out_ref_col};
+        use datafusion::logical_expr::InvariantLevel;
+
+        let executor = executor_refusing_like();
+        let source =
+            |name: &str| provider_as_source(get_test_table_provider(name.into(), executor.clone()));
+        let correlated = LogicalPlanBuilder::scan("bar", source("bar"), None)?
+            .alias("foo")?
+            .filter(col("foo.b").eq(out_ref_col(DataType::Utf8, "schema_a.foo.b")))?
+            .project(vec![col("foo.a")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::scan("schema_a.foo", source("schema_a.foo"), None)?
+            .filter(col("schema_a.foo.b").like(lit("%x")))?
+            .filter(exists(Arc::new(correlated)))?
+            .project(vec![col("schema_a.foo.a")])?
+            .build()?;
+        let analyzed = FederationAnalyzerRule::new()
+            .with_optimizer(Optimizer::with_rules(vec![]))
+            .analyze(plan, &ConfigOptions::default())?;
+
+        analyzed.check_invariants(InvariantLevel::Executable)?;
+        let (outer_refs, _) = federated_outer_refs_and_tables(&analyzed)?;
+        assert_eq!(
+            outer_refs,
+            Vec::<String>::new(),
+            "no federated statement may carry a correlation it does not bind; plan:\n{analyzed}"
+        );
+
+        Ok(())
+    }
+
+    /// A bare correlated reference binds the qualified relation it names, and the
+    /// provider is looked up under that relation's own name: in `t2.a IN (SELECT
+    /// foo.a FROM schema_b.foo WHERE EXISTS (SELECT t5.a FROM t5 WHERE t5.b =
+    /// foo.b))` the `IN` subquery federates as one statement.
+    #[tokio::test]
+    async fn a_bare_correlated_reference_to_a_qualified_relation_federates_as_one_statement(
+    ) -> Result<(), DataFusionError> {
+        use datafusion::logical_expr::expr_fn::{col, exists, in_subquery, out_ref_col};
+        use datafusion::logical_expr::InvariantLevel;
+
+        let predicate = |source: &dyn Fn(&str) -> Arc<dyn TableSource>| -> Result<Expr> {
+            let innermost = LogicalPlanBuilder::scan("t5", source("t5"), None)?
+                .filter(col("t5.b").eq(out_ref_col(DataType::Utf8, "foo.b")))?
+                .project(vec![col("t5.a")])?
+                .build()?;
+            let standalone =
+                LogicalPlanBuilder::scan("schema_b.foo", source("schema_b.foo"), None)?
+                    .filter(exists(Arc::new(innermost)))?
+                    .project(vec![col("schema_b.foo.a")])?
+                    .build()?;
+            Ok(in_subquery(col("t2.a"), Arc::new(standalone)))
+        };
+
+        let analyzed = analyze_partly_federated(&executor_refusing_like(), predicate)?;
+        analyzed.check_invariants(InvariantLevel::Executable)?;
+        assert_eq!(
+            federated_statement_tables(&analyzed)?,
+            vec![vec!["foo", "t5"], vec!["t1"], vec!["t2"]],
+            "the IN subquery must federate as one statement; plan:\n{analyzed}"
+        );
+
+        Ok(())
     }
 
     // ── empty projection: the `SELECT 1` placeholder ─────────────────────────

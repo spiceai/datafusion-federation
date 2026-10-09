@@ -57,7 +57,14 @@ impl AnalyzerRule for FederationAnalyzerRule {
         let providers = get_plan_provider_recursively(&plan)?;
         let explain_context = Self::explain_context_template(&plan);
 
-        match self.analyze_plan_recursively(&plan, true, config, &providers, explain_context)? {
+        match self.analyze_plan_recursively(
+            &plan,
+            true,
+            config,
+            &providers,
+            explain_context,
+            None,
+        )? {
             (Some(optimized_plan), _) => Ok(optimized_plan),
             (None, _) => Ok(plan),
         }
@@ -140,15 +147,15 @@ impl FederationAnalyzerRule {
 
     /// Scans a plan to see if it belongs to a single [`FederationProvider`].
     ///
-    /// `scope` is the candidate that would become one remote statement, which is
-    /// `plan` itself except when scanning a subquery, where it stays the enclosing
-    /// candidate. Only [`Self::scan_expr_recursively`] reads it, to decide whether a
-    /// correlated reference stays bound inside the statement it would be emitted in.
+    /// `scope` says which statement a correlated reference inside `plan` has to be
+    /// bound in (see [`Binding`]). Only [`Self::scan_expr_recursively`] reads it, to
+    /// decide whether a correlated reference stays bound inside the statement it
+    /// would be emitted in.
     fn scan_plan_recursively(
         &self,
         plan: &LogicalPlan,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
-        scope: &LogicalPlan,
+        scope: Binding<'_>,
     ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
@@ -174,13 +181,13 @@ impl FederationAnalyzerRule {
         &self,
         plan: &LogicalPlan,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
-        scope: &LogicalPlan,
+        scope: Binding<'_>,
     ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
         let exprs = plan.expressions();
         for expr in &exprs {
-            let expr_result = self.scan_expr_recursively(expr, providers, scope)?;
+            let expr_result = self.scan_expr_recursively(expr, providers, scope, plan)?;
             sole_provider.merge(expr_result);
 
             if sole_provider.is_ambiguous() {
@@ -192,11 +199,15 @@ impl FederationAnalyzerRule {
     }
 
     /// scans an expression to see if it belongs to a single [`FederationProvider`]
+    ///
+    /// `holder` is the plan node `expr` belongs to: the query block a correlated
+    /// reference inside one of its subqueries can bind to.
     fn scan_expr_recursively(
         &self,
         expr: &Expr,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
-        scope: &LogicalPlan,
+        scope: Binding<'_>,
+        holder: &LogicalPlan,
     ) -> Result<ScanResult> {
         let mut sole_provider: ScanResult = ScanResult::None;
 
@@ -204,16 +215,17 @@ impl FederationAnalyzerRule {
             match e {
                 Expr::ScalarSubquery(ref subquery) => {
                     let plan_result =
-                        self.scan_plan_recursively(&subquery.subquery, providers, scope)?;
+                        self.scan_subquery(&subquery.subquery, providers, scope, holder)?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
                 Expr::InSubquery(ref insubquery) => {
-                    let plan_result = self.scan_plan_recursively(
+                    let plan_result = self.scan_subquery(
                         &insubquery.subquery.subquery,
                         providers,
                         scope,
+                        holder,
                     )?;
 
                     sole_provider.merge(plan_result);
@@ -221,23 +233,59 @@ impl FederationAnalyzerRule {
                 }
                 Expr::Exists(ref exists) => {
                     let plan_result =
-                        self.scan_plan_recursively(&exists.subquery.subquery, providers, scope)?;
+                        self.scan_subquery(&exists.subquery.subquery, providers, scope, holder)?;
 
                     sole_provider.merge(plan_result);
                     Ok(sole_provider.check_recursion())
                 }
                 Expr::OuterReferenceColumn(_, ref col) => {
                     if let Some(table) = &col.relation {
-                        if let Some(plan_result) = providers.get(table) {
-                            sole_provider.merge(ScanResult::Distinct(Arc::clone(plan_result)));
-                            return Ok(sole_provider.check_recursion());
-                        }
-                        // A relation that scans nothing has no provider to report, but
-                        // the remote engine renders it inline and its alias is defined
-                        // inside the same statement, so the correlation stays bound and
-                        // constrains nothing about which engine runs the statement.
-                        if scope_names_a_scanless_relation(scope, table)? {
-                            return Ok(sole_provider.check_recursion());
+                        match scope {
+                            Binding::Enclosing(scope) => {
+                                if let Some(plan_result) = providers.get(table) {
+                                    sole_provider
+                                        .merge(ScanResult::Distinct(Arc::clone(plan_result)));
+                                    return Ok(sole_provider.check_recursion());
+                                }
+                                // A relation that scans nothing has no provider to report,
+                                // but the remote engine renders it inline and its alias is
+                                // defined inside the same statement, so the correlation
+                                // stays bound and constrains nothing about which engine
+                                // runs the statement.
+                                if scope_names_a_scanless_relation(scope, table)? {
+                                    return Ok(sole_provider.check_recursion());
+                                }
+                            }
+                            Binding::Standalone(blocks) => {
+                                // The reference binds in the innermost query block that
+                                // defines the relation, so look outward from the one it
+                                // sits in, as far as the subquery federated on its own.
+                                let mut block = Some(blocks);
+                                while let Some(Blocks {
+                                    block: scope,
+                                    outer,
+                                }) = block
+                                {
+                                    match relation_binding(scope, table)? {
+                                        // The subquery scans the relation itself, so the
+                                        // reference is bound in the statement it becomes.
+                                        RelationBinding::Scanning(defined) => {
+                                            if let Some(plan_result) = providers.get(&defined) {
+                                                sole_provider.merge(ScanResult::Distinct(
+                                                    Arc::clone(plan_result),
+                                                ));
+                                                return Ok(sole_provider.check_recursion());
+                                            }
+                                            break;
+                                        }
+                                        RelationBinding::Scanless => {
+                                            return Ok(sole_provider.check_recursion());
+                                        }
+                                        RelationBinding::Duplicate => break,
+                                        RelationBinding::Undefined => block = *outer,
+                                    }
+                                }
+                            }
                         }
                     }
                     // The reference names a relation this candidate does not define, or
@@ -254,12 +302,37 @@ impl FederationAnalyzerRule {
         Ok(sole_provider)
     }
 
+    /// Scans a subquery found in an expression of `holder`. Inside a subquery
+    /// federated on its own, a correlated reference in it can also bind to a
+    /// relation `holder` defines, so `holder` joins the query blocks it can bind to.
+    fn scan_subquery(
+        &self,
+        subquery: &LogicalPlan,
+        providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
+        scope: Binding<'_>,
+        holder: &LogicalPlan,
+    ) -> Result<ScanResult> {
+        match scope {
+            Binding::Enclosing(_) => self.scan_plan_recursively(subquery, providers, scope),
+            Binding::Standalone(blocks) => {
+                let nested = Blocks {
+                    block: holder,
+                    outer: Some(blocks),
+                };
+                self.scan_plan_recursively(subquery, providers, Binding::Standalone(&nested))
+            }
+        }
+    }
+
     /// Recursively finds the largest sub-plans that can be federated
     /// to a single FederationProvider.
     ///
     /// Returns a plan if a sub-tree was federated, otherwise None.
     ///
     /// Returns a ScanResult of all FederationProviders in the subtree.
+    ///
+    /// `standalone` is the subquery being federated on its own, when `plan` is part
+    /// of one; `None` while analyzing the statement itself.
     fn analyze_plan_recursively(
         &self,
         plan: &LogicalPlan,
@@ -267,9 +340,11 @@ impl FederationAnalyzerRule {
         config: &ConfigOptions,
         providers: &HashMap<TableReference, Arc<dyn FederationProvider>>,
         explain_context: Option<Arc<LogicalPlan>>,
+        standalone: Option<&LogicalPlan>,
     ) -> Result<(Option<LogicalPlan>, ScanResult)> {
         let explain_context = explain_context.or_else(|| Self::explain_context_template(plan));
         let mut sole_provider: ScanResult = ScanResult::None;
+        let standalone_blocks = standalone.map(|block| Blocks { block, outer: None });
 
         if let LogicalPlan::Extension(Extension { ref node }) = plan {
             if node.name() == "Federated" {
@@ -281,9 +356,11 @@ impl FederationAnalyzerRule {
         // A recursive term can read remote tables before its work-table definition
         // is in scope. Consider the complete CTE before attempting to split its terms.
         if matches!(plan, LogicalPlan::RecursiveQuery(_)) {
-            if let ScanResult::Distinct(provider) =
-                self.scan_plan_recursively(plan, providers, plan)?
-            {
+            if let ScanResult::Distinct(provider) = self.scan_plan_recursively(
+                plan,
+                providers,
+                Binding::new(plan, standalone_blocks.as_ref()),
+            )? {
                 let prepared_plan = Self::optimize_for_provider(&provider, plan.clone(), config)?;
                 if let Some(FederationAnalyzerForLogicalPlan::With(analyzer)) =
                     provider.analyzer(&prepared_plan)
@@ -304,7 +381,11 @@ impl FederationAnalyzerRule {
         let (leaf_provider, _) = get_leaf_provider(plan)?;
 
         // Check if the expressions contain, a potentially different, FederationProvider
-        let exprs_result = self.scan_plan_exprs(plan, providers, plan)?;
+        let exprs_result = self.scan_plan_exprs(
+            plan,
+            providers,
+            Binding::new(plan, standalone_blocks.as_ref()),
+        )?;
 
         // Return early if this is a leaf and there is no ambiguity with the expressions.
         if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
@@ -324,7 +405,14 @@ impl FederationAnalyzerRule {
         let input_results = inputs
             .iter()
             .map(|i| {
-                self.analyze_plan_recursively(i, false, config, providers, explain_context.clone())
+                self.analyze_plan_recursively(
+                    i,
+                    false,
+                    config,
+                    providers,
+                    explain_context.clone(),
+                    standalone,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -485,6 +573,7 @@ impl FederationAnalyzerRule {
                     _config,
                     providers,
                     explain_context.clone(),
+                    Some(&subquery.subquery),
                 )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
@@ -520,6 +609,7 @@ impl FederationAnalyzerRule {
                     _config,
                     providers,
                     explain_context,
+                    Some(&in_subquery.subquery.subquery),
                 )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
@@ -559,6 +649,7 @@ impl FederationAnalyzerRule {
                     _config,
                     providers,
                     explain_context,
+                    Some(&exists.subquery.subquery),
                 )?;
                 let Some(new_subquery) = new_subquery else {
                     return Ok(Transformed::no(expr));
@@ -687,12 +778,67 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// [`NopFederationProvider`]. So a relation that scans anything is already in the
 /// provider map, or belongs to an engine this candidate cannot be handed to, and
 /// either way it is not this branch's business.
+fn scope_names_a_scanless_relation(scope: &LogicalPlan, relation: &TableReference) -> Result<bool> {
+    Ok(relation_binding(scope, relation)? == RelationBinding::Scanless)
+}
+
+/// Which statement a correlated reference has to be bound in for the plan around it
+/// to federate.
+#[derive(Clone, Copy)]
+enum Binding<'a> {
+    /// Part of the statement being analyzed, with this node as the candidate. A
+    /// reference to a relation some provider scans is bound once the candidate grows
+    /// to the enclosing statement, and that provider is the engine it needs.
+    Enclosing(&'a LogicalPlan),
+    /// A subquery federated on its own, because the query around it did not federate.
+    /// It becomes a statement of its own, so only a relation it defines binds the
+    /// reference. One defined by the enclosing query would be emitted unbound, and
+    /// the subquery's correlation would be hidden from `DataFusion`, which needs it to
+    /// decorrelate the subquery and to check a correlated scalar one returns one row.
+    ///
+    /// The relations it defines are those of every query block from the one the
+    /// reference sits in out to the subquery itself: a subquery nested inside it
+    /// can correlate with the query block around it, not only with the outermost.
+    Standalone(&'a Blocks<'a>),
+}
+
+impl<'a> Binding<'a> {
+    fn new(plan: &'a LogicalPlan, standalone: Option<&'a Blocks<'a>>) -> Self {
+        standalone.map_or(Self::Enclosing(plan), Self::Standalone)
+    }
+}
+
+/// The query blocks a correlated reference inside a subquery federated on its own
+/// can bind to, innermost first: `block` holds the subquery the reference sits in,
+/// and `outer` the blocks around it, out to the federated subquery itself.
+struct Blocks<'a> {
+    block: &'a LogicalPlan,
+    outer: Option<&'a Blocks<'a>>,
+}
+
+/// How a scope defines the relation a correlated reference names; see [`relation_binding`].
+#[derive(Debug, PartialEq, Eq)]
+enum RelationBinding {
+    /// Not defined there.
+    Undefined,
+    /// Defined more than once, so which one a reference means is unknown.
+    Duplicate,
+    /// Defined once, by a relation that scans nothing.
+    Scanless,
+    /// Defined once, by a relation that scans a table, under this name: the
+    /// relation's own, which is what the provider map knows it by.
+    Scanning(TableReference),
+}
+
+/// How `scope` defines `relation` at the position of a correlated reference to it.
 ///
 /// A unique match is required, and a duplicate name is refused rather than
-/// resolved. Names are compared on the last segment, so a qualified scan and a
-/// bare reference to it collide deliberately: over-matching costs a refusal, where
-/// binding a correlation to the wrong relation of the same name would return wrong
-/// rows with no error.
+/// resolved: binding a correlation to the wrong relation of the same name would
+/// return wrong rows with no error, where refusing costs only the pushdown. A
+/// relation matches when the reference names it ([`reference_names`]): a bare
+/// reference matches a qualified relation of that table, but a qualified
+/// reference matches only a relation that carries the same qualifiers, so neither
+/// `schema_b.foo` nor an alias `foo` binds a reference to `schema_a.foo`.
 ///
 /// The walk is `apply`, not `apply_with_subqueries`: the relation a correlated
 /// reference binds to is in the candidate's own `FROM`, reached through its inputs.
@@ -700,20 +846,21 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// position, so counting one would be a false match on nothing more than a reused
 /// alias — and the plan would then be federated alone, with that identifier unbound
 /// in the emitted SQL.
-fn scope_names_a_scanless_relation(scope: &LogicalPlan, relation: &TableReference) -> Result<bool> {
-    let wanted = relation.table();
+fn relation_binding(scope: &LogicalPlan, relation: &TableReference) -> Result<RelationBinding> {
     let mut matches = 0usize;
-    let mut scanless = false;
+    let mut scans = false;
+    let mut matched = None;
 
     scope.apply(&mut |node: &LogicalPlan| -> Result<TreeNodeRecursion> {
-        let named = match node {
-            LogicalPlan::SubqueryAlias(alias) => alias.alias.table() == wanted,
-            LogicalPlan::TableScan(scan) => scan.table_name.table() == wanted,
-            _ => false,
+        let name = match node {
+            LogicalPlan::SubqueryAlias(alias) => Some(&alias.alias),
+            LogicalPlan::TableScan(scan) => Some(&scan.table_name),
+            _ => None,
         };
-        if named {
+        if let Some(name) = name.filter(|name| reference_names(relation, name)) {
             matches += 1;
-            scanless = matches == 1 && !plan_scans_anything(node)?;
+            scans = plan_scans_anything(node)?;
+            matched = Some(name.clone());
         }
         // Stop at each query block. A `SubqueryAlias` is itself a relation of this
         // scope and the relations inside it are not, and a `Union`'s branches are
@@ -730,7 +877,27 @@ fn scope_names_a_scanless_relation(scope: &LogicalPlan, relation: &TableReferenc
         )
     })?;
 
-    Ok(matches == 1 && scanless)
+    Ok(match (matches, matched) {
+        (0, _) => RelationBinding::Undefined,
+        (1, Some(defined)) if scans => RelationBinding::Scanning(defined),
+        (1, Some(_)) => RelationBinding::Scanless,
+        _ => RelationBinding::Duplicate,
+    })
+}
+
+/// Whether a correlated reference to `reference` names the relation `defined`:
+/// the table names agree, and every qualifier the reference carries, the
+/// relation carries with the same value. A bare `foo` names `schema_b.foo`, but
+/// `schema_a.foo` names neither `schema_b.foo` nor an alias `foo`, which no
+/// qualified name reaches.
+fn reference_names(reference: &TableReference, defined: &TableReference) -> bool {
+    reference.table() == defined.table()
+        && reference
+            .schema()
+            .is_none_or(|schema| defined.schema() == Some(schema))
+        && reference
+            .catalog()
+            .is_none_or(|catalog| defined.catalog() == Some(catalog))
 }
 
 /// Whether any `TableScan` appears in `plan`, including inside its subquery
@@ -1029,6 +1196,58 @@ mod tests {
         );
     }
 
+    /// A relation binds a correlated reference only if their qualifiers agree: a bare
+    /// reference matches the qualified relation, a conflicting schema never does. A
+    /// subquery federated on its own that scans `schema_b.foo` must not take a
+    /// reference to `schema_a.foo` as bound, or the reference is emitted unbound.
+    #[test]
+    fn a_correlated_reference_binds_only_a_relation_whose_qualifiers_agree() {
+        let qualified = scan("schema_b.foo");
+        let aliased = LogicalPlanBuilder::from(scan("bar"))
+            .alias("foo")
+            .expect("alias")
+            .build()
+            .expect("build");
+        for (scope, label, reference, expected) in [
+            (
+                &qualified,
+                "a scan of schema_b.foo",
+                TableReference::partial("schema_b", "foo"),
+                RelationBinding::Scanning(TableReference::partial("schema_b", "foo")),
+            ),
+            (
+                &qualified,
+                "a scan of schema_b.foo",
+                TableReference::bare("foo"),
+                RelationBinding::Scanning(TableReference::partial("schema_b", "foo")),
+            ),
+            (
+                &qualified,
+                "a scan of schema_b.foo",
+                TableReference::partial("schema_a", "foo"),
+                RelationBinding::Undefined,
+            ),
+            (
+                &aliased,
+                "bar AS foo",
+                TableReference::bare("foo"),
+                RelationBinding::Scanning(TableReference::bare("foo")),
+            ),
+            (
+                &aliased,
+                "bar AS foo",
+                TableReference::partial("schema_a", "foo"),
+                RelationBinding::Undefined,
+            ),
+        ] {
+            assert_eq!(
+                relation_binding(scope, &reference).expect("resolve the reference"),
+                expected,
+                "binding of {reference} against {label}"
+            );
+        }
+    }
+
     /// Two relations of one name are refused rather than resolved. Binding the
     /// correlation to the wrong one of them would return wrong rows with no error,
     /// where refusing costs only the pushdown.
@@ -1049,6 +1268,12 @@ mod tests {
             !scope_names_a_scanless_relation(&scope, &TableReference::bare("h"))
                 .expect("resolve h"),
             "an ambiguous name must be refused, not resolved to the constant relation"
+        );
+        // Not `Undefined`: a reference inside a subquery federated on its own looks
+        // outward only past a block that does not define the name at all.
+        assert_eq!(
+            relation_binding(&scope, &TableReference::bare("h")).expect("resolve h"),
+            RelationBinding::Duplicate
         );
     }
 }
