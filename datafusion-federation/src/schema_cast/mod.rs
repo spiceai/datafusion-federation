@@ -17,9 +17,8 @@ use std::fmt;
 use std::sync::Arc;
 
 mod intervals_cast;
-mod lists_cast;
+mod nested_cast;
 pub mod record_convert;
-mod struct_cast;
 
 #[derive(Debug)]
 #[allow(clippy::module_name_repetitions)]
