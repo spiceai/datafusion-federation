@@ -38,14 +38,20 @@ pub(crate) fn cast_string_to_nested<O: OffsetSizeTrait>(
     let mut decoder = ReaderBuilder::new_with_field(field)
         .with_batch_size(strings.len())
         .build_decoder()
-        .map_err(|e| ArrowError::CastError(format!("Failed to create JSON decoder: {e}")))?;
+        .map_err(|e| {
+            ArrowError::CastError(format!(
+                "Failed to create JSON decoder: {}",
+                shown_error(&e)
+            ))
+        })?;
 
     for (row, value) in strings.iter().enumerate() {
         let bytes = value.map_or(b"null".as_slice(), str::as_bytes);
         let consumed = decoder.decode(bytes).map_err(|e| {
             ArrowError::CastError(format!(
-                "Failed to decode {expected} from JSON value {}: {e}",
-                shown(bytes)
+                "Failed to decode {expected} from JSON value {}: {}",
+                shown(bytes),
+                shown_error(&e)
             ))
         })?;
         // Each row must end at a value boundary: a value left open here would be completed
@@ -78,7 +84,12 @@ pub(crate) fn cast_string_to_nested<O: OffsetSizeTrait>(
 
     let batch = decoder
         .flush()
-        .map_err(|e| ArrowError::CastError(format!("Failed to decode {expected} from JSON: {e}")))?
+        .map_err(|e| {
+            ArrowError::CastError(format!(
+                "Failed to decode {expected} from JSON: {}",
+                shown_error(&e)
+            ))
+        })?
         .ok_or_else(|| {
             ArrowError::CastError(format!(
                 "Failed to decode {expected} from JSON: {} strings decoded to no values",
@@ -97,10 +108,12 @@ pub(crate) fn cast_string_to_nested<O: OffsetSizeTrait>(
     Ok(Arc::clone(batch.column(0)))
 }
 
+/// How much of a value or an upstream message an error carries.
+const SHOWN_BYTES: usize = 256;
+
 /// The row text as it appears in an error: quoted, lossily decoded, and cut after
 /// `SHOWN_BYTES` so a multi-megabyte value does not become a multi-megabyte message.
 fn shown(bytes: &[u8]) -> String {
-    const SHOWN_BYTES: usize = 256;
     if bytes.len() <= SHOWN_BYTES {
         format!("{:?}", String::from_utf8_lossy(bytes))
     } else {
@@ -110,6 +123,26 @@ fn shown(bytes: &[u8]) -> String {
             bytes.len()
         )
     }
+}
+
+/// An upstream message as it appears in an error, cut the same way. The JSON reader builds
+/// its type errors by serializing the whole offending element, so a row that is valid JSON
+/// but holds a large value under an incompatible leaf type reaches us as a message as long
+/// as the value itself.
+fn shown_error(e: &ArrowError) -> String {
+    let text = e.to_string();
+    if text.len() <= SHOWN_BYTES {
+        return text;
+    }
+    // `str::floor_char_boundary` says this in one call, but it stabilized recently and this
+    // crate publishes without a `rust-version`, so walking back by hand keeps the MSRV where
+    // it is. `text` is longer than `SHOWN_BYTES` here and index 0 is always a boundary, so
+    // this terminates within the width of one character.
+    let mut end = SHOWN_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\u{2026} ({} bytes)", &text[..end], text.len())
 }
 
 #[cfg(test)]
@@ -586,6 +619,30 @@ mod test {
         );
         assert!(
             message.ends_with("\u{2026} (4001 bytes) is incomplete"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn a_large_valid_value_with_an_incompatible_leaf_is_cut_in_the_error_message() {
+        // The row is structurally valid JSON, so every per-row check passes and the type
+        // error is raised by `flush()`. Arrow's JSON reader quotes the offending element in
+        // that error, so the message carries the whole value unless we cut it.
+        let expected_type = DataType::new_list(DataType::Int32, true);
+        let big = "x".repeat(1_000_000);
+        let row = format!("[\"{big}\"]");
+        let strings = StringArray::from(vec![Some(row.as_str())]);
+        let err = cast_string_to_nested::<i32>(&strings, &expected_type).expect_err("leaf type");
+        let message = err.to_string();
+        assert!(
+            message.len() < 400,
+            "message is {} bytes, starting: {}",
+            message.len(),
+            &message[..200.min(message.len())]
+        );
+        // The cut keeps the upstream message's own length, so the full size stays visible.
+        assert!(
+            message.contains("\u{2026} (") && message.ends_with(" bytes)"),
             "unexpected error: {message}"
         );
     }
