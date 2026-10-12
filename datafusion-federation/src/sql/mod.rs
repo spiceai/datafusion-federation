@@ -25,11 +25,13 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{lit, Extension, LogicalPlan, LogicalPlanBuilder},
+    logical_expr::{lit, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr},
     optimizer::{
         optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer, OptimizerRule,
     },
-    physical_expr::EquivalenceProperties,
+    physical_expr::{
+        expressions::Column as PhysicalColumn, EquivalenceProperties, PhysicalSortExpr,
+    },
     physical_plan::{
         apply_expression_roots,
         execution_plan::{Boundedness, EmissionType},
@@ -37,6 +39,7 @@ use datafusion::{
             ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
         },
         metrics::MetricsSet,
+        sort_pushdown::SortOrderPushdownResult,
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         SendableRecordBatchStream,
@@ -629,6 +632,62 @@ impl ExecutionPlan for VirtualExecutionPlan {
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         Ok(Arc::new(self.statistics.clone()))
+    }
+
+    /// Accepts a sort pushed down from above when the executor orders rows as
+    /// `DataFusion` would ([`SQLExecutor::supports_sort_pushdown`]): the sort is
+    /// added to the federated plan, so the remote SQL carries the `ORDER BY`, and
+    /// the ordering is declared so `DataFusion` drops its own sort. Only sorts on
+    /// this node's output columns are accepted.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        if order.is_empty() || !self.executor.supports_sort_pushdown() {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        let schema = self.plan.schema();
+        let mut keys = Vec::with_capacity(order.len());
+        for sort in order {
+            let Some(column) = sort.expr.downcast_ref::<PhysicalColumn>() else {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            };
+            if column.index() >= schema.fields().len() {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+            let (qualifier, field) = schema.qualified_field(column.index());
+            if field.name() != column.name() {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+            keys.push(SortExpr::new(
+                Expr::Column(datafusion::common::Column::new(
+                    qualifier.cloned(),
+                    field.name(),
+                )),
+                !sort.options.descending,
+                sort.options.nulls_first,
+            ));
+        }
+
+        let plan = LogicalPlan::Sort(Sort {
+            expr: keys,
+            input: Arc::new(self.plan.clone()),
+            fetch: None,
+        });
+        let props = PlanProperties::clone(&self.props).with_eq_properties(
+            EquivalenceProperties::new_with_orderings(self.schema(), vec![order.to_vec()]),
+        );
+        // A remote plan fetched for EXPLAIN describes the SQL before the sort was
+        // added, so it is dropped rather than shown beside SQL it did not run.
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(Self {
+                plan,
+                props: Arc::new(props),
+                remote_plan: None,
+                pending_remote_plan: None,
+                ..self.clone()
+            }),
+        })
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -2830,5 +2889,147 @@ mod tests {
                 .contains("expected the 1 placeholder column"),
             "{error}"
         );
+    }
+
+    // ── sort pushdown into the federated scan ────────────────────────────────
+
+    /// An executor that orders rows as `DataFusion` would, or not.
+    #[derive(Debug)]
+    struct SortingExecutor(bool);
+
+    #[async_trait]
+    impl SQLExecutor for SortingExecutor {
+        fn name(&self) -> &str {
+            "SortingExecutor"
+        }
+
+        fn compute_context(&self) -> Option<String> {
+            Some("sorting".to_string())
+        }
+
+        fn dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(unparser::dialect::DefaultDialect {})
+        }
+
+        fn supports_sort_pushdown(&self) -> bool {
+            self.0
+        }
+
+        fn execute(
+            &self,
+            _query: &str,
+            _schema: SchemaRef,
+            _filters: &[Arc<dyn PhysicalExpr>],
+        ) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
+        }
+
+        async fn table_names(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+
+        async fn get_table_schema(&self, _table_name: &str) -> Result<SchemaRef> {
+            unimplemented!()
+        }
+    }
+
+    /// `SELECT t.a, t.b, t.c FROM t`, federated to an executor that orders rows
+    /// as `DataFusion` would when `sorts` is true.
+    fn scan_vp(sorts: bool) -> VirtualExecutionPlan {
+        let provider = get_test_table_provider(
+            "t".to_string(),
+            TestExecutor {
+                compute_context: "ctx".into(),
+                cannot_federate: None,
+            },
+        );
+        let source = datafusion::datasource::provider_as_source(provider);
+        let plan = LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan")
+            .build()
+            .expect("plan");
+        let schema = Arc::new(<DFSchema as AsRef<Schema>>::as_ref(plan.schema().as_ref()).clone());
+        VirtualExecutionPlan::new(
+            plan,
+            Arc::new(SortingExecutor(sorts)),
+            Statistics::new_unknown(&schema),
+            None,
+        )
+    }
+
+    fn sort_on(name: &str, index: usize) -> Vec<PhysicalSortExpr> {
+        vec![PhysicalSortExpr::new(
+            Arc::new(PhysicalColumn::new(name, index)),
+            datafusion::arrow::compute::SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        )]
+    }
+
+    fn pushed(
+        result: SortOrderPushdownResult<Arc<dyn ExecutionPlan>>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        match result {
+            SortOrderPushdownResult::Exact { inner } => Some(inner),
+            SortOrderPushdownResult::Inexact { .. } => panic!("expected Exact or Unsupported"),
+            SortOrderPushdownResult::Unsupported => None,
+        }
+    }
+
+    /// The federated scan takes a sort only from an executor that orders rows
+    /// as `DataFusion` would; the SQL then carries the `ORDER BY` and the
+    /// ordering is declared, so `DataFusion` can drop its own sort.
+    #[test]
+    fn virtual_execution_plan_takes_a_sort_only_from_a_sorting_executor() -> Result<()> {
+        let order = sort_on("a", 0);
+
+        assert!(pushed(scan_vp(false).try_pushdown_sort(&order)?).is_none());
+
+        let inner = pushed(scan_vp(true).try_pushdown_sort(&order)?).expect("Exact");
+        let vp = inner
+            .downcast_ref::<VirtualExecutionPlan>()
+            .expect("a VirtualExecutionPlan");
+        assert_eq!(
+            vp.final_sql()?,
+            "SELECT * FROM t ORDER BY t.a DESC NULLS LAST"
+        );
+        assert_eq!(
+            inner.properties().output_ordering().map(|o| o.to_vec()),
+            Some(order)
+        );
+
+        // A column the node does not output under that name is not taken.
+        assert!(pushed(scan_vp(true).try_pushdown_sort(&sort_on("b", 0))?).is_none());
+        Ok(())
+    }
+
+    /// The cast passes a sort through on a column it keeps at its type, and
+    /// not on one whose type it changes, whose values may order differently.
+    #[test]
+    fn schema_cast_passes_a_sort_through_only_on_columns_it_keeps_at_their_type() -> Result<()> {
+        let unchanged = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Date32, false),
+        ]));
+        let a_recast = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Date32, false),
+        ]));
+
+        let cast = schema_cast::SchemaCastScanExec::new(Arc::new(scan_vp(true)), unchanged);
+        let inner = pushed(cast.try_pushdown_sort(&sort_on("a", 0))?).expect("Exact");
+        assert_eq!(inner.name(), "SchemaCastScanExec");
+        assert_eq!(
+            inner.properties().output_ordering().map(|o| o.to_vec()),
+            Some(sort_on("a", 0))
+        );
+
+        let cast = schema_cast::SchemaCastScanExec::new(Arc::new(scan_vp(true)), a_recast);
+        assert!(pushed(cast.try_pushdown_sort(&sort_on("a", 0))?).is_none());
+        assert!(pushed(cast.try_pushdown_sort(&sort_on("b", 1))?).is_some());
+        Ok(())
     }
 }

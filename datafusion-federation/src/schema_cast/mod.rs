@@ -5,8 +5,10 @@ use datafusion::common::Statistics;
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::{expressions::Column, PhysicalSortExpr};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PhysicalExpr,
@@ -128,6 +130,34 @@ impl ExecutionPlan for SchemaCastScanExec {
                 }
             },
         )))
+    }
+
+    /// Casting keeps every column at its position, so a sort on columns the cast
+    /// leaves at their type is the same sort on the input. A column whose type
+    /// changes is not passed through: the cast can change how its values order.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let input_schema = self.input.schema();
+        for sort in order {
+            let Some(column) = sort.expr.downcast_ref::<Column>() else {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            };
+            let index = column.index();
+            if index >= input_schema.fields().len()
+                || index >= self.schema.fields().len()
+                || input_schema.field(index).name() != column.name()
+                || input_schema.field(index).data_type() != self.schema.field(index).data_type()
+            {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+        }
+        let schema = Arc::clone(&self.schema);
+        Ok(self
+            .input
+            .try_pushdown_sort(order)?
+            .map(|input| Arc::new(Self::new(input, Arc::clone(&schema))) as Arc<dyn ExecutionPlan>))
     }
 
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {

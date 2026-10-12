@@ -99,6 +99,18 @@ pub trait SQLExecutor: Sync + Send {
         vec![SQLFilterPushDown::Unsupported; filters.len()]
     }
 
+    /// Whether the remote engine returns the rows of an `ORDER BY` rendered in
+    /// [`Self::dialect`] in exactly the order `DataFusion` would sort them,
+    /// including where NULLs go and how strings compare.
+    ///
+    /// When `true`, a [`VirtualExecutionPlan`](super::VirtualExecutionPlan)
+    /// accepts a sort pushed down to it: the federated SQL carries the
+    /// `ORDER BY`, the ordering is declared, and `DataFusion` drops its own sort.
+    /// The default, `false`, keeps the sort local.
+    fn supports_sort_pushdown(&self) -> bool {
+        false
+    }
+
     /// Execute a SQL query.
     ///
     /// `filters` contain physical expressions for which [`Self::supports_filters_pushdown`]
