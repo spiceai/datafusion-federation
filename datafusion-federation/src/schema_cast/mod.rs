@@ -160,6 +160,20 @@ impl ExecutionPlan for SchemaCastScanExec {
             .map(|input| Arc::new(Self::new(input, Arc::clone(&schema))) as Arc<dyn ExecutionPlan>))
     }
 
+    /// Casting keeps every row, so a limit applies to the input unchanged.
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let input = self.input.with_fetch(limit)?;
+        Some(Arc::new(Self::new(input, Arc::clone(&self.schema))))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.input.fetch()
+    }
+
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
         vec![ChildStats::At(partition)]
     }

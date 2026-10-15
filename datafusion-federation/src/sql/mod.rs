@@ -277,6 +277,8 @@ pub struct VirtualExecutionPlan {
     statistics: Statistics,
     query_type: Option<FederatedQueryType>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// The `LIMIT` taken into `plan` through `with_fetch`, if any.
+    fetch: Option<usize>,
     /// The remote engine's plan, once [`AttachRemotePlans`] has materialized it.
     remote_plan: Option<Arc<dyn ExecutionPlan>>,
     /// The remote engine's plan as fetched during planning. Held aside rather than
@@ -307,6 +309,7 @@ impl VirtualExecutionPlan {
             statistics,
             query_type,
             filters: Vec::new(),
+            fetch: None,
             remote_plan: None,
             pending_remote_plan: None,
         }
@@ -690,6 +693,50 @@ impl ExecutionPlan for VirtualExecutionPlan {
         })
     }
 
+    /// Takes a limit pushed down from above into the federated plan, so the
+    /// remote SQL carries the `LIMIT` and the remote returns only those rows.
+    ///
+    /// Declined, leaving the limit to `DataFusion`, when the remote could not run
+    /// it as written: a count past the signed 64-bit `LIMIT` SQL engines take, a
+    /// plan the executor would not federate or its dialect cannot render, or
+    /// filters already handed to the executor, which may apply them after the
+    /// `LIMIT` rather than before it.
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let limit = limit?;
+        if self.fetch.is_some_and(|fetch| fetch <= limit) {
+            return Some(Arc::new(self.clone()));
+        }
+        if !self.filters.is_empty() || i64::try_from(limit).is_err() {
+            return None;
+        }
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
+            .limit(0, Some(limit))
+            .and_then(LogicalPlanBuilder::build)
+            .ok()?;
+        if !self.executor.can_execute_plan(&plan)
+            || Unparser::new(self.executor.dialect().as_ref())
+                .plan_to_sql(&plan)
+                .is_err()
+        {
+            return None;
+        }
+        let statistics = self.statistics.clone().with_fetch(Some(limit), 0, 1).ok()?;
+        // A remote plan fetched for EXPLAIN describes the SQL before the limit
+        // was added, so it is dropped rather than shown beside SQL it did not run.
+        Some(Arc::new(Self {
+            plan,
+            statistics,
+            fetch: Some(limit),
+            remote_plan: None,
+            pending_remote_plan: None,
+            ..self.clone()
+        }))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
     fn metrics(&self) -> Option<MetricsSet> {
         self.executor.metrics()
     }
@@ -710,6 +757,16 @@ impl ExecutionPlan for VirtualExecutionPlan {
         // Note: filters that were part of the federation plan are already baked into
         // final_sql() and never appear here — this path only sees filters that were
         // NOT absorbed during logical federation planning.
+        //
+        // Once the plan carries a `LIMIT`, every filter stays above this node: the
+        // plan applies it to the limited rows, and an executor that injected it
+        // into the SQL would apply it before the `LIMIT` instead.
+        if self.fetch.is_some() {
+            return Ok(FilterPushdownPropagation {
+                filters: vec![PushedDown::No; child_pushdown_result.parent_filters.len()],
+                updated_node: None,
+            });
+        }
         let filter_refs: Vec<&dyn PhysicalExpr> = child_pushdown_result
             .parent_filters
             .iter()
@@ -2936,6 +2993,11 @@ mod tests {
     /// `SELECT t.a, t.b, t.c FROM t`, federated to an executor that orders rows
     /// as `DataFusion` would when `sorts` is true.
     fn scan_vp(sorts: bool) -> VirtualExecutionPlan {
+        scan_vp_with(Arc::new(SortingExecutor(sorts)))
+    }
+
+    /// `SELECT t.a, t.b, t.c FROM t`, federated to `executor`.
+    fn scan_vp_with(executor: Arc<dyn SQLExecutor>) -> VirtualExecutionPlan {
         let provider = get_test_table_provider(
             "t".to_string(),
             TestExecutor {
@@ -2949,12 +3011,7 @@ mod tests {
             .build()
             .expect("plan");
         let schema = Arc::new(<DFSchema as AsRef<Schema>>::as_ref(plan.schema().as_ref()).clone());
-        VirtualExecutionPlan::new(
-            plan,
-            Arc::new(SortingExecutor(sorts)),
-            Statistics::new_unknown(&schema),
-            None,
-        )
+        VirtualExecutionPlan::new(plan, executor, Statistics::new_unknown(&schema), None)
     }
 
     fn sort_on(name: &str, index: usize) -> Vec<PhysicalSortExpr> {
@@ -3031,5 +3088,153 @@ mod tests {
         assert!(pushed(cast.try_pushdown_sort(&sort_on("a", 0))?).is_none());
         assert!(pushed(cast.try_pushdown_sort(&sort_on("b", 1))?).is_some());
         Ok(())
+    }
+
+    // ── limit pushdown into the federated scan ───────────────────────────────
+
+    fn sql_of(plan: &Arc<dyn ExecutionPlan>) -> String {
+        plan.downcast_ref::<VirtualExecutionPlan>()
+            .expect("a VirtualExecutionPlan")
+            .final_sql()
+            .expect("final SQL")
+    }
+
+    /// An executor that applies every filter pushed down to it.
+    #[derive(Debug)]
+    struct ExactFilterExecutor;
+
+    #[async_trait]
+    impl SQLExecutor for ExactFilterExecutor {
+        fn name(&self) -> &str {
+            "ExactFilterExecutor"
+        }
+
+        fn compute_context(&self) -> Option<String> {
+            Some("exact".to_string())
+        }
+
+        fn dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(unparser::dialect::DefaultDialect {})
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&dyn PhysicalExpr],
+        ) -> Vec<SQLFilterPushDown> {
+            vec![SQLFilterPushDown::Exact; filters.len()]
+        }
+
+        fn execute(
+            &self,
+            _query: &str,
+            _schema: SchemaRef,
+            _filters: &[Arc<dyn PhysicalExpr>],
+        ) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
+        }
+
+        async fn table_names(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+
+        async fn get_table_schema(&self, _table_name: &str) -> Result<SchemaRef> {
+            unimplemented!()
+        }
+    }
+
+    /// The federated scan takes a limit into its SQL, alone or after a sort it
+    /// took, and reports it as its fetch.
+    #[test]
+    fn virtual_execution_plan_takes_a_limit_into_its_sql() -> Result<()> {
+        let limited = scan_vp(false)
+            .with_fetch(Some(3))
+            .expect("a limit is taken");
+        assert_eq!(sql_of(&limited), "SELECT * FROM t LIMIT 3");
+        assert_eq!(limited.fetch(), Some(3));
+
+        let sorted = pushed(scan_vp(true).try_pushdown_sort(&sort_on("a", 0))?).expect("Exact");
+        let sorted_and_limited = sorted.with_fetch(Some(3)).expect("a limit after a sort");
+        assert_eq!(
+            sql_of(&sorted_and_limited),
+            "SELECT * FROM t ORDER BY t.a DESC NULLS LAST LIMIT 3"
+        );
+        Ok(())
+    }
+
+    /// The limit stays with `DataFusion` where the remote could not run it as
+    /// written.
+    #[test]
+    fn virtual_execution_plan_declines_a_limit_the_remote_cannot_take() {
+        let past_bigint = usize::try_from(i64::MAX).expect("64-bit usize") + 1;
+        assert!(
+            scan_vp(false).with_fetch(Some(past_bigint)).is_none(),
+            "SQL engines take LIMIT as a signed 64-bit integer"
+        );
+        assert!(
+            scan_vp(false).with_fetch(Some(past_bigint - 1)).is_some(),
+            "the largest LIMIT SQL takes is still taken"
+        );
+
+        let mut filtered = scan_vp(false);
+        filtered.filters = vec![Arc::new(
+            datafusion::physical_expr::expressions::Literal::new(
+                datafusion::common::ScalarValue::Boolean(Some(true)),
+            ),
+        )];
+        assert!(
+            filtered.with_fetch(Some(3)).is_none(),
+            "the executor may apply its filters after the LIMIT"
+        );
+
+        let refusing = scan_vp_with(Arc::new(TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: Some(Arc::new(|plan: &LogicalPlan| {
+                matches!(plan, LogicalPlan::Limit(_))
+            })),
+        }));
+        assert!(
+            refusing.with_fetch(Some(3)).is_none(),
+            "a plan the executor would not federate"
+        );
+    }
+
+    /// Once the SQL carries a `LIMIT`, a filter pushed down from above stays
+    /// above: the plan applies it to the limited rows, and an executor that put
+    /// it into the SQL would apply it before the `LIMIT`.
+    #[test]
+    fn a_limited_virtual_execution_plan_declines_filters() -> Result<()> {
+        let config = ConfigOptions::default();
+        let unlimited = scan_vp_with(Arc::new(ExactFilterExecutor));
+        let accepted = unlimited.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            make_child_result(1),
+            &config,
+        )?;
+        assert!(
+            matches!(accepted.filters[..], [PushedDown::Yes]) && accepted.updated_node.is_some(),
+            "the control: without a LIMIT the executor takes the filter"
+        );
+
+        let limited = unlimited.with_fetch(Some(3)).expect("a limit is taken");
+        let declined = limited.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            make_child_result(1),
+            &config,
+        )?;
+        assert!(matches!(declined.filters[..], [PushedDown::No]));
+        assert!(declined.updated_node.is_none());
+        Ok(())
+    }
+
+    /// The cast keeps every row, so it passes a limit through to the scan.
+    #[test]
+    fn schema_cast_passes_a_limit_through() {
+        let vp = scan_vp(false);
+        let schema = vp.schema();
+        let cast = schema_cast::SchemaCastScanExec::new(Arc::new(vp), schema);
+        assert!(cast.supports_limit_pushdown());
+        let limited = cast.with_fetch(Some(3)).expect("the limit passes through");
+        assert_eq!(limited.fetch(), Some(3));
+        assert_eq!(sql_of(limited.children()[0]), "SELECT * FROM t LIMIT 3");
     }
 }
