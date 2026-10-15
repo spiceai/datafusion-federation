@@ -25,7 +25,11 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{lit, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr},
+    logical_expr::{
+        lit,
+        logical_plan::{FetchType, SkipType},
+        Expr, Extension, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr,
+    },
     optimizer::{
         optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer, OptimizerRule,
     },
@@ -709,7 +713,26 @@ impl ExecutionPlan for VirtualExecutionPlan {
         if !self.filters.is_empty() || i64::try_from(limit).is_err() {
             return None;
         }
-        let plan = LogicalPlanBuilder::from(self.plan.clone())
+        // A tighter limit replaces the one this node added rather than nesting
+        // under it: nested limits unparse as the innermost one, so the SQL would
+        // keep the looser count. Once something sits above that limit, such as
+        // a sort pushed down after it, the tighter one is left to DataFusion.
+        let unlimited = match self.fetch {
+            None => self.plan.clone(),
+            Some(fetch) => match &self.plan {
+                LogicalPlan::Limit(added)
+                    if matches!(added.get_skip_type(), Ok(SkipType::Literal(0)))
+                        && matches!(
+                            added.get_fetch_type(),
+                            Ok(FetchType::Literal(Some(added_fetch))) if added_fetch == fetch
+                        ) =>
+                {
+                    added.input.as_ref().clone()
+                }
+                _ => return None,
+            },
+        };
+        let plan = LogicalPlanBuilder::from(unlimited)
             .limit(0, Some(limit))
             .and_then(LogicalPlanBuilder::build)
             .ok()?;
@@ -3236,5 +3259,39 @@ mod tests {
         let limited = cast.with_fetch(Some(3)).expect("the limit passes through");
         assert_eq!(limited.fetch(), Some(3));
         assert_eq!(sql_of(limited.children()[0]), "SELECT * FROM t LIMIT 3");
+    }
+
+    /// Tightening a limit the scan already holds replaces it rather than
+    /// nesting a second `Limit` under the first: the SQL and the reported fetch
+    /// must agree.
+    #[test]
+    fn a_tighter_limit_replaces_the_one_the_scan_holds() {
+        let limited = scan_vp(false)
+            .with_fetch(Some(10))
+            .expect("a limit is taken");
+        let tighter = limited
+            .with_fetch(Some(3))
+            .expect("a tighter limit is taken");
+        assert_eq!(tighter.fetch(), Some(3));
+        assert_eq!(sql_of(&tighter), "SELECT * FROM t LIMIT 3");
+
+        let looser = tighter
+            .with_fetch(Some(5))
+            .expect("a looser limit changes nothing");
+        assert_eq!(looser.fetch(), Some(3));
+        assert_eq!(sql_of(&looser), "SELECT * FROM t LIMIT 3");
+    }
+
+    /// Once a sort sits above the limit the scan added, a tighter limit cannot
+    /// replace it in place, so it is declined and stays with `DataFusion`.
+    #[test]
+    fn a_tighter_limit_under_a_pushed_sort_is_declined() -> Result<()> {
+        let limited = scan_vp(true)
+            .with_fetch(Some(10))
+            .expect("a limit is taken");
+        let sorted = pushed(limited.try_pushdown_sort(&sort_on("a", 0))?).expect("Exact");
+        assert_eq!(sorted.fetch(), Some(10));
+        assert!(sorted.with_fetch(Some(3)).is_none());
+        Ok(())
     }
 }
