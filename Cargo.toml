@@ -73,3 +73,6 @@ datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", 
 datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "8558625a8cace92662a35323c5ccdb968115537f" }
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "8558625a8cace92662a35323c5ccdb968115537f" }
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "8558625a8cace92662a35323c5ccdb968115537f" }
+
+[patch."https://github.com/spiceai/datafusion-federation.git"]
+datafusion-federation = { path = "datafusion-federation" }

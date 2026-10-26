@@ -10,10 +10,10 @@ publish = false
 [dependencies]
 anyhow = "1.0.98"
 duckdb = "1.4.4"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "dc9c9a1e609f230d5870a975372a8bd1da953b9f", features = [
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "f103fe809cc186168833632b9a0ee07ff40a9283", features = [
     "duckdb",
     "duckdb-federation",
-] } # branch: spiceai-55-patches
+] } # branch: spiceai-55
 
 datafusion = { workspace = true }
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros"] }
