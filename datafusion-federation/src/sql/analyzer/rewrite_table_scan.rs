@@ -10,6 +10,7 @@ use datafusion::{
     logical_expr::{
         self, build_join_schema,
         expr::{Exists, InSubquery},
+        expr_rewriter::NamePreserver,
         Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
         SubqueryAlias, Union, Window,
     },
@@ -78,8 +79,16 @@ impl RewriteTableScanAnalyzer {
                     .into_iter()
                     .map(|input| Arc::clone(input.schema()))
                     .collect::<Vec<_>>();
+                let preserves_projection_names = matches!(plan, LogicalPlan::Projection(_));
+                let name_preserver = NamePreserver::new_for_projection();
                 let plan = plan.map_expressions(|expr| {
-                    expr.transform_up(|expr| {
+                    // Computed outputs retain their logical names when a source
+                    // table is renamed. Columns and explicit aliases keep their
+                    // own qualifier and metadata handling below.
+                    let saved_name = (preserves_projection_names
+                        && !matches!(expr, Expr::Column(_) | Expr::Alias(_)))
+                    .then(|| name_preserver.save(&expr));
+                    let rewritten = expr.transform_up(|expr| {
                         #[expect(deprecated)]
                         match expr {
                             // An unqualified output name already supplied by an
@@ -204,6 +213,12 @@ impl RewriteTableScanAnalyzer {
                             }
                             _ => Ok(Transformed::no(expr)),
                         }
+                    })?;
+                    Ok(match saved_name {
+                        Some(name) if rewritten.transformed => {
+                            Transformed::yes(name.restore(rewritten.data))
+                        }
+                        _ => rewritten,
                     })
                 })?;
 
@@ -778,6 +793,26 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_rewrite_table_scans_preserves_computed_projection_names() -> Result<()> {
+        let ctx = get_test_df_context();
+        ctx.register_table("remote_table", get_test_table_provider())?;
+        for sql in [
+            "SELECT a + 1, b FROM app_table",
+            "SELECT count(*) AS n FROM (SELECT a + 1 FROM app_table INTERSECT SELECT a + 1 FROM app_table WHERE a > 0) q",
+            "SELECT count(*) AS n FROM (SELECT a + 1 FROM app_table EXCEPT SELECT a + 1 FROM app_table WHERE a > 0) q",
+        ] {
+            let plan = ctx.sql(sql).await?.into_optimized_plan()?;
+            let names = plan.schema().fields().iter().map(|field| field.name().clone()).collect::<Vec<_>>();
+            let known_rewrites = collect_known_rewrites(&plan)?;
+            let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+            assert_eq!(rewritten.schema().fields().iter().map(|field| field.name().clone()).collect::<Vec<_>>(), names, "{}", rewritten.display_indent());
+            let output = plan_to_sql(&rewritten)?.to_string();
+            ctx.sql(&output).await?;
+        }
+        Ok(())
+    }
+
     /// References to optimizer-pinned names must resolve after a scan rewrite,
     /// including when type coercion changes the expression under the alias.
     #[tokio::test]
@@ -1018,7 +1053,7 @@ mod tests {
             ),
             (
                 "SELECT foo.df_table.a FROM foo.df_table",
-                r#"SELECT a FROM "default".remote_table"#,
+                r#"SELECT remote_table.a FROM "default".remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",

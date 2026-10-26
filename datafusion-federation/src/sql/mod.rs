@@ -1411,7 +1411,7 @@ mod tests {
         });
 
         let expected = vec![
-            r#"SELECT a, b, c FROM "default"."table" UNION ALL SELECT a, b, c FROM "default"."Table"(1) Table"#,
+            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) Table"#,
         ];
 
         assert_eq!(
