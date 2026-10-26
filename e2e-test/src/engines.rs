@@ -179,7 +179,11 @@ fn duckdb_node(value: &serde_json::Value) -> RemotePlanNode {
         .with_detail("timing", json_scalar(value.get("operator_timing")));
 
     if let Some(extra) = value.get("extra_info").and_then(|e| e.as_object()) {
-        for (key, detail) in extra {
+        // JSON object ordering depends on serde_json feature unification.
+        // Keep rendered plan details stable across dependency feature sets.
+        let mut details: Vec<_> = extra.iter().collect();
+        details.sort_unstable_by_key(|(key, _)| *key);
+        for (key, detail) in details {
             node = node.with_detail(key.to_lowercase(), json_scalar(Some(detail)));
         }
     }
