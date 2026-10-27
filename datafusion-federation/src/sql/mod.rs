@@ -153,11 +153,7 @@ fn can_unparse_distinct_on_filters(plan: &LogicalPlan, unsafe_filter_above: bool
     if unsafe_filter_above && matches!(plan, LogicalPlan::Distinct(Distinct::On(_))) {
         return Ok(false);
     }
-    let unsafe_filter_above = unsafe_filter_above
-        || match plan {
-            LogicalPlan::Filter(_) => true,
-            _ => false,
-        };
+    let unsafe_filter_above = unsafe_filter_above || matches!(plan, LogicalPlan::Filter(_));
     for input in plan.inputs() {
         if !can_unparse_distinct_on_filters(input, unsafe_filter_above)? {
             return Ok(false);
