@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 anyhow = "1.0.98"
 duckdb = "1.4.4"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "f103fe809cc186168833632b9a0ee07ff40a9283", features = [
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "40773b1dcd27fed45d197968940bbbe1b62ef636", features = [
     "duckdb",
     "duckdb-federation",
 ] } # branch: spiceai-55

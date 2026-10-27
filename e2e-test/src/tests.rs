@@ -221,3 +221,56 @@ async fn sqlite_explain_format_pgjson() -> Result<()> {
 async fn sqlite_explain_format_graphviz() -> Result<()> {
     assert_explain_format_graphviz(&sqlite_ctx().await?, "sqlite").await
 }
+
+/// Execute an unoptimized fragment so scalar-subquery naming crosses the actual
+/// table-rewrite boundary before the outer projection consumes its column.
+async fn assert_scalar_subquery_output_name(
+    executor: std::sync::Arc<dyn datafusion_federation::sql::SQLExecutor>,
+) -> Result<()> {
+    use datafusion::{
+        arrow::array::Array,
+        common::Statistics,
+        physical_plan::{collect, displayable},
+    };
+    use datafusion_federation::sql::VirtualExecutionPlan;
+    use std::sync::Arc;
+
+    let ctx = crate::federated_context(Arc::clone(&executor)).await?;
+    let table = ctx.table_provider(TABLE).await?;
+    crate::overwrite_default_schema(
+        &ctx.state(),
+        Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+    )?;
+    ctx.register_table("app_table", Arc::clone(&table))?;
+    ctx.register_table(TABLE, table)?;
+    let sql = r#"SELECT q."max(app_table.id)" FROM (SELECT (SELECT max(id) FROM app_table)) q"#;
+    let plan = ctx.sql(sql).await?.logical_plan().clone();
+    let statistics = Statistics::new_unknown(plan.schema().as_arrow());
+    let execution = Arc::new(VirtualExecutionPlan::new(plan, executor, statistics, None));
+    println!("{sql} => {}", displayable(execution.as_ref()).one_line());
+    let batches = collect(execution, ctx.task_ctx()).await?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].schema().field(0).name(), "max(app_table.id)");
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("max of integer IDs");
+    assert_eq!(values.len(), 1);
+    assert!(!values.is_null(0));
+    assert_eq!(values.value(0), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_scalar_subquery_output_name() -> Result<()> {
+    assert_scalar_subquery_output_name(std::sync::Arc::new(crate::engines::SqliteExecutor::new()?))
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_scalar_subquery_output_name() -> Result<()> {
+    assert_scalar_subquery_output_name(std::sync::Arc::new(crate::engines::DuckDbExecutor::new()?))
+        .await
+}
