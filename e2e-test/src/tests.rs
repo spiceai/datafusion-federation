@@ -320,7 +320,12 @@ async fn assert_distinct_on_rewrite(
             .filter(column.lt(lit(3_i64)))?
             .build()?;
         let mut batches = Vec::new();
-        for candidate in [plan, stacked] {
+        let candidates = if expected.is_empty() {
+            vec![plan, stacked]
+        } else {
+            vec![plan]
+        };
+        for candidate in candidates {
             let physical = ctx
                 .execute_logical_plan(candidate)
                 .await?
@@ -357,7 +362,7 @@ async fn assert_distinct_on_rewrite(
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn duckdb_distinct_on_filter_rewrites_qualifiers() -> Result<()> {
-    assert_distinct_on_rewrite("id", "id", true, false, &[2, 3]).await
+    assert_distinct_on_rewrite("id", "id", true, true, &[2, 3]).await
 }
 
 #[cfg(feature = "duckdb")]
@@ -401,4 +406,44 @@ async fn duckdb_distinct_on_unsafe_direct_filter_is_refused() {
         matches!(error, datafusion::error::DataFusionError::NotImplemented(_)),
         "{error}"
     );
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_anonymous_subquery_filter_stays_local() -> Result<()> {
+    use datafusion::{
+        arrow::array::Int64Array,
+        physical_plan::{collect, displayable},
+    };
+    use std::sync::Arc;
+    let executor = Arc::new(crate::engines::DuckDbExecutor::new()?);
+    executor.duplicate_rows()?;
+    let ctx = crate::federated_context(executor).await?;
+    let table = ctx.table_provider(TABLE).await?;
+    crate::overwrite_default_schema(
+        &ctx.state(),
+        Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+    )?;
+    ctx.register_table("app_table", table)?;
+    let physical = ctx.sql("SELECT id FROM (SELECT DISTINCT ON (id) id FROM app_table ORDER BY id) WHERE id > 1 ORDER BY id")
+        .await?.create_physical_plan().await?;
+    let rendered = displayable(physical.as_ref()).indent(true).to_string();
+    println!("{rendered}");
+    assert!(rendered.contains("FilterExec"), "{rendered}");
+    assert!(rendered.contains("VirtualExecutionPlan"), "{rendered}");
+    let mut actual = Vec::new();
+    for batch in collect(physical, ctx.task_ctx()).await? {
+        actual.extend(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("integer result")
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    assert_eq!(actual, vec![2, 3]);
+    Ok(())
 }

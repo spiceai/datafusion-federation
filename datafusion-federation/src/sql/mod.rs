@@ -146,56 +146,8 @@ impl SQLFederationProvider {
     }
 }
 
-// WHERE is evaluated before DISTINCT ON. Only repeatable predicates over
-// unchanged bare ON-key outputs can be emitted there without selecting new rows.
-fn distinct_on_key_predicate(filter: &datafusion::logical_expr::Filter) -> Result<bool> {
-    let LogicalPlan::Distinct(Distinct::On(distinct)) = filter.input.as_ref() else {
-        return Ok(false);
-    };
-    for expr in distinct
-        .on_expr
-        .iter()
-        .chain(&distinct.select_expr)
-        .chain(distinct.sort_expr.iter().flatten().map(|sort| &sort.expr))
-    {
-        let mut repeatable = true;
-        expr.apply(|expr| {
-            // Keep computed outputs local so their evaluation and errors stay
-            // before the filter, and volatile outputs are not redrawn.
-            repeatable &= matches!(expr, Expr::Column(_) | Expr::Literal(..) | Expr::Alias(_));
-            Ok(if repeatable {
-                TreeNodeRecursion::Continue
-            } else {
-                TreeNodeRecursion::Stop
-            })
-        })?;
-        if !repeatable {
-            return Ok(false);
-        }
-    }
-    let mut safe = true;
-    filter.predicate.apply(|expr| {
-        let allowed = match expr {
-            Expr::Column(_) => {
-                distinct.on_expr.contains(expr) && distinct.select_expr.contains(expr)
-            }
-            Expr::Literal(..)
-            | Expr::BinaryExpr(_)
-            | Expr::Not(_)
-            | Expr::IsNull(_)
-            | Expr::IsNotNull(_) => true,
-            _ => false,
-        };
-        safe &= allowed;
-        Ok(if safe {
-            TreeNodeRecursion::Continue
-        } else {
-            TreeNodeRecursion::Stop
-        })
-    })?;
-    Ok(safe)
-}
-
+// A filter above DISTINCT ON applies after row selection. Keep it local rather
+// than emitting it as WHERE or referencing a qualifier hidden by a derived table.
 #[recursive::recursive]
 fn can_unparse_distinct_on_filters(plan: &LogicalPlan, unsafe_filter_above: bool) -> Result<bool> {
     if unsafe_filter_above && matches!(plan, LogicalPlan::Distinct(Distinct::On(_))) {
@@ -203,7 +155,7 @@ fn can_unparse_distinct_on_filters(plan: &LogicalPlan, unsafe_filter_above: bool
     }
     let unsafe_filter_above = unsafe_filter_above
         || match plan {
-            LogicalPlan::Filter(filter) => !distinct_on_key_predicate(filter)?,
+            LogicalPlan::Filter(_) => true,
             _ => false,
         };
     for input in plan.inputs() {
