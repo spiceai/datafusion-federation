@@ -274,3 +274,131 @@ async fn duckdb_scalar_subquery_output_name() -> Result<()> {
     assert_scalar_subquery_output_name(std::sync::Arc::new(crate::engines::DuckDbExecutor::new()?))
         .await
 }
+
+#[cfg(feature = "duckdb")]
+async fn assert_distinct_on_rewrite(
+    select: &str,
+    on_key: &str,
+    filter: bool,
+    local_fallback: bool,
+    expected: &[i64],
+) -> Result<()> {
+    use datafusion::{
+        arrow::array::{Array, Int64Array},
+        common::{Column, Statistics},
+        logical_expr::{lit, Expr, LogicalPlanBuilder},
+        physical_plan::{collect, displayable},
+    };
+    use datafusion_federation::sql::VirtualExecutionPlan;
+    use std::sync::Arc;
+
+    let executor = Arc::new(crate::engines::DuckDbExecutor::new()?);
+    executor.duplicate_rows()?;
+    let ctx = crate::federated_context(executor.clone()).await?;
+    let table = ctx.table_provider(TABLE).await?;
+    crate::overwrite_default_schema(
+        &ctx.state(),
+        Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+    )?;
+    ctx.register_table("app_table", table)?;
+    let sql =
+        format!("SELECT DISTINCT ON ({on_key}) {select} FROM app_table ORDER BY {on_key}, id");
+    let plan = ctx.sql(&sql).await?.logical_plan().clone();
+    let original_name = plan.schema().field(0).name().clone();
+    let column = Expr::Column(Column::from(plan.schema().qualified_field(0)));
+    let builder = LogicalPlanBuilder::from(plan);
+    // Keep the consumer directly above DistinctOn; optimizing first can hide
+    // stale schemas by lowering DISTINCT ON into other operators.
+    let plan = if filter {
+        builder.filter(column.gt(lit(1_i64)))?.build()?
+    } else {
+        builder.project(vec![column])?.build()?
+    };
+    let batches = if local_fallback {
+        let column = Expr::Column(Column::from(plan.schema().qualified_field(0)));
+        let stacked = LogicalPlanBuilder::from(plan.clone())
+            .filter(column.lt(lit(3_i64)))?
+            .build()?;
+        let mut batches = Vec::new();
+        for candidate in [plan, stacked] {
+            let physical = ctx
+                .execute_logical_plan(candidate)
+                .await?
+                .create_physical_plan()
+                .await?;
+            let rendered = displayable(physical.as_ref()).indent(true).to_string();
+            println!("{rendered}");
+            assert!(rendered.contains("FilterExec"), "{rendered}");
+            assert!(rendered.contains("VirtualExecutionPlan"), "{rendered}");
+            batches.extend(collect(physical, ctx.task_ctx()).await?);
+        }
+        batches
+    } else {
+        let statistics = Statistics::new_unknown(plan.schema().as_arrow());
+        let execution = Arc::new(VirtualExecutionPlan::new(plan, executor, statistics, None));
+        println!("{sql} => {}", displayable(execution.as_ref()).one_line());
+        collect(execution, ctx.task_ctx()).await?
+    };
+    let mut actual = Vec::new();
+    for batch in batches {
+        assert_eq!(batch.schema().field(0).name(), &original_name);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("integer DISTINCT ON result");
+        assert_eq!(values.null_count(), 0);
+        actual.extend(values.values().iter().copied());
+    }
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_filter_rewrites_qualifiers() -> Result<()> {
+    assert_distinct_on_rewrite("id", "id", true, false, &[2, 3]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_computed_output_keeps_name() -> Result<()> {
+    assert_distinct_on_rewrite("id + 1", "id", false, false, &[2, 3, 4]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_scalar_output_keeps_name() -> Result<()> {
+    assert_distinct_on_rewrite(
+        "(SELECT max(id) FROM app_table)",
+        "id",
+        false,
+        false,
+        &[3, 3, 3],
+    )
+    .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_explicit_alias_is_preserved() -> Result<()> {
+    assert_distinct_on_rewrite("id AS v", "id", false, false, &[1, 2, 3]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_non_key_filter_stays_after_distinct() -> Result<()> {
+    assert_distinct_on_rewrite("id", "id % 1", true, true, &[]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_unsafe_direct_filter_is_refused() {
+    let error = assert_distinct_on_rewrite("id", "id % 1", true, false, &[])
+        .await
+        .expect_err("direct unsafe SQL must be refused");
+    assert!(
+        matches!(error, datafusion::error::DataFusionError::NotImplemented(_)),
+        "{error}"
+    );
+}

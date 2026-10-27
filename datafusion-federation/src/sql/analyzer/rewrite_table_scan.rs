@@ -8,8 +8,8 @@ use datafusion::{
     },
     error::DataFusionError,
     logical_expr::{
-        self, build_join_schema, expr_rewriter::NamePreserver, Aggregate, Expr, Join, LogicalPlan,
-        LogicalPlanBuilder, Projection, SubqueryAlias, Union, Window,
+        self, build_join_schema, expr_rewriter::NamePreserver, Aggregate, Distinct, DistinctOn,
+        Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, SubqueryAlias, Union, Window,
     },
 };
 
@@ -38,20 +38,23 @@ impl RewriteTableScanAnalyzer {
         outer_scopes: &[Arc<ColumnBindings>],
     ) -> Result<LogicalPlan> {
         // Subquery rewrites can change the name of their enclosing expression.
-        // Capture public projection names before traversing either kind of child.
-        let saved_projection_names = match &plan {
-            LogicalPlan::Projection(projection) => {
-                let preserver = NamePreserver::new_for_projection();
-                projection
-                    .expr
-                    .iter()
-                    .map(|expr| {
-                        (!matches!(expr, Expr::Column(_) | Expr::Alias(_)))
-                            .then(|| preserver.save(expr))
-                    })
-                    .collect::<Vec<_>>()
+        // Capture public SELECT names before traversing either kind of child.
+        let name_preserver = NamePreserver::new_for_projection();
+        let save_names = |expressions: &[Expr]| {
+            expressions
+                .iter()
+                .map(|expr| {
+                    (!matches!(expr, Expr::Column(_) | Expr::Alias(_)))
+                        .then(|| name_preserver.save(expr))
+                })
+                .collect::<Vec<_>>()
+        };
+        let (saved_projection_names, saved_distinct_on_names) = match &plan {
+            LogicalPlan::Projection(projection) => (save_names(&projection.expr), Vec::new()),
+            LogicalPlan::Distinct(Distinct::On(distinct)) => {
+                (Vec::new(), save_names(&distinct.select_expr))
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), Vec::new()),
         };
         // Rewrite scan qualifiers before rebuilding their consumers.
         let rewrite_table_scans = |plan: LogicalPlan| -> Result<Transformed<LogicalPlan>> {
@@ -191,6 +194,25 @@ impl RewriteTableScanAnalyzer {
                 LogicalPlan::Projection(projection) => Ok(LogicalPlan::Projection(
                     Projection::try_new(projection.expr, projection.input)?,
                 )),
+                LogicalPlan::Distinct(Distinct::On(distinct)) => {
+                    // Only SELECT outputs have public names; ON and ORDER BY
+                    // must retain matching expression identities.
+                    let mut saved_names = saved_distinct_on_names.into_iter();
+                    let select_expr = distinct
+                        .select_expr
+                        .into_iter()
+                        .map(|expr| match saved_names.next().flatten() {
+                            Some(name) => name.restore(expr),
+                            None => expr,
+                        })
+                        .collect();
+                    Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn::try_new(
+                        distinct.on_expr,
+                        select_expr,
+                        distinct.sort_expr,
+                        distinct.input,
+                    )?)))
+                }
                 LogicalPlan::Join(join) => {
                     let join_schema = build_join_schema(
                         join.left.schema(),

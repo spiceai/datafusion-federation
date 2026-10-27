@@ -28,7 +28,7 @@ use datafusion::{
     logical_expr::{
         lit,
         logical_plan::{FetchType, SkipType},
-        Expr, Extension, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr,
+        Distinct, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr,
     },
     optimizer::{
         optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer, OptimizerRule,
@@ -146,6 +146,83 @@ impl SQLFederationProvider {
     }
 }
 
+// WHERE is evaluated before DISTINCT ON. Only repeatable predicates over
+// unchanged bare ON-key outputs can be emitted there without selecting new rows.
+fn distinct_on_key_predicate(filter: &datafusion::logical_expr::Filter) -> Result<bool> {
+    let LogicalPlan::Distinct(Distinct::On(distinct)) = filter.input.as_ref() else {
+        return Ok(false);
+    };
+    for expr in distinct
+        .on_expr
+        .iter()
+        .chain(&distinct.select_expr)
+        .chain(distinct.sort_expr.iter().flatten().map(|sort| &sort.expr))
+    {
+        let mut repeatable = true;
+        expr.apply(|expr| {
+            // Keep computed outputs local so their evaluation and errors stay
+            // before the filter, and volatile outputs are not redrawn.
+            repeatable &= matches!(expr, Expr::Column(_) | Expr::Literal(..) | Expr::Alias(_));
+            Ok(if repeatable {
+                TreeNodeRecursion::Continue
+            } else {
+                TreeNodeRecursion::Stop
+            })
+        })?;
+        if !repeatable {
+            return Ok(false);
+        }
+    }
+    let mut safe = true;
+    filter.predicate.apply(|expr| {
+        let allowed = match expr {
+            Expr::Column(_) => {
+                distinct.on_expr.contains(expr) && distinct.select_expr.contains(expr)
+            }
+            Expr::Literal(..)
+            | Expr::BinaryExpr(_)
+            | Expr::Not(_)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_) => true,
+            _ => false,
+        };
+        safe &= allowed;
+        Ok(if safe {
+            TreeNodeRecursion::Continue
+        } else {
+            TreeNodeRecursion::Stop
+        })
+    })?;
+    Ok(safe)
+}
+
+#[recursive::recursive]
+fn can_unparse_distinct_on_filters(plan: &LogicalPlan, unsafe_filter_above: bool) -> Result<bool> {
+    if unsafe_filter_above && matches!(plan, LogicalPlan::Distinct(Distinct::On(_))) {
+        return Ok(false);
+    }
+    let unsafe_filter_above = unsafe_filter_above
+        || match plan {
+            LogicalPlan::Filter(filter) => !distinct_on_key_predicate(filter)?,
+            _ => false,
+        };
+    for input in plan.inputs() {
+        if !can_unparse_distinct_on_filters(input, unsafe_filter_above)? {
+            return Ok(false);
+        }
+    }
+    let mut safe = true;
+    plan.apply_subqueries(|subquery| {
+        safe &= can_unparse_distinct_on_filters(subquery, false)?;
+        Ok(if safe {
+            TreeNodeRecursion::Continue
+        } else {
+            TreeNodeRecursion::Stop
+        })
+    })?;
+    Ok(safe)
+}
+
 impl FederationProvider for SQLFederationProvider {
     fn name(&self) -> &str {
         "sql_federation_provider"
@@ -162,6 +239,7 @@ impl FederationProvider for SQLFederationProvider {
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         if self.executor.can_execute_plan(plan)
             && self.can_unparse_recursive_ctes(plan).unwrap_or(false)
+            && can_unparse_distinct_on_filters(plan, false).unwrap_or(false)
         {
             Some(Arc::clone(&self.analyzer).into())
         } else {
@@ -431,6 +509,11 @@ impl VirtualExecutionPlan {
     /// syntax. The remote plan is obtained separately, via
     /// [`SQLExecutor::explain_plan`], and attached as this node's child.
     fn final_sql(&self) -> Result<String> {
+        if !can_unparse_distinct_on_filters(&self.plan, false)? {
+            return Err(DataFusionError::NotImplemented(
+                "A filter above DISTINCT ON must execute after row selection".to_string(),
+            ));
+        }
         let known_rewrites = collect_known_rewrites(&self.plan)?;
         let plan = RewriteTableScanAnalyzer::rewrite(self.plan.clone(), &known_rewrites)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
@@ -843,7 +926,8 @@ impl ExecutionPlan for VirtualExecutionPlan {
         // Once the plan carries a `LIMIT`, every filter stays above this node: the
         // plan applies it to the limited rows, and an executor that injected it
         // into the SQL would apply it before the `LIMIT` instead.
-        if self.fetch.is_some() {
+        // A post-filter must also stay after DISTINCT ON's row selection.
+        if self.fetch.is_some() || !can_unparse_distinct_on_filters(&self.plan, true)? {
             return Ok(FilterPushdownPropagation {
                 filters: vec![PushedDown::No; child_pushdown_result.parent_filters.len()],
                 updated_node: None,
@@ -3312,6 +3396,28 @@ mod tests {
         )?;
         assert!(matches!(declined.filters[..], [PushedDown::No]));
         assert!(declined.updated_node.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_on_declines_physical_post_filters() -> Result<()> {
+        let original = scan_vp_with(Arc::new(ExactFilterExecutor));
+        let column = Expr::Column(datafusion::common::Column::from(
+            original.plan.schema().qualified_field(0),
+        ));
+        let plan = LogicalPlanBuilder::from(original.plan.clone())
+            .distinct_on(vec![column.clone()], vec![column], None)?
+            .build()?;
+        let statistics = Statistics::new_unknown(plan.schema().as_arrow());
+        let distinct =
+            VirtualExecutionPlan::new(plan, Arc::clone(&original.executor), statistics, None);
+        let result = distinct.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            make_child_result(1),
+            &ConfigOptions::default(),
+        )?;
+        assert!(matches!(result.filters[..], [PushedDown::No]));
+        assert!(result.updated_node.is_none());
         Ok(())
     }
 

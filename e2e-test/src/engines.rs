@@ -60,6 +60,15 @@ impl DuckDbExecutor {
         })
     }
 
+    /// Duplicates the fixture so DISTINCT tests observe row elimination.
+    pub fn duplicate_rows(&self) -> Result<()> {
+        self.conn
+            .lock()
+            .expect("duckdb mutex poisoned")
+            .execute_batch(&format!("INSERT INTO {TABLE} SELECT * FROM {TABLE}"))
+            .map_err(|e| remote_err("duckdb", e))
+    }
+
     fn query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>)> {
         let conn = self.conn.lock().expect("duckdb mutex poisoned");
         let mut stmt = conn.prepare(sql).map_err(|e| remote_err("duckdb", e))?;
