@@ -60,6 +60,15 @@ impl DuckDbExecutor {
         })
     }
 
+    /// Duplicates the fixture so DISTINCT tests observe row elimination.
+    pub fn duplicate_rows(&self) -> Result<()> {
+        self.conn
+            .lock()
+            .expect("duckdb mutex poisoned")
+            .execute_batch(&format!("INSERT INTO {TABLE} SELECT * FROM {TABLE}"))
+            .map_err(|e| remote_err("duckdb", e))
+    }
+
     fn query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>)> {
         let conn = self.conn.lock().expect("duckdb mutex poisoned");
         let mut stmt = conn.prepare(sql).map_err(|e| remote_err("duckdb", e))?;
@@ -179,7 +188,11 @@ fn duckdb_node(value: &serde_json::Value) -> RemotePlanNode {
         .with_detail("timing", json_scalar(value.get("operator_timing")));
 
     if let Some(extra) = value.get("extra_info").and_then(|e| e.as_object()) {
-        for (key, detail) in extra {
+        // JSON object ordering depends on serde_json feature unification.
+        // Keep rendered plan details stable across dependency feature sets.
+        let mut details: Vec<_> = extra.iter().collect();
+        details.sort_unstable_by_key(|(key, _)| *key);
+        for (key, detail) in details {
             node = node.with_detail(key.to_lowercase(), json_scalar(Some(detail)));
         }
     }

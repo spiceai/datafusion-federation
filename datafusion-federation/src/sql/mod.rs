@@ -28,7 +28,7 @@ use datafusion::{
     logical_expr::{
         lit,
         logical_plan::{FetchType, SkipType},
-        Expr, Extension, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr,
+        Distinct, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr,
     },
     optimizer::{
         optimize_unions::OptimizeUnions, Analyzer, AnalyzerRule, Optimizer, OptimizerRule,
@@ -146,6 +146,31 @@ impl SQLFederationProvider {
     }
 }
 
+// A filter above DISTINCT ON applies after row selection. Keep it local rather
+// than emitting it as WHERE or referencing a qualifier hidden by a derived table.
+#[recursive::recursive]
+fn can_unparse_distinct_on_filters(plan: &LogicalPlan, unsafe_filter_above: bool) -> Result<bool> {
+    if unsafe_filter_above && matches!(plan, LogicalPlan::Distinct(Distinct::On(_))) {
+        return Ok(false);
+    }
+    let unsafe_filter_above = unsafe_filter_above || matches!(plan, LogicalPlan::Filter(_));
+    for input in plan.inputs() {
+        if !can_unparse_distinct_on_filters(input, unsafe_filter_above)? {
+            return Ok(false);
+        }
+    }
+    let mut safe = true;
+    plan.apply_subqueries(|subquery| {
+        safe &= can_unparse_distinct_on_filters(subquery, false)?;
+        Ok(if safe {
+            TreeNodeRecursion::Continue
+        } else {
+            TreeNodeRecursion::Stop
+        })
+    })?;
+    Ok(safe)
+}
+
 impl FederationProvider for SQLFederationProvider {
     fn name(&self) -> &str {
         "sql_federation_provider"
@@ -162,6 +187,7 @@ impl FederationProvider for SQLFederationProvider {
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         if self.executor.can_execute_plan(plan)
             && self.can_unparse_recursive_ctes(plan).unwrap_or(false)
+            && can_unparse_distinct_on_filters(plan, false).unwrap_or(false)
         {
             Some(Arc::clone(&self.analyzer).into())
         } else {
@@ -431,6 +457,11 @@ impl VirtualExecutionPlan {
     /// syntax. The remote plan is obtained separately, via
     /// [`SQLExecutor::explain_plan`], and attached as this node's child.
     fn final_sql(&self) -> Result<String> {
+        if !can_unparse_distinct_on_filters(&self.plan, false)? {
+            return Err(DataFusionError::NotImplemented(
+                "A filter above DISTINCT ON must execute after row selection".to_string(),
+            ));
+        }
         let known_rewrites = collect_known_rewrites(&self.plan)?;
         let plan = RewriteTableScanAnalyzer::rewrite(self.plan.clone(), &known_rewrites)?;
         let (logical_optimizers, ast_analyzers, sql_query_rewriters) = gather_analyzers(&plan)?;
@@ -843,7 +874,8 @@ impl ExecutionPlan for VirtualExecutionPlan {
         // Once the plan carries a `LIMIT`, every filter stays above this node: the
         // plan applies it to the limited rows, and an executor that injected it
         // into the SQL would apply it before the `LIMIT` instead.
-        if self.fetch.is_some() {
+        // A post-filter must also stay after DISTINCT ON's row selection.
+        if self.fetch.is_some() || !can_unparse_distinct_on_filters(&self.plan, true)? {
             return Ok(FilterPushdownPropagation {
                 filters: vec![PushedDown::No; child_pushdown_result.parent_filters.len()],
                 updated_node: None,
@@ -1411,7 +1443,7 @@ mod tests {
         });
 
         let expected = vec![
-            r#"SELECT a, b, c FROM "default"."table" UNION ALL SELECT a, b, c FROM "default"."Table"(1) Table"#,
+            r#"SELECT "table".a, "table".b, "table".c FROM "default"."table" UNION ALL SELECT "Table".a, "Table".b, "Table".c FROM "default"."Table"(1) Table"#,
         ];
 
         assert_eq!(
@@ -3312,6 +3344,28 @@ mod tests {
         )?;
         assert!(matches!(declined.filters[..], [PushedDown::No]));
         assert!(declined.updated_node.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_on_declines_physical_post_filters() -> Result<()> {
+        let original = scan_vp_with(Arc::new(ExactFilterExecutor));
+        let column = Expr::Column(datafusion::common::Column::from(
+            original.plan.schema().qualified_field(0),
+        ));
+        let plan = LogicalPlanBuilder::from(original.plan.clone())
+            .distinct_on(vec![column.clone()], vec![column], None)?
+            .build()?;
+        let statistics = Statistics::new_unknown(plan.schema().as_arrow());
+        let distinct =
+            VirtualExecutionPlan::new(plan, Arc::clone(&original.executor), statistics, None);
+        let result = distinct.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            make_child_result(1),
+            &ConfigOptions::default(),
+        )?;
+        assert!(matches!(result.filters[..], [PushedDown::No]));
+        assert!(result.updated_node.is_none());
         Ok(())
     }
 

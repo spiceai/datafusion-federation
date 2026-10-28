@@ -221,3 +221,229 @@ async fn sqlite_explain_format_pgjson() -> Result<()> {
 async fn sqlite_explain_format_graphviz() -> Result<()> {
     assert_explain_format_graphviz(&sqlite_ctx().await?, "sqlite").await
 }
+
+/// Execute an unoptimized fragment so scalar-subquery naming crosses the actual
+/// table-rewrite boundary before the outer projection consumes its column.
+async fn assert_scalar_subquery_output_name(
+    executor: std::sync::Arc<dyn datafusion_federation::sql::SQLExecutor>,
+) -> Result<()> {
+    use datafusion::{
+        arrow::array::Array,
+        common::Statistics,
+        physical_plan::{collect, displayable},
+    };
+    use datafusion_federation::sql::VirtualExecutionPlan;
+    use std::sync::Arc;
+
+    let ctx = crate::federated_context(Arc::clone(&executor)).await?;
+    let table = ctx.table_provider(TABLE).await?;
+    crate::overwrite_default_schema(
+        &ctx.state(),
+        Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+    )?;
+    ctx.register_table("app_table", Arc::clone(&table))?;
+    ctx.register_table(TABLE, table)?;
+    let sql = r#"SELECT q."max(app_table.id)" FROM (SELECT (SELECT max(id) FROM app_table)) q"#;
+    let plan = ctx.sql(sql).await?.logical_plan().clone();
+    let statistics = Statistics::new_unknown(plan.schema().as_arrow());
+    let execution = Arc::new(VirtualExecutionPlan::new(plan, executor, statistics, None));
+    println!("{sql} => {}", displayable(execution.as_ref()).one_line());
+    let batches = collect(execution, ctx.task_ctx()).await?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].schema().field(0).name(), "max(app_table.id)");
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("max of integer IDs");
+    assert_eq!(values.len(), 1);
+    assert!(!values.is_null(0));
+    assert_eq!(values.value(0), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_scalar_subquery_output_name() -> Result<()> {
+    assert_scalar_subquery_output_name(std::sync::Arc::new(crate::engines::SqliteExecutor::new()?))
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_scalar_subquery_output_name() -> Result<()> {
+    assert_scalar_subquery_output_name(std::sync::Arc::new(crate::engines::DuckDbExecutor::new()?))
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+async fn assert_distinct_on_rewrite(
+    select: &str,
+    on_key: &str,
+    filter: bool,
+    local_fallback: bool,
+    expected: &[i64],
+) -> Result<()> {
+    use datafusion::{
+        arrow::array::{Array, Int64Array},
+        common::{Column, Statistics},
+        logical_expr::{lit, Expr, LogicalPlanBuilder},
+        physical_plan::{collect, displayable},
+    };
+    use datafusion_federation::sql::VirtualExecutionPlan;
+    use std::sync::Arc;
+
+    let executor = Arc::new(crate::engines::DuckDbExecutor::new()?);
+    executor.duplicate_rows()?;
+    let ctx = crate::federated_context(executor.clone()).await?;
+    let table = ctx.table_provider(TABLE).await?;
+    crate::overwrite_default_schema(
+        &ctx.state(),
+        Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+    )?;
+    ctx.register_table("app_table", table)?;
+    let sql =
+        format!("SELECT DISTINCT ON ({on_key}) {select} FROM app_table ORDER BY {on_key}, id");
+    let plan = ctx.sql(&sql).await?.logical_plan().clone();
+    let original_name = plan.schema().field(0).name().clone();
+    let column = Expr::Column(Column::from(plan.schema().qualified_field(0)));
+    let builder = LogicalPlanBuilder::from(plan);
+    // Keep the consumer directly above DistinctOn; optimizing first can hide
+    // stale schemas by lowering DISTINCT ON into other operators.
+    let plan = if filter {
+        builder.filter(column.gt(lit(1_i64)))?.build()?
+    } else {
+        builder.project(vec![column])?.build()?
+    };
+    let batches = if local_fallback {
+        let column = Expr::Column(Column::from(plan.schema().qualified_field(0)));
+        let stacked = LogicalPlanBuilder::from(plan.clone())
+            .filter(column.lt(lit(3_i64)))?
+            .build()?;
+        let mut batches = Vec::new();
+        let candidates = if expected.is_empty() {
+            vec![plan, stacked]
+        } else {
+            vec![plan]
+        };
+        for candidate in candidates {
+            let physical = ctx
+                .execute_logical_plan(candidate)
+                .await?
+                .create_physical_plan()
+                .await?;
+            let rendered = displayable(physical.as_ref()).indent(true).to_string();
+            println!("{rendered}");
+            assert!(rendered.contains("FilterExec"), "{rendered}");
+            assert!(rendered.contains("VirtualExecutionPlan"), "{rendered}");
+            batches.extend(collect(physical, ctx.task_ctx()).await?);
+        }
+        batches
+    } else {
+        let statistics = Statistics::new_unknown(plan.schema().as_arrow());
+        let execution = Arc::new(VirtualExecutionPlan::new(plan, executor, statistics, None));
+        println!("{sql} => {}", displayable(execution.as_ref()).one_line());
+        collect(execution, ctx.task_ctx()).await?
+    };
+    let mut actual = Vec::new();
+    for batch in batches {
+        assert_eq!(batch.schema().field(0).name(), &original_name);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("integer DISTINCT ON result");
+        assert_eq!(values.null_count(), 0);
+        actual.extend(values.values().iter().copied());
+    }
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_filter_rewrites_qualifiers() -> Result<()> {
+    assert_distinct_on_rewrite("id", "id", true, true, &[2, 3]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_computed_output_keeps_name() -> Result<()> {
+    assert_distinct_on_rewrite("id + 1", "id", false, false, &[2, 3, 4]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_scalar_output_keeps_name() -> Result<()> {
+    assert_distinct_on_rewrite(
+        "(SELECT max(id) FROM app_table)",
+        "id",
+        false,
+        false,
+        &[3, 3, 3],
+    )
+    .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_explicit_alias_is_preserved() -> Result<()> {
+    assert_distinct_on_rewrite("id AS v", "id", false, false, &[1, 2, 3]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_non_key_filter_stays_after_distinct() -> Result<()> {
+    assert_distinct_on_rewrite("id", "id % 1", true, true, &[]).await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_unsafe_direct_filter_is_refused() {
+    let error = assert_distinct_on_rewrite("id", "id % 1", true, false, &[])
+        .await
+        .expect_err("direct unsafe SQL must be refused");
+    assert!(
+        matches!(error, datafusion::error::DataFusionError::NotImplemented(_)),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn duckdb_distinct_on_anonymous_subquery_filter_stays_local() -> Result<()> {
+    use datafusion::{
+        arrow::array::Int64Array,
+        physical_plan::{collect, displayable},
+    };
+    use std::sync::Arc;
+    let executor = Arc::new(crate::engines::DuckDbExecutor::new()?);
+    executor.duplicate_rows()?;
+    let ctx = crate::federated_context(executor).await?;
+    let table = ctx.table_provider(TABLE).await?;
+    crate::overwrite_default_schema(
+        &ctx.state(),
+        Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+    )?;
+    ctx.register_table("app_table", table)?;
+    let physical = ctx.sql("SELECT id FROM (SELECT DISTINCT ON (id) id FROM app_table ORDER BY id) WHERE id > 1 ORDER BY id")
+        .await?.create_physical_plan().await?;
+    let rendered = displayable(physical.as_ref()).indent(true).to_string();
+    println!("{rendered}");
+    assert!(rendered.contains("FilterExec"), "{rendered}");
+    assert!(rendered.contains("VirtualExecutionPlan"), "{rendered}");
+    let mut actual = Vec::new();
+    for batch in collect(physical, ctx.task_ctx()).await? {
+        actual.extend(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("integer result")
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    assert_eq!(actual, vec![2, 3]);
+    Ok(())
+}

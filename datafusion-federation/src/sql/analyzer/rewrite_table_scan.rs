@@ -4,14 +4,12 @@ use datafusion::{
     common::TableReference,
     common::{
         tree_node::{Transformed, TreeNode},
-        Column, HashMap, RecursionUnnestOption, UnnestOptions,
+        Column, DFSchema, HashMap, RecursionUnnestOption, UnnestOptions,
     },
     error::DataFusionError,
     logical_expr::{
-        self, build_join_schema,
-        expr::{Exists, InSubquery},
-        Aggregate, Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, Subquery,
-        SubqueryAlias, Union, Window,
+        self, build_join_schema, expr_rewriter::NamePreserver, Aggregate, Distinct, DistinctOn,
+        Expr, Join, LogicalPlan, LogicalPlanBuilder, Projection, SubqueryAlias, Union, Window,
     },
 };
 
@@ -30,8 +28,36 @@ impl RewriteTableScanAnalyzer {
         plan: LogicalPlan,
         known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
     ) -> Result<LogicalPlan> {
-        // In f_down, rewrite the table scans in all LogicalPlan nodes (including subqueries).
-        let rewrite_table_scans = |plan: LogicalPlan| {
+        Self::rewrite_with_outer_scopes(plan, known_rewrites, &[])
+    }
+
+    #[recursive::recursive]
+    fn rewrite_with_outer_scopes(
+        plan: LogicalPlan,
+        known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
+        outer_scopes: &[Arc<ColumnBindings>],
+    ) -> Result<LogicalPlan> {
+        // Subquery rewrites can change the name of their enclosing expression.
+        // Capture public SELECT names before traversing either kind of child.
+        let name_preserver = NamePreserver::new_for_projection();
+        let save_names = |expressions: &[Expr]| {
+            expressions
+                .iter()
+                .map(|expr| {
+                    (!matches!(expr, Expr::Column(_) | Expr::Alias(_)))
+                        .then(|| name_preserver.save(expr))
+                })
+                .collect::<Vec<_>>()
+        };
+        let (saved_projection_names, saved_distinct_on_names) = match &plan {
+            LogicalPlan::Projection(projection) => (save_names(&projection.expr), Vec::new()),
+            LogicalPlan::Distinct(Distinct::On(distinct)) => {
+                (Vec::new(), save_names(&distinct.select_expr))
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        // Rewrite scan qualifiers before rebuilding their consumers.
+        let rewrite_table_scans = |plan: LogicalPlan| -> Result<Transformed<LogicalPlan>> {
             match plan {
                 LogicalPlan::TableScan(mut table_scan) => {
                     let Some(federated_source) = get_table_source(&table_scan.source)? else {
@@ -66,201 +92,295 @@ impl RewriteTableScanAnalyzer {
         };
 
         // In f_up, rewrite the column names in the expressions.
-        let rewrite_column_names_in_expressions =
-            |plan: LogicalPlan| -> Result<Transformed<LogicalPlan>> {
-                let plan = match plan {
-                    LogicalPlan::Unnest(unnest) => rewrite_unnest_plan(unnest, known_rewrites)?,
-                    _ => plan,
-                };
+        let rewrite_column_names_in_expressions = |plan: LogicalPlan,
+                                                   bindings: &ColumnBindings|
+         -> Result<Transformed<LogicalPlan>> {
+            let plan = match plan {
+                LogicalPlan::Unnest(unnest) => rewrite_unnest_plan(unnest, known_rewrites)?,
+                _ => plan,
+            };
 
-                let input_schemas = plan
-                    .inputs()
-                    .into_iter()
-                    .map(|input| Arc::clone(input.schema()))
-                    .collect::<Vec<_>>();
-                let plan = plan.map_expressions(|expr| {
-                    expr.transform_up(|expr| {
-                        #[expect(deprecated)]
-                        match expr {
-                            // An unqualified output name already supplied by an
-                            // input is an alias, not a table reference embedded in
-                            // an expression name. Preserve it along with its alias.
-                            Expr::Column(col)
-                                if col.relation.is_none()
-                                    && input_schemas
-                                        .iter()
-                                        .any(|schema| schema.has_column(&col)) =>
+            let input_schemas = plan
+                .inputs()
+                .into_iter()
+                .map(|input| Arc::clone(input.schema()))
+                .collect::<Vec<_>>();
+            let mut saved_names = saved_projection_names.into_iter();
+            let plan = plan.map_expressions(|expr| {
+                let saved_name = saved_names.next().flatten();
+                let rewritten = expr.transform_up(|expr| {
+                    #[expect(deprecated)]
+                    match expr {
+                        Expr::Column(col) => {
+                            // Resolve provenance before considering the rewritten
+                            // schema: a remote name can match another local input.
+                            let rewritten = if let Some(rewritten) =
+                                rewritten_column_binding(&col, bindings)?
                             {
-                                Ok(Transformed::no(Expr::Column(col)))
-                            }
-                            Expr::Column(col) => rewrite_column(col, known_rewrites)
-                                .map(|t| t.update_data(Expr::Column)),
-                            Expr::OuterReferenceColumn(field, col) => {
-                                rewrite_column(col, known_rewrites).map(|t| {
-                                    t.update_data(|col| Expr::OuterReferenceColumn(field, col))
-                                })
-                            }
-                            Expr::Alias(mut alias) => {
-                                let relation = alias.relation.as_ref().and_then(|relation| {
-                                    known_rewrites
-                                        .get(relation)
-                                        .and_then(|rewrite| match rewrite {
-                                            MultiPartTableReference::TableReference(rewrite) => {
-                                                Some(rewrite.clone())
-                                            }
-                                            _ => None,
-                                        })
-                                });
-
-                                let Some(relation) = relation else {
-                                    return Ok(Transformed::no(Expr::Alias(alias)));
-                                };
-                                alias.relation = Some(relation);
-                                Ok(Transformed::yes(Expr::Alias(alias)))
-                            }
-                            Expr::Wildcard { qualifier, options } => {
-                                if let Some(rewrite) = qualifier
-                                    .as_ref()
-                                    .and_then(|q| known_rewrites.get(q))
+                                if rewritten == col {
+                                    Transformed::no(col)
+                                } else {
+                                    Transformed::yes(rewritten)
+                                }
+                            } else if input_schemas.iter().any(|schema| schema.has_column(&col)) {
+                                Transformed::no(col)
+                            } else {
+                                rewrite_column(col, known_rewrites)?
+                            };
+                            Ok(rewritten.update_data(Expr::Column))
+                        }
+                        Expr::OuterReferenceColumn(field, col) => {
+                            rewrite_outer_reference(col, outer_scopes).map(|t| {
+                                t.update_data(|col| Expr::OuterReferenceColumn(field, col))
+                            })
+                        }
+                        Expr::Alias(mut alias) => {
+                            let relation = alias.relation.as_ref().and_then(|relation| {
+                                known_rewrites
+                                    .get(relation)
                                     .and_then(|rewrite| match rewrite {
                                         MultiPartTableReference::TableReference(rewrite) => {
-                                            Some(rewrite)
+                                            Some(rewrite.clone())
                                         }
                                         _ => None,
                                     })
-                                {
-                                    Ok(Transformed::yes(Expr::Wildcard {
-                                        qualifier: Some(rewrite.clone()),
-                                        options,
-                                    }))
-                                } else {
-                                    Ok(Transformed::no(Expr::Wildcard { qualifier, options }))
-                                }
-                            }
-                            // We can't match directly on the outer ref columns until https://github.com/apache/datafusion/issues/16147 is fixed.
-                            Expr::ScalarSubquery(Subquery {
-                                outer_ref_columns,
-                                subquery,
-                                spans,
-                            }) => {
-                                let outer_ref_columns = rewrite_outer_reference_columns(
-                                    outer_ref_columns,
-                                    known_rewrites,
-                                )?;
+                            });
 
-                                Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
-                                    outer_ref_columns,
-                                    subquery,
-                                    spans,
-                                })))
-                            }
-                            Expr::Exists(Exists {
-                                subquery:
-                                    Subquery {
-                                        subquery,
-                                        outer_ref_columns,
-                                        spans,
-                                    },
-                                negated,
-                            }) => {
-                                let outer_ref_columns = rewrite_outer_reference_columns(
-                                    outer_ref_columns,
-                                    known_rewrites,
-                                )?;
-
-                                Ok(Transformed::yes(Expr::Exists(Exists {
-                                    subquery: Subquery {
-                                        outer_ref_columns,
-                                        subquery,
-                                        spans,
-                                    },
-                                    negated,
-                                })))
-                            }
-                            Expr::InSubquery(InSubquery {
-                                subquery:
-                                    Subquery {
-                                        outer_ref_columns,
-                                        subquery,
-                                        spans,
-                                    },
-                                expr,
-                                negated,
-                            }) => {
-                                let outer_ref_columns = rewrite_outer_reference_columns(
-                                    outer_ref_columns,
-                                    known_rewrites,
-                                )?;
-
-                                Ok(Transformed::yes(Expr::InSubquery(InSubquery {
-                                    expr,
-                                    subquery: Subquery {
-                                        outer_ref_columns,
-                                        subquery,
-                                        spans,
-                                    },
-                                    negated,
-                                })))
-                            }
-                            _ => Ok(Transformed::no(expr)),
+                            let Some(relation) = relation else {
+                                return Ok(Transformed::no(Expr::Alias(alias)));
+                            };
+                            alias.relation = Some(relation);
+                            Ok(Transformed::yes(Expr::Alias(alias)))
                         }
-                    })
-                })?;
-
-                // Recalculate the schemas now that all of the inner expressions have been rewritten.
-                plan.map_data(|plan| match plan {
-                    LogicalPlan::Aggregate(aggr) => Ok(LogicalPlan::Aggregate(Aggregate::try_new(
-                        aggr.input,
-                        aggr.group_expr,
-                        aggr.aggr_expr,
-                    )?)),
-                    LogicalPlan::Window(window) => Ok(LogicalPlan::Window(Window::try_new(
-                        window.window_expr,
-                        window.input,
-                    )?)),
-                    LogicalPlan::Projection(projection) => Ok(LogicalPlan::Projection(
-                        Projection::try_new(projection.expr, projection.input)?,
-                    )),
-                    LogicalPlan::Join(join) => {
-                        let join_schema = build_join_schema(
-                            join.left.schema(),
-                            join.right.schema(),
-                            &join.join_type,
-                        )?;
-
-                        Ok(LogicalPlan::Join(Join {
-                            left: join.left,
-                            right: join.right,
-                            on: join.on,
-                            filter: join.filter,
-                            join_type: join.join_type,
-                            join_constraint: join.join_constraint,
-                            schema: Arc::new(join_schema),
-                            null_equality: join.null_equality,
-                            null_aware: join.null_aware,
-                        }))
+                        Expr::Wildcard { qualifier, options } => {
+                            if let Some(rewrite) = qualifier
+                                .as_ref()
+                                .and_then(|q| known_rewrites.get(q))
+                                .and_then(|rewrite| match rewrite {
+                                    MultiPartTableReference::TableReference(rewrite) => {
+                                        Some(rewrite)
+                                    }
+                                    _ => None,
+                                })
+                            {
+                                Ok(Transformed::yes(Expr::Wildcard {
+                                    qualifier: Some(rewrite.clone()),
+                                    options,
+                                }))
+                            } else {
+                                Ok(Transformed::no(Expr::Wildcard { qualifier, options }))
+                            }
+                        }
+                        _ => Ok(Transformed::no(expr)),
                     }
-                    LogicalPlan::SubqueryAlias(subquery_alias) => Ok(LogicalPlan::SubqueryAlias(
-                        SubqueryAlias::try_new(subquery_alias.input, subquery_alias.alias)?,
-                    )),
-                    LogicalPlan::Union(union) => Ok(LogicalPlan::Union(
-                        Union::try_new_with_loose_types(union.inputs)?,
-                    )),
-                    plan => Ok(plan),
+                })?;
+                Ok(match saved_name {
+                    Some(name) => Transformed::yes(name.restore(rewritten.data)),
+                    _ => rewritten,
                 })
-            };
+            })?;
 
-        plan.transform_down_up_with_subqueries(
-            rewrite_table_scans,
-            rewrite_column_names_in_expressions,
-        )
-        .map(|t| t.data)
+            // Recalculate the schemas now that all of the inner expressions have been rewritten.
+            plan.map_data(|plan| match plan {
+                LogicalPlan::Aggregate(aggr) => Ok(LogicalPlan::Aggregate(Aggregate::try_new(
+                    aggr.input,
+                    aggr.group_expr,
+                    aggr.aggr_expr,
+                )?)),
+                LogicalPlan::Window(window) => Ok(LogicalPlan::Window(Window::try_new(
+                    window.window_expr,
+                    window.input,
+                )?)),
+                LogicalPlan::Projection(projection) => Ok(LogicalPlan::Projection(
+                    Projection::try_new(projection.expr, projection.input)?,
+                )),
+                LogicalPlan::Distinct(Distinct::On(distinct)) => {
+                    // Only SELECT outputs have public names; ON and ORDER BY
+                    // must retain matching expression identities.
+                    let mut saved_names = saved_distinct_on_names.into_iter();
+                    let select_expr = distinct
+                        .select_expr
+                        .into_iter()
+                        .map(|expr| match saved_names.next().flatten() {
+                            Some(name) => name.restore(expr),
+                            None => expr,
+                        })
+                        .collect();
+                    Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn::try_new(
+                        distinct.on_expr,
+                        select_expr,
+                        distinct.sort_expr,
+                        distinct.input,
+                    )?)))
+                }
+                LogicalPlan::Join(join) => {
+                    let join_schema = build_join_schema(
+                        join.left.schema(),
+                        join.right.schema(),
+                        &join.join_type,
+                    )?;
+
+                    Ok(LogicalPlan::Join(Join {
+                        left: join.left,
+                        right: join.right,
+                        on: join.on,
+                        filter: join.filter,
+                        join_type: join.join_type,
+                        join_constraint: join.join_constraint,
+                        schema: Arc::new(join_schema),
+                        null_equality: join.null_equality,
+                        null_aware: join.null_aware,
+                    }))
+                }
+                LogicalPlan::SubqueryAlias(subquery_alias) => Ok(LogicalPlan::SubqueryAlias(
+                    SubqueryAlias::try_new(subquery_alias.input, subquery_alias.alias)?,
+                )),
+                LogicalPlan::Union(union) => Ok(LogicalPlan::Union(
+                    Union::try_new_with_loose_types(union.inputs)?,
+                )),
+                plan => Ok(plan),
+            })
+        };
+
+        let original_inputs = plan
+            .inputs()
+            .iter()
+            .map(|input| Arc::clone(input.schema()))
+            .collect::<Vec<_>>();
+        let original_scan_schema = match &plan {
+            LogicalPlan::TableScan(scan) => Some(DFSchema::try_from_qualified_schema(
+                scan.table_name.clone(),
+                scan.source.schema().as_ref(),
+            )?),
+            _ => None,
+        };
+        let plan = rewrite_table_scans(plan)?.data;
+        let plan = plan
+            .map_children(|child| {
+                Self::rewrite_with_outer_scopes(child, known_rewrites, outer_scopes)
+                    .map(Transformed::yes)
+            })?
+            .data;
+        let mut scope = ColumnBindings::default();
+        for (original, rewritten) in original_inputs.iter().zip(plan.inputs()) {
+            append_column_bindings(&mut scope, original, rewritten.schema())?;
+        }
+        // Scan filters may correlate against source columns omitted by projection.
+        if let (Some(original), LogicalPlan::TableScan(scan)) = (original_scan_schema, &plan) {
+            let rewritten = DFSchema::try_from_qualified_schema(
+                scan.table_name.clone(),
+                scan.source.schema().as_ref(),
+            )?;
+            append_column_bindings(&mut scope, &original, &rewritten)?;
+        }
+        let scope = Arc::new(scope);
+        let mut subquery_scopes = outer_scopes.to_vec();
+        subquery_scopes.push(Arc::clone(&scope));
+        let plan = plan
+            .map_subqueries(|subquery| {
+                Self::rewrite_with_outer_scopes(subquery, known_rewrites, &subquery_scopes)
+                    .map(Transformed::yes)
+            })?
+            .data;
+        // All expression-subquery forms use this wrapper, including ANY/ALL.
+        let plan = match plan {
+            LogicalPlan::Subquery(mut subquery) => {
+                subquery.outer_ref_columns =
+                    rewrite_outer_reference_columns(subquery.outer_ref_columns, outer_scopes)?;
+                LogicalPlan::Subquery(subquery)
+            }
+            other => other,
+        };
+        rewrite_column_names_in_expressions(plan, &scope).map(|t| t.data)
     }
+}
+
+/// Original and rewritten columns exposed by one enclosing input scope.
+#[derive(Default)]
+struct ColumnBindings {
+    by_name: HashMap<String, Vec<(Column, Column)>>,
+}
+
+fn append_column_bindings(
+    bindings: &mut ColumnBindings,
+    original: &DFSchema,
+    rewritten: &DFSchema,
+) -> Result<()> {
+    if original.fields().len() != rewritten.fields().len() {
+        return Err(DataFusionError::Plan(
+            "A table rewrite changed the width of a correlated input".to_string(),
+        ));
+    }
+    for ((old_qualifier, old_field), (new_qualifier, new_field)) in
+        original.iter().zip(rewritten.iter())
+    {
+        bindings
+            .by_name
+            .entry(old_field.name().clone())
+            .or_default()
+            .push((
+                Column::new(old_qualifier.cloned(), old_field.name()),
+                Column::new(new_qualifier.cloned(), new_field.name()),
+            ));
+    }
+    Ok(())
+}
+
+/// Correlations bind to the nearest enclosing input, including pinned computed
+/// outputs and lexical aliases. References outside this fragment retain their binding.
+fn rewrite_outer_reference(
+    column: Column,
+    outer_scopes: &[Arc<ColumnBindings>],
+) -> Result<Transformed<Column>> {
+    for scope in outer_scopes.iter().rev() {
+        if let Some(rewritten) = rewritten_column_binding(&column, scope)? {
+            return Ok(if rewritten == column {
+                Transformed::no(column)
+            } else {
+                Transformed::yes(rewritten)
+            });
+        }
+    }
+    Ok(Transformed::no(column))
+}
+
+fn rewritten_column_binding(column: &Column, scope: &ColumnBindings) -> Result<Option<Column>> {
+    let Some(candidates) = scope.by_name.get(&column.name) else {
+        return Ok(None);
+    };
+    // Prefer exact definitions within this scope without allowing a less
+    // qualified alias to capture a schema- or catalog-qualified reference.
+    let has_exact = candidates.iter().any(|(original, _)| original == column);
+    let mut matches = candidates.iter().filter(|(original, _)| {
+        if has_exact {
+            return original == column;
+        }
+        column.relation.as_ref().is_none_or(|reference| {
+            original.relation.as_ref().is_some_and(|defined| {
+                reference.table() == defined.table()
+                    && reference
+                        .schema()
+                        .is_none_or(|schema| defined.schema() == Some(schema))
+                    && reference
+                        .catalog()
+                        .is_none_or(|catalog| defined.catalog() == Some(catalog))
+            })
+        })
+    });
+    let Some((_, rewritten)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(DataFusionError::Plan(format!(
+            "Ambiguous column binding during table rewrite: {column}"
+        )));
+    }
+    Ok(Some(rewritten.clone()))
 }
 
 fn rewrite_outer_reference_columns(
     outer_ref_columns: Vec<Expr>,
-    known_rewrites: &HashMap<TableReference, MultiPartTableReference>,
+    outer_scopes: &[Arc<ColumnBindings>],
 ) -> Result<Vec<Expr>> {
     let outer_ref_columns = outer_ref_columns
         .into_iter()
@@ -269,7 +389,7 @@ fn rewrite_outer_reference_columns(
                 return Ok(e);
             };
 
-            let rewritten_col = rewrite_column(col, known_rewrites)?.data;
+            let rewritten_col = rewrite_outer_reference(col, outer_scopes)?.data;
 
             Ok(Expr::OuterReferenceColumn(dt, rewritten_col))
         })
@@ -778,6 +898,26 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_rewrite_table_scans_preserves_computed_projection_names() -> Result<()> {
+        let ctx = get_test_df_context();
+        ctx.register_table("remote_table", get_test_table_provider())?;
+        for sql in [
+            "SELECT a + 1, b FROM app_table",
+            "SELECT count(*) AS n FROM (SELECT a + 1 FROM app_table INTERSECT SELECT a + 1 FROM app_table WHERE a > 0) q",
+            "SELECT count(*) AS n FROM (SELECT a + 1 FROM app_table EXCEPT SELECT a + 1 FROM app_table WHERE a > 0) q",
+        ] {
+            let plan = ctx.sql(sql).await?.into_optimized_plan()?;
+            let names = plan.schema().fields().iter().map(|field| field.name().clone()).collect::<Vec<_>>();
+            let known_rewrites = collect_known_rewrites(&plan)?;
+            let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known_rewrites)?;
+            assert_eq!(rewritten.schema().fields().iter().map(|field| field.name().clone()).collect::<Vec<_>>(), names, "{}", rewritten.display_indent());
+            let output = plan_to_sql(&rewritten)?.to_string();
+            ctx.sql(&output).await?;
+        }
+        Ok(())
+    }
+
     /// References to optimizer-pinned names must resolve after a scan rewrite,
     /// including when type coercion changes the expression under the alias.
     #[tokio::test]
@@ -1018,7 +1158,7 @@ mod tests {
             ),
             (
                 "SELECT foo.df_table.a FROM foo.df_table",
-                r#"SELECT a FROM "default".remote_table"#,
+                r#"SELECT remote_table.a FROM "default".remote_table"#,
             ),
             (
                 "SELECT MIN(a) FROM foo.df_table",
@@ -1058,6 +1198,273 @@ mod tests {
             test_sql(&ctx, test.0, test.1).await?;
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_scalar_subquery_projection_names_survive_rewrite() -> Result<()> {
+        let ctx = get_test_df_context();
+        for sql in [
+            "SELECT (SELECT max(a) FROM app_table)",
+            "SELECT * FROM (SELECT (SELECT max(a) FROM app_table)) q",
+            r#"SELECT q."max(app_table.a)" FROM (SELECT (SELECT max(a) FROM app_table)) q"#,
+        ] {
+            let plan = ctx.sql(sql).await?.logical_plan().clone();
+            let original = Arc::clone(plan.schema());
+            let known = collect_known_rewrites(&plan)?;
+            let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known)?;
+            println!("{sql} => {}", plan_to_sql(&rewritten)?);
+            assert_eq!(original.fields(), rewritten.schema().fields());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_qualified_outer_reference_ignores_bare_alias() -> Result<()> {
+        let ctx = SessionContext::new();
+        let catalog = ctx.catalog("datafusion").expect("default catalog");
+        let schema = Arc::new(MemorySchemaProvider::new());
+        catalog.register_schema("schema_a", schema.clone())?;
+        schema.register_table(
+            "foo".to_string(),
+            get_test_table_provider_named("remote_outer"),
+        )?;
+        ctx.register_table("bar", get_test_table_provider_named("remote_inner"))?;
+        let sql = "SELECT (SELECT (SELECT schema_a.foo.a) FROM (SELECT a FROM bar) foo) AS v FROM schema_a.foo";
+        let plan = ctx.sql(sql).await?.logical_plan().clone();
+        // Bind the logical reference explicitly so this regression exercises
+        // table rewriting independently of SQL identifier normalization.
+        let plan = plan
+            .transform_up_with_subqueries(|mut node| {
+                if let LogicalPlan::Subquery(subquery) = &mut node {
+                    for reference in &mut subquery.outer_ref_columns {
+                        if let Expr::OuterReferenceColumn(_, column) = reference {
+                            column.relation = Some(TableReference::partial("schema_a", "foo"));
+                        }
+                    }
+                }
+                node.map_expressions(|expr| {
+                    expr.transform_up(|expr| match expr {
+                        Expr::OuterReferenceColumn(field, column) if column.name == "a" => {
+                            Ok(Transformed::yes(Expr::OuterReferenceColumn(
+                                field,
+                                Column::new(Some(TableReference::partial("schema_a", "foo")), "a"),
+                            )))
+                        }
+                        other => Ok(Transformed::no(other)),
+                    })
+                })
+            })?
+            .data;
+        let known = collect_known_rewrites(&plan)?;
+        let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known)?;
+        let output = plan_to_sql(&rewritten)?.to_string();
+        println!("Explicitly bound {sql} => {output}");
+        assert!(output.contains("SELECT remote_outer.a"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_binding_precedence_and_ambiguity() -> Result<()> {
+        // Match DFSchema's lookup of an already-bound projected alias.
+        let unqualified = Column::new_unqualified("a");
+        let mut schema = DFSchema::new_with_metadata(
+            vec![(None, Arc::new(Field::new("a", DataType::Int64, false)))],
+            Default::default(),
+        )?;
+        schema.merge(&DFSchema::try_from_qualified_schema(
+            "foo",
+            &Schema::new(vec![Field::new("a", DataType::Int64, true)]),
+        )?);
+        assert!(!schema
+            .qualified_field_from_column(&unqualified)?
+            .1
+            .is_nullable());
+        let mut alias_scope = ColumnBindings::default();
+        append_column_bindings(&mut alias_scope, &schema, &schema)?;
+        assert_eq!(
+            rewritten_column_binding(&unqualified, &alias_scope)?,
+            Some(unqualified)
+        );
+        let bare = Column::new(Some(TableReference::bare("foo")), "a");
+        let qualified = Column::new(Some(TableReference::partial("schema_a", "foo")), "a");
+        let remote = Column::new(Some(TableReference::bare("remote_outer")), "a");
+        let mut scope = ColumnBindings::default();
+        scope.by_name.insert(
+            "a".to_string(),
+            vec![
+                (bare.clone(), bare.clone()),
+                (qualified.clone(), remote.clone()),
+            ],
+        );
+        assert_eq!(
+            rewritten_column_binding(&qualified, &scope)?,
+            Some(remote.clone())
+        );
+        assert_eq!(rewritten_column_binding(&bare, &scope)?, Some(bare.clone()));
+        let mut nearer = ColumnBindings::default();
+        nearer
+            .by_name
+            .insert("a".to_string(), vec![(qualified.clone(), remote.clone())]);
+        assert_eq!(
+            rewrite_outer_reference(bare, &[Arc::new(scope), Arc::new(nearer)])?.data,
+            remote
+        );
+        let mut duplicate = ColumnBindings::default();
+        duplicate.by_name.insert(
+            "a".to_string(),
+            vec![
+                (qualified.clone(), remote.clone()),
+                (qualified.clone(), remote),
+            ],
+        );
+        let error = rewritten_column_binding(&qualified, &duplicate)
+            .expect_err("ambiguous exact definitions");
+        assert!(error.to_string().contains("Ambiguous column binding"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wide_projection_rewrite() -> Result<()> {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(
+            (0..3000)
+                .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        ));
+        let table = Arc::new(TestTable::new("remote_wide".to_string(), schema));
+        let provider = Arc::new(SQLFederationProvider::new(Arc::new(TestExecutor)));
+        let source = Arc::new(SQLTableSource { provider, table });
+        ctx.register_table("wide", Arc::new(FederatedTableProviderAdaptor::new(source)))?;
+        let plan = ctx.sql("SELECT * FROM wide").await?.logical_plan().clone();
+        let known = collect_known_rewrites(&plan)?;
+        let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known)?;
+        assert_eq!(rewritten.schema().fields().len(), 3000);
+        for index in 0..3000 {
+            let (qualifier, field) = rewritten.schema().qualified_field(index);
+            assert_eq!(qualifier, Some(&TableReference::bare("remote_wide")));
+            assert_eq!(field.name(), &format!("c{index}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_deep_rewrite_on_small_stack() -> Result<()> {
+        use datafusion::logical_expr::{lit, EmptyRelation};
+        let mut plan = LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: true,
+            schema: Arc::new(DFSchema::empty()),
+        });
+        for _ in 0..1500 {
+            plan = LogicalPlan::Projection(Projection::try_new(
+                vec![lit(1_i64).alias("v")],
+                Arc::new(plan),
+            )?);
+        }
+        let rewritten = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || RewriteTableScanAnalyzer::rewrite(plan, &HashMap::new()))
+            .expect("start bounded-stack rewrite")
+            .join()
+            .expect("rewrite thread")?;
+        let mut current = &rewritten;
+        let mut depth = 0;
+        while let LogicalPlan::Projection(projection) = current {
+            depth += 1;
+            current = projection.input.as_ref();
+        }
+        assert_eq!(depth, 1500);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_correlated_computed_outputs_keep_their_names() -> Result<()> {
+        let ctx = get_test_df_context();
+        ctx.register_table("remote_table", get_test_table_provider())?;
+        for sql in [
+            r#"SELECT (SELECT "app_table.a + Int64(1)") AS v FROM (SELECT a + 1 FROM app_table)"#,
+            r#"SELECT EXISTS (SELECT 1 WHERE "app_table.a + Int64(1)" > 0) AS v FROM (SELECT a + 1 FROM app_table)"#,
+            r#"SELECT 42 IN (SELECT "app_table.a + Int64(1)") AS v FROM (SELECT a + 1 FROM app_table)"#,
+            r#"SELECT 42 < ANY (SELECT "app_table.a + Int64(1)") AS v FROM (SELECT a + 1 FROM app_table)"#,
+        ] {
+            let plan = ctx.sql(sql).await?.logical_plan().clone();
+            let known = collect_known_rewrites(&plan)?;
+            let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known)?;
+            let output = plan_to_sql(&rewritten)?.to_string();
+            println!("{sql} => {output}");
+            ctx.sql(&output).await?;
+            let mut metadata_references = 0;
+            rewritten.apply_with_subqueries(|node| {
+                node.apply_expressions(|expr| {
+                    expr.apply(|expr| {
+                        let subquery = match expr {
+                            Expr::ScalarSubquery(subquery) => Some(subquery),
+                            Expr::Exists(exists) => Some(&exists.subquery),
+                            Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery),
+                            Expr::SetComparison(comparison) => Some(&comparison.subquery),
+                            _ => None,
+                        };
+                        if let Some(subquery) = subquery {
+                            for reference in &subquery.outer_ref_columns {
+                                let Expr::OuterReferenceColumn(_, column) = reference else {
+                                    panic!("expected an outer reference: {reference}");
+                                };
+                                metadata_references += 1;
+                                assert_eq!(column.name, "app_table.a + Int64(1)", "{output}");
+                            }
+                        }
+                        if let Expr::OuterReferenceColumn(_, column) = expr {
+                            assert_eq!(column.name, "app_table.a + Int64(1)", "{output}");
+                        }
+                        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+                    })
+                })
+            })?;
+            assert!(metadata_references > 0, "{output}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_correlated_bindings_follow_enclosing_scopes() -> Result<()> {
+        let ctx = get_test_df_context();
+        ctx.register_table("remote_table", get_test_table_provider())?;
+        ctx.register_table("other_table", get_test_table_provider_named("remote_other"))?;
+        ctx.register_table(
+            "remote_other",
+            get_test_table_provider_named("remote_other"),
+        )?;
+        for sql in [
+            r#"SELECT (SELECT app_table.a) AS v FROM app_table"#,
+            r#"SELECT (SELECT app_table.v) AS v FROM (SELECT a + 1 AS v FROM app_table) app_table"#,
+            r#"SELECT (SELECT (SELECT "app_table.a + Int64(1)")) AS v FROM (SELECT a + 1 FROM app_table)"#,
+            r#"SELECT (SELECT "app_table.a + Int64(1)") AS v, (SELECT "app_table.a + Int64(1)" + 1) AS w FROM (SELECT a + 1 FROM app_table)"#,
+            r#"SELECT (SELECT (SELECT app_table.v) FROM (SELECT a + 10 AS v FROM other_table) app_table) AS v FROM (SELECT a + 1 AS v FROM app_table) app_table"#,
+            r#"SELECT (SELECT app_table.a + other_table.a FROM other_table LIMIT 1) AS v FROM app_table"#,
+        ] {
+            let plan = ctx.sql(sql).await?.logical_plan().clone();
+            let known = collect_known_rewrites(&plan)?;
+            let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known)?;
+            let output = plan_to_sql(&rewritten)?.to_string();
+            println!("{sql} => {output}");
+            ctx.sql(&output).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remote_name_collision_preserves_column_provenance() -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.register_table("foo", get_test_table_provider_named("remote_left"))?;
+        ctx.register_table("bar", get_test_table_provider_named("foo"))?;
+        let sql = "SELECT foo.a AS left_a, bar.a AS right_a FROM foo JOIN bar ON foo.a = bar.a";
+        let plan = ctx.sql(sql).await?.logical_plan().clone();
+        let known = collect_known_rewrites(&plan)?;
+        let rewritten = RewriteTableScanAnalyzer::rewrite(plan, &known)?;
+        let output = plan_to_sql(&rewritten)?.to_string();
+        println!("{sql} => {output}");
+        assert!(output.contains("remote_left.a = foo.a"), "{output}");
+        assert!(output.contains("remote_left.a AS left_a"), "{output}");
         Ok(())
     }
 

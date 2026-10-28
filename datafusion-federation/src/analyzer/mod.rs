@@ -4,6 +4,7 @@ use crate::{FederatedTableProviderAdaptor, FederatedTableSource, FederationProvi
 use crate::{FederationAnalyzerForLogicalPlan, FederationProvider};
 use datafusion::logical_expr::{col, expr::Exists, expr::InSubquery, LogicalPlanBuilder};
 use datafusion::optimizer::optimize_unions::OptimizeUnions;
+#[cfg(not(feature = "sql"))]
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
 use datafusion::{
@@ -92,6 +93,9 @@ impl FederationAnalyzerRule {
     pub fn default_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
         vec![
             Arc::new(OptimizeUnions::new()),
+            #[cfg(feature = "sql")]
+            Arc::new(crate::sql::optimizer::PushDownFilterFederation::for_analyzer()),
+            #[cfg(not(feature = "sql"))]
             Arc::new(PushDownFilter::new()),
         ]
     }
