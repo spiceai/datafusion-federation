@@ -2270,6 +2270,64 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test for spiceai/spiceai#16081: a grouping-set aggregate federated
+    /// beneath a node that stays local must not ask the source for DataFusion's
+    /// internal grouping id, which no SQL statement can name.
+    #[tokio::test]
+    async fn a_grouping_set_aggregate_below_a_local_node_does_not_send_its_grouping_id(
+    ) -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: Some(Arc::new(|plan| {
+                plan.expressions().iter().any(|expr| {
+                    expr.exists(|e| Ok(matches!(e, Expr::ScalarFunction(f) if f.name() == "upper")))
+                        .unwrap_or(false)
+                })
+            })),
+        };
+
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", get_test_table_provider("t".into(), executor))?;
+
+        // The second query reaches the aggregate through the HAVING filter, which
+        // passes the grouping id through from the aggregate below it.
+        for (query, expected) in [
+            (
+                "SELECT upper(b) AS u, grouping(b) AS g, count(a) AS n FROM t GROUP BY ROLLUP(b)",
+                "SELECT t.b, grouping(t.b), count(t.a) FROM t GROUP BY ROLLUP (t.b)",
+            ),
+            (
+                "SELECT upper(b) AS u, count(a) AS n FROM t GROUP BY ROLLUP(b) HAVING count(a) > 1",
+                "SELECT t.b, count(t.a) FROM t GROUP BY ROLLUP (t.b) HAVING (count(t.a) > 1)",
+            ),
+        ] {
+            let physical_plan = ctx.sql(query).await?.create_physical_plan().await?;
+
+            let mut federation_sqls: Vec<String> = Vec::new();
+            physical_plan.apply(|node| {
+                if let Some(vp) = node.downcast_ref::<VirtualExecutionPlan>() {
+                    federation_sqls.push(vp.final_sql()?);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+
+            assert_eq!(
+                federation_sqls,
+                vec![expected.to_string()],
+                "the aggregate is federated and the projection above it stays local: {query}"
+            );
+            let display = datafusion::physical_plan::displayable(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                display.contains("ProjectionExec") && display.contains("upper"),
+                "the projection must be evaluated locally for {query}:\n{display}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// A dialect without recursive-CTE rendering keeps recursion local and
     /// executes only the supported scan remotely.
     #[tokio::test]
