@@ -13,7 +13,10 @@ use datafusion::{
     config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
-    logical_expr::{Expr, Extension, LogicalPlan, Projection, TableScan, TableSource},
+    logical_expr::{
+        utils::grouping_set_to_exprlist, Expr, Extension, Filter, Limit, LogicalPlan, Projection,
+        Sort, TableScan, TableSource,
+    },
     optimizer::analyzer::AnalyzerRule,
 };
 use scan_result::ScanResult;
@@ -751,17 +754,41 @@ fn wrap_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     match plan {
         LogicalPlan::Projection(_) => Ok(plan),
         _ => {
+            // A grouping-set aggregate's internal grouping id has no SQL name the
+            // source could return. Nothing above the aggregate reads it yet:
+            // `grouping()` calls are still aggregate expressions, which the source
+            // evaluates itself.
+            let grouping_id = internal_grouping_id_index(&plan)?;
             let expr = plan
                 .schema()
                 .columns()
                 .iter()
-                .map(|c| Expr::Column(c.clone()))
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != grouping_id)
+                .map(|(_, c)| Expr::Column(c.clone()))
                 .collect::<Vec<Expr>>();
             Ok(LogicalPlan::Projection(Projection::try_new(
                 expr,
                 Arc::new(plan),
             )?))
         }
+    }
+}
+
+/// The position of the internal grouping id among `plan`'s output columns, when
+/// `plan` is a grouping-set aggregate or passes one's output through unchanged.
+fn internal_grouping_id_index(plan: &LogicalPlan) -> Result<Option<usize>> {
+    match plan {
+        LogicalPlan::Aggregate(aggregate)
+            if matches!(aggregate.group_expr.as_slice(), [Expr::GroupingSet(_)]) =>
+        {
+            // The grouping id follows the grouping expressions in the schema.
+            Ok(Some(grouping_set_to_exprlist(&aggregate.group_expr)?.len()))
+        }
+        LogicalPlan::Filter(Filter { input, .. })
+        | LogicalPlan::Sort(Sort { input, .. })
+        | LogicalPlan::Limit(Limit { input, .. }) => internal_grouping_id_index(input),
+        _ => Ok(None),
     }
 }
 
