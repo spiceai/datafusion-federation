@@ -2218,9 +2218,6 @@ mod tests {
         Ok(())
     }
 
-    /// A function the executor reports it cannot run must stay in the local plan:
-    /// the SQL sent to the source carries only the scan, and the function is
-    /// evaluated by DataFusion above it.
     /// A `DISTINCT ON ... ORDER BY` the executor will not run stays local above
     /// the federated scan, with its sort keys.
     #[tokio::test]
@@ -2248,6 +2245,9 @@ mod tests {
         Ok(())
     }
 
+    /// A function the executor reports it cannot run must stay in the local plan:
+    /// the SQL sent to the source carries only the scan, and the function is
+    /// evaluated by DataFusion above it.
     #[tokio::test]
     async fn can_execute_plan_keeps_an_unsupported_function_local() -> Result<(), DataFusionError> {
         let executor = TestExecutor {
