@@ -733,8 +733,10 @@ impl ExecutionPlan for VirtualExecutionPlan {
     /// `DataFusion` would ([`SQLExecutor::supports_sort_pushdown`]): the sort is
     /// added to the federated plan, so the remote SQL carries the `ORDER BY`, and
     /// the ordering is declared so `DataFusion` drops its own sort. Only sorts on
-    /// this node's output columns are accepted, and only where one `SELECT` can
-    /// express them: not across a `LIMIT`, and not over another `ORDER BY`.
+    /// this node's output columns are accepted, only where one `SELECT` can
+    /// express them (not across a `LIMIT`, and not over another `ORDER BY`), and
+    /// only when the executor can run the sorted plan, as it would decide for the
+    /// same sort in the logical plan.
     fn try_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
@@ -770,7 +772,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
             input: Arc::new(self.plan.clone()),
             fetch: None,
         });
-        if !renders_as_one_select(&plan) {
+        if !renders_as_one_select(&plan) || !self.executor.can_execute_plan(&plan) {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
         let props = PlanProperties::clone(&self.props).with_eq_properties(
@@ -3144,6 +3146,12 @@ mod tests {
             self.0
         }
 
+        /// Runs no plan sorted by `c`, a column it would order differently.
+        fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+            !matches!(plan, LogicalPlan::Sort(sort)
+                if sort.expr.iter().any(|key| key.expr.column_refs().iter().any(|column| column.name == "c")))
+        }
+
         fn execute(
             &self,
             _query: &str,
@@ -3230,6 +3238,9 @@ mod tests {
 
         // A column the node does not output under that name is not taken.
         assert!(pushed(scan_vp(true).try_pushdown_sort(&sort_on("b", 0))?).is_none());
+
+        // Nor is a sort the executor would not run in the logical plan.
+        assert!(pushed(scan_vp(true).try_pushdown_sort(&sort_on("c", 2))?).is_none());
         Ok(())
     }
 
