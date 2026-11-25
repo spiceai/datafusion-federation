@@ -104,9 +104,10 @@ pub trait SQLExecutor: Sync + Send {
     /// including where NULLs go and how strings compare.
     ///
     /// When `true`, a [`VirtualExecutionPlan`](super::VirtualExecutionPlan)
-    /// accepts a sort pushed down to it: the federated SQL carries the
-    /// `ORDER BY`, the ordering is declared, and `DataFusion` drops its own sort.
-    /// The default, `false`, keeps the sort local.
+    /// accepts a sort pushed down to it that [`Self::can_execute_plan`] accepts
+    /// for the sorted plan: the federated SQL carries the `ORDER BY`, the
+    /// ordering is declared, and `DataFusion` drops its own sort. The default,
+    /// `false`, keeps the sort local.
     fn supports_sort_pushdown(&self) -> bool {
         false
     }

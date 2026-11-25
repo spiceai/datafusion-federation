@@ -733,8 +733,10 @@ impl ExecutionPlan for VirtualExecutionPlan {
     /// `DataFusion` would ([`SQLExecutor::supports_sort_pushdown`]): the sort is
     /// added to the federated plan, so the remote SQL carries the `ORDER BY`, and
     /// the ordering is declared so `DataFusion` drops its own sort. Only sorts on
-    /// this node's output columns are accepted, and only where one `SELECT` can
-    /// express them: not across a `LIMIT`, and not over another `ORDER BY`.
+    /// this node's output columns are accepted, only where one `SELECT` can
+    /// express them (not across a `LIMIT`, and not over another `ORDER BY`), and
+    /// only when the executor can run the sorted plan, as it would decide for the
+    /// same sort in the logical plan.
     fn try_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
@@ -770,7 +772,7 @@ impl ExecutionPlan for VirtualExecutionPlan {
             input: Arc::new(self.plan.clone()),
             fetch: None,
         });
-        if !renders_as_one_select(&plan) {
+        if !renders_as_one_select(&plan) || !self.executor.can_execute_plan(&plan) {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
         let props = PlanProperties::clone(&self.props).with_eq_properties(
@@ -2216,6 +2218,33 @@ mod tests {
         Ok(())
     }
 
+    /// A `DISTINCT ON ... ORDER BY` the executor will not run stays local above
+    /// the federated scan, with its sort keys.
+    #[tokio::test]
+    async fn a_distinct_on_with_an_order_by_kept_local_keeps_its_sort(
+    ) -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: Some(Arc::new(|plan| matches!(plan, LogicalPlan::Distinct(_)))),
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", get_test_table_provider("t".into(), executor))?;
+
+        let plan = ctx
+            .sql("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC")
+            .await?
+            .into_optimized_plan()?;
+
+        // The optimizer turns the `DISTINCT ON` into `first_value` calls, which
+        // keep its `ORDER BY`.
+        let shown = plan.display_indent().to_string();
+        assert!(
+            shown.contains("first_value(t.b) ORDER BY [t.a ASC NULLS LAST, t.b DESC NULLS FIRST]"),
+            "{shown}"
+        );
+        Ok(())
+    }
+
     /// A function the executor reports it cannot run must stay in the local plan:
     /// the SQL sent to the source carries only the scan, and the function is
     /// evaluated by DataFusion above it.
@@ -3144,6 +3173,12 @@ mod tests {
             self.0
         }
 
+        /// Runs no plan sorted by `c`, a column it would order differently.
+        fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+            !matches!(plan, LogicalPlan::Sort(sort)
+                if sort.expr.iter().any(|key| key.expr.column_refs().iter().any(|column| column.name == "c")))
+        }
+
         fn execute(
             &self,
             _query: &str,
@@ -3230,6 +3265,9 @@ mod tests {
 
         // A column the node does not output under that name is not taken.
         assert!(pushed(scan_vp(true).try_pushdown_sort(&sort_on("b", 0))?).is_none());
+
+        // Nor is a sort the executor would not run in the logical plan.
+        assert!(pushed(scan_vp(true).try_pushdown_sort(&sort_on("c", 2))?).is_none());
         Ok(())
     }
 
