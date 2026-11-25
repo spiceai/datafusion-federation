@@ -8,14 +8,15 @@ use datafusion::optimizer::optimize_unions::OptimizeUnions;
 use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
 use datafusion::{
+    common::internal_err,
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     common::TableReference,
     config::ConfigOptions,
     datasource::source_as_provider,
     error::Result,
     logical_expr::{
-        utils::grouping_set_to_exprlist, Expr, Extension, Filter, Limit, LogicalPlan, Projection,
-        Sort, TableScan, TableSource,
+        utils::grouping_set_to_exprlist, Distinct, DistinctOn, Expr, Extension, Filter, Limit,
+        LogicalPlan, Projection, Sort, SortExpr, TableScan, TableSource,
     },
     optimizer::analyzer::AnalyzerRule,
 };
@@ -537,7 +538,14 @@ impl FederationAnalyzerRule {
         };
 
         // Construct the optimized plan
-        let new_plan = plan.with_new_exprs(new_expressions, new_inputs)?;
+        let new_plan = match plan {
+            // `with_new_exprs` cannot rebuild a `DISTINCT ON` that has an
+            // `ORDER BY`, so it is rebuilt here with its sort keys.
+            LogicalPlan::Distinct(Distinct::On(distinct_on)) if distinct_on.sort_expr.is_some() => {
+                rebuild_distinct_on(distinct_on, new_expressions, new_inputs)?
+            }
+            _ => plan.with_new_exprs(new_expressions, new_inputs)?,
+        };
 
         // Return the federated plan
         Ok((Some(new_plan), ScanResult::Ambiguous))
@@ -1041,6 +1049,36 @@ pub fn get_table_source(
 
     // Return original FederatedTableSource
     Ok(Some(Arc::clone(&wrapper.source)))
+}
+
+/// `distinct_on` with `exprs`, its `ON`, `SELECT` and `ORDER BY` expressions in
+/// the order [`LogicalPlan::expressions`] lists them, over the one input in
+/// `inputs`.
+fn rebuild_distinct_on(
+    distinct_on: &DistinctOn,
+    mut exprs: Vec<Expr>,
+    inputs: Vec<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    let Ok([input]) = <[LogicalPlan; 1]>::try_from(inputs) else {
+        return internal_err!("DISTINCT ON has one input");
+    };
+    let sort_exprs = exprs.split_off(distinct_on.on_expr.len() + distinct_on.select_expr.len());
+    let select_expr = exprs.split_off(distinct_on.on_expr.len());
+    let sort_expr = distinct_on.sort_expr.as_ref().map(|keys| {
+        keys.iter()
+            .zip(sort_exprs)
+            .map(|(key, expr)| SortExpr {
+                expr,
+                ..key.clone()
+            })
+            .collect()
+    });
+    Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn::try_new(
+        exprs,
+        select_expr,
+        sort_expr,
+        Arc::new(input),
+    )?)))
 }
 
 #[cfg(test)]

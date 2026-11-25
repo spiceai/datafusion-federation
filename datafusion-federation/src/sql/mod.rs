@@ -2221,6 +2221,33 @@ mod tests {
     /// A function the executor reports it cannot run must stay in the local plan:
     /// the SQL sent to the source carries only the scan, and the function is
     /// evaluated by DataFusion above it.
+    /// A `DISTINCT ON ... ORDER BY` the executor will not run stays local above
+    /// the federated scan, with its sort keys.
+    #[tokio::test]
+    async fn a_distinct_on_with_an_order_by_kept_local_keeps_its_sort(
+    ) -> Result<(), DataFusionError> {
+        let executor = TestExecutor {
+            compute_context: "ctx".into(),
+            cannot_federate: Some(Arc::new(|plan| matches!(plan, LogicalPlan::Distinct(_)))),
+        };
+        let ctx = SessionContext::new_with_state(crate::default_session_state());
+        ctx.register_table("t", get_test_table_provider("t".into(), executor))?;
+
+        let plan = ctx
+            .sql("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC")
+            .await?
+            .into_optimized_plan()?;
+
+        // The optimizer turns the `DISTINCT ON` into `first_value` calls, which
+        // keep its `ORDER BY`.
+        let shown = plan.display_indent().to_string();
+        assert!(
+            shown.contains("first_value(t.b) ORDER BY [t.a ASC NULLS LAST, t.b DESC NULLS FIRST]"),
+            "{shown}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn can_execute_plan_keeps_an_unsupported_function_local() -> Result<(), DataFusionError> {
         let executor = TestExecutor {
